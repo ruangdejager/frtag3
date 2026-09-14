@@ -23,6 +23,14 @@ void SYSTEM_vSleepLockRelease(void);
 
 void Error_Handler(void);
 
+/* Sub-millisecond busy-wait for hardware settle times, calibrated off
+ * SystemCoreClock. Deliberately NOT built on HAL_Delay/HAL_vDelayUs or osDelay:
+ * the HAL delays depend on a tick this project does not drive the way they
+ * expect, and osDelay's 1 ms granularity is both far too coarse and a yield
+ * where the caller needs the pin state held. This is a spin — keep the
+ * durations to the tens of microseconds the settle actually needs. */
+void HAL_SYSTEM_vBusyWaitUs(uint32_t u32Us);
+
 /* Enters STOP2 and restores clocks/peripherals on wake. Called from the
  * tickless-idle sleep path (vPortSuppressTicksAndSleep) with interrupts
  * already masked and deep-sleep eligibility already decided. */

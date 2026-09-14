@@ -9,6 +9,7 @@
 
 #include "hal_gpio.h"
 #include "hal_bsp.h"
+#include "hal_subghz.h"
 
 #include "stm32wlxx.h"
 
@@ -38,8 +39,12 @@ void HAL_GPIO_vInit(void)
     /* Farmranger interrupt output */
     HAL_GPIO_vInitOutput(BSP_FR_GPIO_INT_PORT, BSP_FR_GPIO_INT_PIN, GPIO_PIN_RESET);
 
-    /* RF switch control — start LOW (RX/OFF) */
+    /* RF switch — supply rail off, path select LOW (RX/OFF).
+     * VDD last of the two, and both low: the radio is asleep at this point, and
+     * CTRL must never be high while VDD is at 0 V (see
+     * HAL_SUBGHZ_vRfSwitchPowerOff). hal_subghz owns both pins from here on. */
     HAL_GPIO_vInitOutput(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
+    HAL_GPIO_vInitOutput(BSP_RF_SW_VDD_PORT,  BSP_RF_SW_VDD_PIN,  GPIO_PIN_RESET);
 
     /* Device role sense */
     HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_PULLDOWN);
@@ -50,9 +55,21 @@ void HAL_GPIO_vInit(void)
  * analog Hi-Z before sleep and restored on wake. SPI1 = ACC, SPI2 = flash,
  * USART2 = debug, USART1 = GPS/Farmranger.
  * NOT included (intentionally held across STOP2 to keep externals in a known
- * state): PA0 GNSS_ON=low, PA4 BAT_BIAS=low, PA9 RF_SW=low, PA11 ACC_CS=high,
- * PA15 FLASH_CS=high, PB5/PB8 LEDs=low. ADC pins (PA12/PB3/PB4) are already
- * analog. GPIO state is retained in STOP2, so driven pins keep their level.
+ * state): PA0 GNSS_ON=low, PA4 BAT_BIAS=low, PA9 RF_SW_CTRL, PB2 RF_SW_VDD,
+ * PA11 ACC_CS=high, PA15 FLASH_CS=high, PB5/PB8 LEDs=low. ADC pins
+ * (PA12/PB3) are already analog. GPIO state is retained in STOP2, so driven
+ * pins keep their level.
+ *
+ * The two RF switch pins are deliberately NOT parked: this MCU does enter STOP2
+ * with the radio still awake. LORARADIO_vRadioTask leaves the chip in
+ * continuous RX and then blocks, holding no sleep lock, so an idle tag sleeps
+ * with an RX window open — and a "tag radiotest" secondary does the same via
+ * bKeepAwake. Parking RF_SW_VDD analog there would drop the switch mid-receive
+ * and the unit would go deaf without any code saying it had. The radio's own
+ * sleep state is what gates the rail, not the MCU's: see
+ * HAL_SUBGHZ_vRfSwitchPowerOn / _vRfSwitchPowerOff, called from the radio wake
+ * and sleep paths. HAL_GPIO_vOnSleep below drives both pins low explicitly when
+ * the radio IS asleep rather than assuming they are already low.
  *
  * PB12 (ROLE_BIT0) is also kept in the analog sleep mask: it is read once at
  * boot (DEVICE_DISCOVERY_vConfigDeviceRole) and tristated immediately after, so
@@ -76,6 +93,22 @@ void HAL_GPIO_vInit(void)
 
 void HAL_GPIO_vOnSleep(void)
 {
+    /* RF switch. If the radio is asleep the switch rail must be down for the
+     * duration, and driven low rather than assumed low — and driven low here,
+     * before any pin is reconfigured to analog below. CTRL first, then VDD:
+     * CTRL high with VDD at 0 V forward-biases the CTRL ESD diode and
+     * parasitically powers the switch die (see HAL_SUBGHZ_vRfSwitchPowerOff).
+     *
+     * If the radio is AWAKE, both pins are left exactly as the radio set them.
+     * This MCU does enter STOP2 with an RX window open (see the note on the
+     * sleep mask above), and dropping the rail under a live receive would make
+     * the unit deaf with nothing in the log to say why. */
+    if (!HAL_SUBGHZ_bRfSwitchPowered())
+    {
+        HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(BSP_RF_SW_VDD_PORT,  BSP_RF_SW_VDD_PIN,  GPIO_PIN_RESET);
+    }
+
     /* Park the peripheral AF pins as analog BEFORE gating the port clocks
      * (register writes need the clock on). */
     HAL_GPIO_vInitAnalogNoPull(GPIOA, HAL_GPIO_SLEEP_ANALOG_GPIOA);

@@ -44,7 +44,7 @@
  *                               silently (DBG_LOG only, no over-air reply —
  *                               see FRKERNEL_vAck). Query commands (-help,
  *                               juice, fwver, discovery schedule, flash
- *                               stream, sd log stream) are dropped under
+ *                               stream) are dropped under
  *                               "*" instead of flooding the air with every
  *                               device's answer — see FRKERNEL_bQueryOnlyCmd.
  *
@@ -223,7 +223,7 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
 {
     static const char *const apacQueries[] = {
         "-help", "juice", "fwver", "discovery schedule",
-        "flash stream", "sd log stream", "flash",
+        "flash stream", "flash",
         "selftest", "selftest gps", "selftest acc", "selftest flash",
     };
     for (size_t i = 0U; i < (sizeof(apacQueries) / sizeof(apacQueries[0])); i++)

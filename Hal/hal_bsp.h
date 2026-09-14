@@ -177,10 +177,32 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 #define BSP_VSOLAR_ADC_CHANNEL          ADC_CHANNEL_2
 
 /* -----------------------------------------------------------------------
- * RF switch control — PA9 (HIGH = TX/LP, LOW = RX/OFF)
+ * RF switch — supply rail (PB2) and path select (PA9)
+ *
+ * RF_SW_VDD (PB2, HIGH = switch powered) gates the switch's own supply and
+ * follows the RADIO's power state, not individual TX/RX operations: asserted
+ * once when the SubGHz radio leaves sleep, held across every RX<->TX
+ * turnaround, de-asserted once when the radio goes back to sleep. The switch
+ * draws ~35 uA, nothing beside the radio's mA while awake, and cycling it per
+ * turnaround would add the settle below to every transition for no gain.
+ *
+ * RF_SW_CTRL (PA9, HIGH = TX/LP, LOW = RX/OFF) selects the path and is only
+ * ever driven while RF_SW_VDD is already high.
+ *
+ * Bring-up and teardown order is mandatory, see HAL_SUBGHZ_vRfSwitchPowerOn /
+ * _vRfSwitchPowerOff: CTRL must never be high while VDD is at 0 V.
+ *
+ * Settle times come from the board's RC networks:
+ *   VDD:  470R x ~100 nF, tau = 47 us, allow 7 tau
+ *   CTRL: 100R x 101 nF,  ~50 us
  * ----------------------------------------------------------------------- */
+#define BSP_RF_SW_VDD_PORT          GPIOB
+#define BSP_RF_SW_VDD_PIN           GPIO_PIN_2
+#define BSP_RF_SW_VDD_SETTLE_US     350U
+
 #define BSP_RF_SW_CTRL_PORT         GPIOA
 #define BSP_RF_SW_CTRL_PIN          GPIO_PIN_9
+#define BSP_RF_SW_CTRL_SETTLE_US    50U
 
 /* -----------------------------------------------------------------------
  * Device role sense — single GPIO (primary=HIGH / secondary=LOW)

@@ -285,7 +285,6 @@ static const char * const MeshPktTypeStr[] = {
 
 /* ---- Misc state ---- */
 static uint16_t u16MsgCounter        = 0;
-static uint64_t u64LastPrimaryHeardTick = 0;
 static uint8_t  u8PrimaryDreqWaveCnt = 0;
 
 /* RSSI of the ONE DReq that actually triggered this node's current beaconing
@@ -2049,7 +2048,6 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         MESHNETWORK_vSetWakeupInterval(tInterval);
         MESHNETWORK_vSetDiscoveryMode(eMode);
         MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
-        MESHNETWORK_vUpdatePrimaryLastSeen();
         bTimeSyncAcceptedThisWake = true;
         DBG_LOG("MeshNetwork: TimeSync applied: %u interval=%u mode=%s gps=%u\r\n",
                 u32Utc, tInterval,
@@ -2817,9 +2815,6 @@ bool MESHNETWORK_bGetGpsEnabled(void)          { return bCurrentGpsEnabled; }
 
 uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void)    { return tLastBeaconHeardTick;       }
 uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void)   { return u32LastDiscoveryPktTick;    }
-
-void MESHNETWORK_vUpdatePrimaryLastSeen(void)   { u64LastPrimaryHeardTick = HAL_RTC_u64GetValue(); }
-uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void) { return u64LastPrimaryHeardTick; }
 
 void MESHNETWORK_vStartPrimaryAck(void)
 {

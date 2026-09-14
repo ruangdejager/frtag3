@@ -348,6 +348,29 @@ void SYSTEM_vSleepLockRelease(void)
     taskEXIT_CRITICAL();
 }
 
+/* --------------------------------------------------------------------------
+ * HAL_SYSTEM_vBusyWaitUs — spin for roughly u32Us microseconds.
+ *
+ * Same approach as LED_vBlockingDelayMs in app_freertos.c: a __NOP loop
+ * calibrated off SystemCoreClock, depending on neither SysTick, nor the HAL
+ * tick, nor the scheduler. The HAL delays are not an option here —
+ * HAL_vDelayUs reads SysTick, which FreeRTOS owns and stops in tickless idle,
+ * and it wraps incorrectly past one tick period; osDelay yields and cannot
+ * resolve below 1 ms.
+ *
+ * The loop body is one __NOP plus the loop overhead on a volatile counter,
+ * which is at least 4 cycles on this core. Sizing the count as if it were
+ * exactly 4 therefore errs LONG — for a hardware settle that is the safe
+ * direction, and the callers here spend tens of microseconds, not thousands.
+ * -------------------------------------------------------------------------- */
+void HAL_SYSTEM_vBusyWaitUs(uint32_t u32Us)
+{
+    uint32_t u32Loops = u32Us * (SystemCoreClock / 4000000U);
+
+    for (volatile uint32_t i = 0; i < u32Loops; i++)
+        __NOP();
+}
+
 void Error_Handler(void)
 {
 

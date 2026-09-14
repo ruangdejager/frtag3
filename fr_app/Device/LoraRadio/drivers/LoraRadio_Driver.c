@@ -37,6 +37,14 @@ void LORARADIO_DRIVER_vInit(uint8_t *pUniqueID)
 {
     PacketParams_t packetParams;
 
+    /* RF switch supply up before the first SUBGHZ transaction — this is the
+     * one place the radio leaves sleep (cold boot and every re-wake both land
+     * here), so it is where the rail is raised. It stays up until
+     * LORARADIO_DRIVER_vEnterDeepSleep drops it, across every turnaround in
+     * between. The settle is hidden by the radio's own wake time; see
+     * HAL_SUBGHZ_vRfSwitchPowerOn. */
+    HAL_SUBGHZ_vRfSwitchPowerOn();
+
     HAL_vSUBGHZ_Init();
 
     SUBGRF_Init(LORARADIO_DRIVER_vRadioOnDioIrq);
@@ -272,6 +280,11 @@ void LORARADIO_DRIVER_vEnterDeepSleep(void)
     sleepConfig.Fields.Reset      = 0;  /* no reset on wakeup                   */
     sleepConfig.Fields.WakeUpRTC  = 0;  /* wakeup by NSS pulse only             */
     SUBGRF_SetSleep(sleepConfig);
+
+    /* Radio is down, so the switch rail comes down with it. After SUBGRF_SetSleep,
+     * not before: it drives the path select off as its first act, and CTRL must
+     * be low before VDD is removed (see HAL_SUBGHZ_vRfSwitchPowerOff). */
+    HAL_SUBGHZ_vRfSwitchPowerOff();
 }
 
 void LORARADIO_DRIVER_vWakeUp(void)

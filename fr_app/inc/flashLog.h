@@ -32,7 +32,6 @@ typedef enum
 {
     LOG_DISCOVERY_START   = 1,
     LOG_DISCOVERY_INIT,
-    LOG_DISCOVERY_RECOVER,
     LOG_RX_DREQ,
     LOG_RX_BEACON,
     LOG_RX_ACK,

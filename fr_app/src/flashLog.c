@@ -229,10 +229,6 @@ void FLASHLOG_vDump(void)
                 snprintf(buf, sizeof(buf), "[%s] Discovery init [%s]\r\n",
                          timebuf, (value == 1) ? "PRIMARY" : "SECONDARY");
                 break;
-            case LOG_DISCOVERY_RECOVER:
-                snprintf(buf, sizeof(buf), "[%s] Discovery recovery [%04lX]\r\n",
-                         timebuf, value);
-                break;
             case LOG_RX_DREQ:
                 snprintf(buf, sizeof(buf), "[%s] Dreq received Wave %d [%04X %ddBm]\r\n",
                          timebuf, resVal, devId, rssi);

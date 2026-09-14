@@ -923,9 +923,6 @@ bool MESHNETWORK_bSendOtaResponse(const uint8_t *buf, uint16_t len);
 uint32_t MESHNETWORK_u32GetLastBeaconHeardTick(void);
 uint32_t MESHNETWORK_u32GetLastDiscoveryPktTick(void);  /* any DReq/DBeacon/DAck/TimeSync */
 
-uint64_t MESHNETWORK_u64GetLastPrimaryHeardTick(void);
-void     MESHNETWORK_vUpdatePrimaryLastSeen(void);
-
 void MESHNETWORK_vStartPrimaryAck(void);
 void MESHNETWORK_vStopPrimaryAck(void);
 

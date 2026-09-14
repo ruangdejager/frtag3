@@ -188,9 +188,9 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *spiHandle)
         HAL_GPIO_WritePin(BSP_FLASH_CS_PORT, BSP_FLASH_CS_PIN, GPIO_PIN_SET);
 
         /* PA5 (MISO) — AF3 (SPI2_MISO on port A).
-         * Pull-up keeps the line defined when neither flash nor SD card is
-         * driving it (deselected or absent); required by the SD SPI spec
-         * and harmless for the NOR flash. */
+         * Pull-up keeps the line defined while the flash is deselected or
+         * absent, so a read of an unpopulated device returns all-ones rather
+         * than a floating pattern that could look like data. */
         GPIO_InitStruct.Pin       = BSP_FLASH_MISO_PIN;
         GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull      = GPIO_PULLUP;

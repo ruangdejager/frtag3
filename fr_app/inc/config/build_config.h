@@ -58,8 +58,6 @@
  * current measurement. See Hal/hal_bsp.h. */
 #define ENABLE_LEDS
 
-// #define ENABLE_LOW_POWER_RECOVERY      /* see fr_app/Tasks/DeviceDiscovery/DeviceDiscovery.h */
-
 /* Persistent flash event logger: 8-byte records (timestamp + event + value)
  * written to internal flash 0x08020000-0x0803FFE0 by a low-priority background
  * task. Off compiles the whole logger away — no task, no flash region, every

@@ -141,9 +141,6 @@ void INIT_vInitialization(void *parameters)
 #ifdef ENABLE_LEDS
         " ENABLE_LEDS\r\n"
 #endif
-#ifdef ENABLE_LOW_POWER_RECOVERY
-        " ENABLE_LOW_POWER_RECOVERY\r\n"
-#endif
 #ifdef ENABLE_FLASH_LOG
         " ENABLE_FLASH_LOG\r\n"
 #endif
