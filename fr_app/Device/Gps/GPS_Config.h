@@ -7,13 +7,7 @@
 #ifndef DEVICE_GPS_GPS_CONFIG_H_
 #define DEVICE_GPS_GPS_CONFIG_H_
 
-/*
- * Per-sample GNSS telemetry CSV (see GPS.c). One flash-log line per second of
- * every fix session — useful for bench TTFF/convergence tuning, but pure noise
- * in production (the per-session FIX OK / FIX TIMEOUT lines already capture the
- * outcome). Off by default; define to restore it.
- */
-// #define LOG_GPS_PERIODIC
+#include "build_config.h"   /* ENABLE_GPS_PERIODIC_LOG, ENABLE_GNSS_* */
 
 /* Default TTFF timeout [s] — aided start */
 #define GNSS_TTFF_TIMEOUT_1_AID_ASSIST      UINT16_C(60)
@@ -55,12 +49,10 @@
 #define GNSS_ASSIST_SERVER_RESOURCE_1       "http://xtrapath1.izatcloud.net/xtra2.bin"
 #define GNSS_ASSIST_SERVER_RESOURCE_2       "http://xtrapath2.izatcloud.net/xtra2.bin"
 
-/*
- * Compile-time option for NMEA GGA (altitude) — currently only used in
- * experimental logging applications.
- */
-#if defined SWITCH_GNSS_LOGGER
-#define GNSS_NMEA_GGA   true
+/* A GNSS-logger build always parses GGA (altitude); a normal build can opt in
+ * on its own with ENABLE_GNSS_NMEA_GGA in build_config.h. */
+#if defined(ENABLE_GNSS_LOGGER_BUILD) && !defined(ENABLE_GNSS_NMEA_GGA)
+#  define ENABLE_GNSS_NMEA_GGA
 #endif
 
 /*

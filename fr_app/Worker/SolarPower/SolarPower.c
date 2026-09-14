@@ -1,21 +1,16 @@
 /*
  * SolarPower.c
  *
- * Solar power measurement — CMSIS-RTOS v2 task layer.
+ * Solar panel voltage measurement — CMSIS-RTOS v2 task layer.
  *
  * Two tasks:
  *   SOLAR_vSampleTask            — triggered by thread flag; performs one
- *                                  VSOLAR ADC sample (plus RSENSE and coulomb
- *                                  accumulation when ENABLE_SOLAR_POWER_SENSE).
+ *                                  VSOLAR ADC sample.
  *   SOLAR_vCheckSampleScheduleTask — subscribes to the 1-second heartbeat;
  *                                  triggers a sample every 10 ticks.
  *
  * The ADC is shared with the Battery worker. HAL_ADC_vLock / vUnlock
  * serialize access so only one measurement runs at a time.
- *
- * RSENSE-based current/power/coulomb counting is compiled out unless
- * ENABLE_SOLAR_POWER_SENSE is defined (see SolarPower_Config.h — the shunt
- * front-end is non-functional on this board revision). Vsolar is always read.
  */
 
 #include "SolarPower.h"
@@ -44,12 +39,6 @@ static osThreadId_t SOLAR_vCheckSampleScheduleTask_handle;
 
 /* ---- Last measured values (mV) ---- */
 static volatile uint16_t u16VsolarLastMV;
-#ifdef ENABLE_SOLAR_POWER_SENSE
-static volatile uint16_t u16RsenseLastMV;
-
-/* ---- Coulomb accumulator ---- */
-static float fCoulombs;
-#endif
 
 /* ---- Forward declarations ---- */
 static void SOLAR_vSampleTask(void *pvParameters);
@@ -112,9 +101,6 @@ static void SOLAR_vSampleTask(void *pvParameters)
 
     uint16_t u16RawVsolar = 0;
     uint16_t u16RawVref   = 0;
-#ifdef ENABLE_SOLAR_POWER_SENSE
-    uint16_t u16RawRsense = 0;
-#endif
 
     for (;;)
     {
@@ -125,13 +111,9 @@ static void SOLAR_vSampleTask(void *pvParameters)
 
         SOLAR_DRIVER_vEnable();
 
-        /* Read VSOLAR (and RSENSE when enabled) plus VREFINT in one enabled
-         * window. VREFINT gives the true VDDA so results are independent of the
-         * 1.8 V rail. */
+        /* Read VSOLAR plus VREFINT in one enabled window. VREFINT gives the
+         * true VDDA so results are independent of the 1.8 V rail. */
         bool bConvOk = SOLAR_bConvert(VSOLAR_VOLTAGE_CHANNEL, &u16RawVsolar)
-#ifdef ENABLE_SOLAR_POWER_SENSE
-                    && SOLAR_bConvert(RSENSE_VOLTAGE_CHANNEL, &u16RawRsense)
-#endif
                     && SOLAR_bConvert(VREFINT_CHANNEL,        &u16RawVref);
 
         SOLAR_DRIVER_vDisable();
@@ -153,25 +135,8 @@ static void SOLAR_vSampleTask(void *pvParameters)
             (((uint64_t)u16RawVsolar * u16Vdda * SOLAR_VSOLAR_DIV_NUM)
              / ((uint64_t)SOLAR_ADC_FULL_SCALE * SOLAR_VSOLAR_DIV_DEN));
 
-#ifdef ENABLE_SOLAR_POWER_SENSE
-        /* Vrsense = adc * VDDA / full_scale (no divider) */
-        u16RsenseLastMV = (uint16_t)
-            (((uint32_t)u16RawRsense * u16Vdda) / SOLAR_ADC_FULL_SCALE);
-
-#ifdef LOG_SOLAR_PERIODIC
-        DBG_LOG("solar: Vsolar=%u mV  Vrsense=%u mV  Vdda=%u mV  I=%ld mA  P=%lu mW\r\n",
-            u16VsolarLastMV, u16RsenseLastMV, u16Vdda,
-            SOLAR_i32GetCurrentMA(), SOLAR_u32GetPowerMW());
-#endif
-
-        /* ---- Coulomb accumulation: Q += I(A) × T(s) ---- */
-        taskENTER_CRITICAL();
-        fCoulombs += (SOLAR_i32GetCurrentMA() / 1000.0f) * SOLAR_SAMPLE_INTERVAL;
-        taskEXIT_CRITICAL();
-#else
-#ifdef LOG_SOLAR_PERIODIC
+#ifdef ENABLE_SOLAR_PERIODIC_LOG
         DBG_LOG("solar: Vsolar=%u mV  Vdda=%u mV\r\n", u16VsolarLastMV, u16Vdda);
-#endif
 #endif
     }
 }
@@ -208,36 +173,3 @@ uint16_t SOLAR_u16GetVSolarMV(void)
     return u16VsolarLastMV;
 }
 
-#ifdef ENABLE_SOLAR_POWER_SENSE
-uint16_t SOLAR_u16GetVRSenseMV(void)
-{
-    return u16RsenseLastMV;
-}
-
-int32_t SOLAR_i32GetCurrentMA(void)
-{
-    /* I(mA) = Vrsense(mV) / R(Ω) = Vrsense(mV) × 100 / RSENSE_OHM_X100 */
-    return (int32_t)u16RsenseLastMV * 100 / SOLAR_RSENSE_OHM_X100;
-}
-
-uint32_t SOLAR_u32GetPowerMW(void)
-{
-    /* P(mW) = Vsolar(mV) × I(mA) / 1000 */
-    return (uint32_t)u16VsolarLastMV * (uint32_t)SOLAR_i32GetCurrentMA() / 1000UL;
-}
-
-float SOLAR_fGetCoulombs(void)
-{
-    taskENTER_CRITICAL();
-    float f = fCoulombs;
-    taskEXIT_CRITICAL();
-    return f;
-}
-
-void SOLAR_vResetCoulombs(void)
-{
-    taskENTER_CRITICAL();
-    fCoulombs = 0.0f;
-    taskEXIT_CRITICAL();
-}
-#endif /* ENABLE_SOLAR_POWER_SENSE */

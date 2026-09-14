@@ -8,6 +8,7 @@
 #define HAL_BSP_H_
 
 #include "stm32wlxx_hal.h"
+#include "build_config.h"   /* ENABLE_LEDS */
 
 /* -----------------------------------------------------------------------
  * LED
@@ -22,15 +23,9 @@ typedef enum {
     LED_YELLOW = 1,
 } Led_TypeDef;
 
-/* Define to drive the status LEDs. Comment out to TERMINATE them: both pins are
- * left in their analog reset state (Hi-Z, undriven, zero current) and every LED
- * call becomes a no-op. Use the terminated build for production / low-power
- * current measurement. */
-#define LEDS_ENABLED
-
 static inline void BSP_LED_Init(Led_TypeDef led)
 {
-#ifdef LEDS_ENABLED
+#ifdef ENABLE_LEDS
     GPIO_InitTypeDef gpio = {0};
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
@@ -65,7 +60,7 @@ static inline void BSP_LED_Init(Led_TypeDef led)
 
 static inline void BSP_LED_On(Led_TypeDef led)
 {
-#ifdef LEDS_ENABLED
+#ifdef ENABLE_LEDS
     if (led == LED_RED)
         HAL_GPIO_WritePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN, GPIO_PIN_SET);
     else
@@ -77,7 +72,7 @@ static inline void BSP_LED_On(Led_TypeDef led)
 
 static inline void BSP_LED_Off(Led_TypeDef led)
 {
-#ifdef LEDS_ENABLED
+#ifdef ENABLE_LEDS
     if (led == LED_RED)
         HAL_GPIO_WritePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN, GPIO_PIN_RESET);
     else
@@ -89,7 +84,7 @@ static inline void BSP_LED_Off(Led_TypeDef led)
 
 static inline void BSP_LED_Toggle(Led_TypeDef led)
 {
-#ifdef LEDS_ENABLED
+#ifdef ENABLE_LEDS
     if (led == LED_RED)
         HAL_GPIO_TogglePin(BSP_LED_RED_PORT, BSP_LED_RED_PIN);
     else
@@ -174,17 +169,12 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 #define BSP_FLASH_CS_PIN            GPIO_PIN_15
 
 /* -----------------------------------------------------------------------
- * Solar power measurement (ADC)
+ * Solar panel voltage measurement (ADC)
  * VSOLAR_MEAS  = PB3 = ADC_IN2, 10k/33k divider, 1.8 V ref
- * RSENSE_MEAS  = PB4 = ADC_IN3, no divider,       1.8 V ref
  * ----------------------------------------------------------------------- */
 #define BSP_VSOLAR_MEAS_PORT            GPIOB
 #define BSP_VSOLAR_MEAS_PIN             GPIO_PIN_3
 #define BSP_VSOLAR_ADC_CHANNEL          ADC_CHANNEL_2
-
-#define BSP_RSENSE_MEAS_PORT            GPIOB
-#define BSP_RSENSE_MEAS_PIN             GPIO_PIN_4
-#define BSP_RSENSE_ADC_CHANNEL          ADC_CHANNEL_3
 
 /* -----------------------------------------------------------------------
  * RF switch control — PA9 (HIGH = TX/LP, LOW = RX/OFF)

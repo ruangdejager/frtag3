@@ -1,7 +1,7 @@
 /*
  * hal_adc.h
  *
- * ADC driver — battery, VSOLAR, and RSENSE voltage measurement.
+ * ADC driver — battery and VSOLAR voltage measurement.
  *
  * The ADC peripheral is shared across multiple workers. Callers must
  * acquire the ADC mutex (HAL_ADC_vLock / HAL_ADC_vUnlock) around the
@@ -19,8 +19,7 @@
 typedef enum {
     BAT_VOLTAGE_CHANNEL    = 0,
     VSOLAR_VOLTAGE_CHANNEL = 1,
-    RSENSE_VOLTAGE_CHANNEL = 2,
-    VREFINT_CHANNEL        = 3,
+    VREFINT_CHANNEL        = 2,
 } hal_adc_channel_t;
 
 extern ADC_HandleTypeDef hadc;

@@ -80,13 +80,8 @@
 #include "SelfTest.h"
 #include "RadioTestMode.h"     /* R&D radio link/range test (tag radiotest) */
 #include "stm32wlxx_hal.h"     /* TAMP->BKP2R for the bootloader version    */
-#ifdef STORAGE_BACKEND_MICROSD
-#  include "AccLog.h"
-#endif
-#ifdef STORAGE_BACKEND_FLASH
-#  include "Fota.h"
-#  include "Flash.h"          /* flash health query / on-demand recovery   */
-#endif
+#include "Fota.h"
+#include "Flash.h"            /* flash health query / on-demand recovery   */
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 #  include "Debug.h"
@@ -237,7 +232,7 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
     return false;
 }
 
-#if defined(FRKERNEL_INTERFACE_LORA) && defined(STORAGE_BACKEND_FLASH)
+#ifdef FRKERNEL_INTERFACE_LORA
 /* DbgLog's dump sink for "tag flash stream" on the LoRa interface: there's no
  * UART session to read a UART-routed dump from, so the dump goes out as
  * FrKernel LoRa packets instead (same framing as FRKERNEL_vRespond's LoRa
@@ -247,9 +242,8 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
  *
  * Sliced to the full per-packet payload (LORA_MAX_PACKET_SIZE - 3) rather
  * than whatever chunk size the log backend happens to hand in — a caller
- * chunk larger than that (e.g. a 512 B MicroSD block, on that backend) is
- * split across as many packets as it takes instead of being silently
- * truncated to the first slice.
+ * chunk larger than that is split across as many packets as it takes instead
+ * of being silently truncated to the first slice.
  *
  * Paced with LORARADIO_bTxPacketWait instead of a fixed delay: it blocks
  * only when the TX queue is actually full, and unblocks the instant the
@@ -393,10 +387,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag juice                   battery + solar panel voltage (mV)\r\n"
                 "  tag selftest                gps/acc results + live flash state\r\n"
                 "  tag selftest gps|acc|flash  single result\r\n"
-#ifdef STORAGE_BACKEND_FLASH
                 "  tag flash                   ext-flash health (gate, ids, faults)\r\n"
                 "  tag flash recover           force a flash re-probe + bring-up\r\n"
-#endif
                 "  tag discovery schedule      wakeup interval (min)\r\n"
                 "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
@@ -418,10 +410,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> juice              battery + solar panel voltage (mV)\r\n"
                 "  tag <ID> selftest           gps/acc results + live flash state\r\n"
                 "  tag <ID> selftest gps|acc|flash  single result\r\n"
-#ifdef STORAGE_BACKEND_FLASH
                 "  tag <ID> flash              ext-flash health (gate, ids, faults)\r\n"
                 "  tag <ID> flash recover      force a flash re-probe + bring-up\r\n"
-#endif
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
@@ -434,7 +424,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "                              (DBG_LOG only, no reply; action cmds only)\r\n"
             );
         }
-#ifdef STORAGE_BACKEND_FLASH
         if (!bAddressed)
         {
             FRKERNEL_vRespond(eXport,
@@ -453,21 +442,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
                 "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
         }
-#endif
-#ifdef STORAGE_BACKEND_MICROSD
-        if (!bAddressed)
-        {
-            FRKERNEL_vRespond(eXport,
-                "  tag sd clear                wipe MicroSD (logs + acc)\r\n"
-                "  tag sd log stream           stream MicroSD log\r\n");
-        }
-        else
-        {
-            FRKERNEL_vRespond(eXport,
-                "  tag <ID> sd clear           wipe MicroSD (logs + acc)\r\n"
-                "  tag <ID> sd log stream      stream MicroSD log\r\n");
-        }
-#endif
     }
     else if (strcmp(p, "juice") == 0)
     {
@@ -497,14 +471,13 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * SELFTEST_vRunAndReport called from INIT_vInitialization); flash is
          * answered live from the driver gate, because that gate can close and
          * re-open after boot. "n/a" is reported for tests that don't apply on
-         * this build/role (GPS on primary, flash under MicroSD backend). */
+         * this role (GPS on primary). */
         snprintf(resp, sizeof(resp), "selftest: gps=%s acc=%s flash=%s\r\n",
                  SELFTEST_bGpsApplicable()   ? (SELFTEST_bGpsOk()   ? "OK" : "FAIL") : "n/a",
                  SELFTEST_bAccOk()           ? "OK" : "FAIL",
                  SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
         FRKERNEL_vRespond(eXport, resp);
     }
-#ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "flash") == 0)
     {
         /* Full flash health over the air. A tag whose flash has gated off has
@@ -543,7 +516,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  au8Id[0], au8Id[1], au8Id[2], (unsigned)u8Attempts);
         FRKERNEL_vRespond(eXport, resp);
     }
-#endif
     else if (strcmp(p, "selftest gps") == 0)
     {
         snprintf(resp, sizeof(resp), "selftest gps: %s\r\n",
@@ -706,7 +678,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
             FRKERNEL_vAck(eXport, bBulk, "RadioTest: not running\r\n");
         }
     }
-#ifdef STORAGE_BACKEND_FLASH
     else if (strcmp(p, "fwaccept") == 0)
     {
         /* Arm firmware acceptance (secondary only). The session stays open so
@@ -778,22 +749,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
             FRKERNEL_vRespond(eXport, "Streaming ext-flash log...\r\n");
         }
     }
-#endif
-#ifdef STORAGE_BACKEND_MICROSD
-    else if (strcmp(p, "sd clear") == 0)
-    {
-        /* Wipe the whole card: log FIFO (via the consumer) + ACC write head
-         * (deferred to the movement task). Both avoid racing their owners. */
-        DBGLOG_vRequestErase();
-        ACCLOG_vRequestErase();
-        FRKERNEL_vAck(eXport, bBulk, "MicroSD wipe requested (logs + acc data)\r\n");
-    }
-    else if (strcmp(p, "sd log stream") == 0)
-    {
-        DBGLOG_vRequestDump();   /* log region only; no acc-data stream by design */
-        FRKERNEL_vRespond(eXport, "Streaming MicroSD log...\r\n");
-    }
-#endif
     else
     {
         snprintf(resp, sizeof(resp), "Unknown: '%s'. Try 'tag -help'\r\n", p);

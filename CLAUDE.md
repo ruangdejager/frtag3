@@ -51,9 +51,9 @@ work to concentrate in `Hal/`.
 
 | Folder | Role |
 | --- | --- |
-| `Device/` | Peripheral drivers owned by this board: `Acc`, `Flash`, `Gps`, `LoraRadio`, `MicroSD`, `Farmranger` (UART link to the fr9 board). Bus I/O via `Hal/`, plus device protocol and health/retry logic. |
+| `Device/` | Peripheral drivers owned by this board: `Acc`, `Flash`, `Gps`, `LoraRadio`, `Farmranger` (UART link to the fr9 board). Bus I/O via `Hal/`, plus device protocol and health/retry logic. |
 | `Worker/` | Subsystems with their own lifecycle or state machine: `Battery`, `Fota`, `FrKernel`, `MeshNetwork`, `Movement`, `Power`, `SolarPower`. Built on one or more Devices. |
-| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTest` (bench mode). |
+| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTestMode` (runtime link/range test, entered with `tag <ID> radiotest`; not a separate build). |
 | `inc/`, `src/` | Cross-cutting glue that is not a module: `main.c`, `init.c` (boot sequencer), `DbgLog`, `flashLog`, `math_func`, `time_driver`, `uart_callbacks`, `inc/config/` build and version headers. |
 | `settings/` | `settings_default.c/h` — the persisted-settings struct and its compile-time defaults. |
 

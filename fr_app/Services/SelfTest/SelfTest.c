@@ -14,13 +14,11 @@
 #include "Acc_Config.h"            /* ACC_WHO_AM_I_VALUE             */
 #include "Gps.h"                   /* GPS_bSelfTest                  */
 
-#ifdef STORAGE_BACKEND_FLASH
-#  include "Flash.h"               /* FLASH_bRecoverDevice, health   */
-#  include "Flash_Config.h"        /* FLASH_MANUFACTURER_ID          */
-#endif
+#include "Flash.h"                 /* FLASH_bRecoverDevice, health   */
+#include "Flash_Config.h"          /* FLASH_MANUFACTURER_ID          */
 
 /* Result flags default to true so a not-applicable test naturally reports
- * OK (e.g. GPS on primary, flash under MicroSD backend). */
+ * OK (e.g. GPS on primary). */
 static bool bGpsOk       = true;
 static bool bAccOk       = true;
 static bool bFlashOk     = true;
@@ -84,9 +82,7 @@ void SELFTEST_vRunAndReport(void)
                     (unsigned)u8Attempts, u8Id, (unsigned)ACC_WHO_AM_I_VALUE);
     }
 
-    /* Ext flash. Compiled out entirely when the storage backend is MicroSD.
-     *
-     * Reports the DRIVER GATE (FLASH_bDevicePresent), not merely whether a
+    /* Ext flash. Reports the DRIVER GATE (FLASH_bDevicePresent), not merely whether a
      * JEDEC read can be coaxed through right now. Those are different
      * questions, and answering the easy one is what made this check actively
      * harmful: on 2026-08-31 a tag printed "flash=OK" at every boot for 18 h
@@ -98,7 +94,6 @@ void SELFTEST_vRunAndReport(void)
      * shut here is very often a boot-time transient that a retry clears — and
      * a self-test that repairs the fault it was about to report is strictly
      * better than one that only names it, on a unit nobody can reach by wire. */
-#ifdef STORAGE_BACKEND_FLASH
     {
         uint8_t au8Id[3]   = {0};
         uint8_t u8Attempts = 0U;
@@ -136,7 +131,6 @@ void SELFTEST_vRunAndReport(void)
                     (unsigned)tHealth.bUnprotectFailed,
                     (unsigned)tHealth.u16EraseVerifyFails);
     }
-#endif
 
     DBG_LOG("SelfTest: gps=%s acc=%s flash=%s\r\n",
             bGpsRan   ? (bGpsOk   ? "OK" : "FAIL") : "n/a",
@@ -174,11 +168,7 @@ bool SELFTEST_bAccOk(void)   { return bAccOk;   }
  * tag report flash=OK for 18 h. */
 bool SELFTEST_bFlashOk(void)
 {
-#ifdef STORAGE_BACKEND_FLASH
     return bFlashRan ? FLASH_bDevicePresent() : bFlashOk;
-#else
-    return bFlashOk;
-#endif
 }
 
 bool SELFTEST_bGpsApplicable(void)
@@ -188,9 +178,5 @@ bool SELFTEST_bGpsApplicable(void)
 
 bool SELFTEST_bFlashApplicable(void)
 {
-#ifdef STORAGE_BACKEND_FLASH
     return true;
-#else
-    return false;
-#endif
 }

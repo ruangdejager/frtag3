@@ -1,7 +1,7 @@
 /*
  * hal_adc.c
  *
- * ADC driver — battery (PA12/IN8), VSOLAR (PB3/IN2), RSENSE (PB4/IN3).
+ * ADC driver — battery (PA12/IN8), VSOLAR (PB3/IN2).
  *
  * The peripheral is shared. Use HAL_ADC_vLock / HAL_ADC_vUnlock around
  * each full enable → convert → disable sequence.
@@ -121,15 +121,6 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *adcHandle)
         GPIO_InitStruct.Pin  = BSP_VSOLAR_MEAS_PIN;
         HAL_GPIO_Init(BSP_VSOLAR_MEAS_PORT, &GPIO_InitStruct);
 
-        /* RSENSE (PB4) is no longer sampled (see SolarPower — the shunt front-end
-         * is non-functional on this board revision, Rsense fitted as 0 Ω). It is
-         * still parked here as ANALOG / NOPULL: that is the zero-static-current
-         * state for an unused pin, and crucially it disables PB4's reset-default
-         * NJTRST pull-up — which would otherwise leak ~VDD/Rpull through the 0 Ω
-         * link to GND. Do not remove this init. */
-        GPIO_InitStruct.Pin  = BSP_RSENSE_MEAS_PIN;
-        HAL_GPIO_Init(BSP_RSENSE_MEAS_PORT, &GPIO_InitStruct);
-
         HAL_NVIC_SetPriority(ADC_IRQn, 5, 0);
         HAL_NVIC_EnableIRQ(ADC_IRQn);
     }
@@ -161,9 +152,6 @@ void HAL_ADC_vSelectChannel(hal_adc_channel_t channel)
             break;
         case VSOLAR_VOLTAGE_CHANNEL:
             sConfig.Channel = BSP_VSOLAR_ADC_CHANNEL;
-            break;
-        case RSENSE_VOLTAGE_CHANNEL:
-            sConfig.Channel = BSP_RSENSE_ADC_CHANNEL;
             break;
         case VREFINT_CHANNEL:
             sConfig.Channel = ADC_CHANNEL_VREFINT;

@@ -32,10 +32,8 @@
 #include "flashLog.h"
 
 #include "build_config.h"
-#ifdef STORAGE_BACKEND_FLASH
 #include "Fota.h"
 #include "version_config.h"
-#endif
 
 #include "GPS.h"
 #include "Movement.h"
@@ -376,10 +374,10 @@ static uint16_t u16StatBeaconsHeard;
 static uint16_t u16StatAcksHeard;
 static uint16_t u16StatMsgsForwarded;
 
-/* Field-test only - see MESH_DIAG_COUNTERS. DIAG_INC(Foo) touches u16DiagFoo,
+/* Field-test only - see ENABLE_MESH_DIAG_COUNTERS. DIAG_INC(Foo) touches u16DiagFoo,
  * and expands to nothing when the flag is off, so the names are never
  * referenced and cost neither RAM nor flash in a production build. */
-#ifdef MESH_DIAG_COUNTERS
+#ifdef ENABLE_MESH_DIAG_COUNTERS
 static uint16_t u16DiagFwdBeacon;
 static uint16_t u16DiagFwdDreq;
 static uint16_t u16DiagFwdAck;
@@ -704,7 +702,7 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
              * than quietly truncating the union" — without this flag the
              * truncation was exactly as quiet as a node that never answered,
              * which is the one reading that would send us hunting the radio
-             * instead of the table size. Matters most on a MESH_DIAG_COUNTERS
+             * instead of the table size. Matters most on a ENABLE_MESH_DIAG_COUNTERS
              * build, where the table is 64 rather than 120. */
             bTableFullDrop = true;
         }
@@ -1324,7 +1322,7 @@ static bool MESHNETWORK_bSendPacketDelayed(const uint8_t *pBuf, size_t u32Len,
     if (xMeshTxTaskHandle != NULL)
         osThreadFlagsSet(xMeshTxTaskHandle, MESH_TX_FLAG_QUEUE);
 
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
     DBG("MeshNetwork: Queued TX (len=%u, delay=%lu ms)\r\n",
         (unsigned)u32Len, (unsigned long)u32DelayMs);
 #endif
@@ -1511,7 +1509,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                     EVTLOG(LOG_TX_DREQ, 2);
                 }
             }
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
             else
             {
                 DBG("MeshNetwork: DReq forward budget spent\r\n");
@@ -1632,7 +1630,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     if (FORWARD_bHasSeen(tBeacon.u32BeaconMsgId))
     {
         DIAG_INC(DedupeHit);
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
         DBG("MeshNetwork: Beacon seen before\r\n");
 #endif
         tLastBeaconHeardTick = osKernelGetTickCount();
@@ -1909,7 +1907,7 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
 
     if (FORWARD_bHasSeen(u32AckMsgId))
     {
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
         DBG("MeshNetwork: Ack seen before\r\n");
 #endif
         return;
@@ -1991,7 +1989,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
      * numeric range, which would silently drop their packets. */
     if (bTimeSyncUtcValid && (int32_t)(u32Utc - u32LastTimeSyncUtc) <= 0)
     {
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
         DBG("MeshNetwork: TimeSync seen before\r\n");
 #endif
         return;
@@ -2034,14 +2032,12 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
      * second call, and the strict > means an equal or older announcement does
      * nothing. Nothing here touches the clock, the interval, the mode or the
      * forward path. */
-#ifdef STORAGE_BACKEND_FLASH
     if (u32StagedVer > VERSION_u32Get() && !FOTA_bAcceptanceArmed())
     {
         DBG_LOG("MeshNetwork: TimeSync offers newer fw v%lu (running v%lu) - auto-arming acceptance\r\n",
                 (unsigned long)u32StagedVer, (unsigned long)VERSION_u32Get());
         FOTA_vArmAcceptance();
     }
-#endif
 
     /* Secondary: accept only the first TimeSync this wake cycle.
      * Subsequent TimeSyncs are still forwarded (the mesh keeps
@@ -2070,7 +2066,7 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         if (xAppTask != NULL)
             osThreadFlagsSet(xAppTask, DEVICE_DISCOVERY_NOTIFY_TIMESYNC);
     }
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
     else
     {
         DBG("MeshNetwork: TimeSync seen (already accepted this wake)\r\n");
@@ -2110,7 +2106,6 @@ void MESHNETWORK_vParserTask(void *pvParameters)
 
         MeshPktType_e eType = (MeshPktType_e)tRx.buffer[0];
 
-#ifdef STORAGE_BACKEND_FLASH
         /* FOTA takes priority: while a distribute or receive session is
          * active, ordinary mesh traffic (beacons, DReq/DAck, TimeSync,
          * FrKernel) adds nothing but radio/CPU contention right when a
@@ -2125,7 +2120,6 @@ void MESHNETWORK_vParserTask(void *pvParameters)
         {
             continue;
         }
-#endif
 
         /* R&D radio link/range test. Same shape as the FOTA filter above:
          * placed after the RX read so the LoRa queue still drains, and before
@@ -2193,7 +2187,6 @@ void MESHNETWORK_vParserTask(void *pvParameters)
                                                tRx.i16NoiseFloor);
 #endif
                 break;
-#ifdef STORAGE_BACKEND_FLASH
             case MeshPktType_OtaPrep:
             case MeshPktType_OtaPrepAck:
             case MeshPktType_OtaChunk:
@@ -2204,7 +2197,6 @@ void MESHNETWORK_vParserTask(void *pvParameters)
                  * re-forwarded. */
                 FOTA_vOnLoraPacket(tRx.buffer, tRx.length);
                 break;
-#endif
             default:
                 DBG_LOG("MeshNetwork: Unknown pkt type %u\r\n", tRx.buffer[0]);
                 break;
@@ -2255,7 +2247,7 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
             if (tItem.u32ReadyTick > now)
                 osDelay(tItem.u32ReadyTick - now);   /* wait out the TX jitter */
 
-#ifdef MESH_LOG_VERBOSE
+#ifdef ENABLE_MESH_VERBOSE_LOG
             DBG("MeshNetwork: TX (len=%u)\r\n", tItem.u16Len);
 #endif
             MESHNETWORK_bTxSendRaw(tItem.u8Buf, tItem.u16Len);
@@ -2895,9 +2887,8 @@ bool MESHNETWORK_bCampaignHeard(void)
 }
 
 /* Radio-test support. The worker exists in every build that calls
- * MESHNETWORK_vInit, which is every production build; an ENABLE_RADIO_TEST
- * build skips MeshNetwork entirely, and the runtime test checks this before
- * entering rather than beaconing into a task that is not there. */
+ * MESHNETWORK_vInit; the runtime test checks this before entering rather than
+ * beaconing into a task that is not there. */
 bool MESHNETWORK_bTxWorkerReady(void)
 {
     return (xMeshTxTaskHandle != NULL);
@@ -3004,7 +2995,7 @@ void MESHNETWORK_vLogCampaignStats(const char *pcTag)
             (unsigned)(u16StatTxDropped + LORARADIO_u16GetAndClearTxStaleDrops()),
             (unsigned long)MESHNETWORK_u32GetTxJitterCeilingMs());
 
-#ifdef MESH_DIAG_COUNTERS
+#ifdef ENABLE_MESH_DIAG_COUNTERS
     /* Second line rather than a longer first one: the production line is
      * already at the width a flash-log record wants to be, and these are a
      * field-test extra that a production log will never carry. */

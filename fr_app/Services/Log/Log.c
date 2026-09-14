@@ -18,7 +18,6 @@
 
 #include "build_config.h"
 
-#ifdef STORAGE_BACKEND_FLASH
 
 #include "Log.h"
 #include "Flash.h"
@@ -302,8 +301,7 @@ void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
      * (LORA_MAX_PACKET_SIZE - 3 = 253 B), so a chunk normally maps to exactly
      * one radio packet, while still being far fewer, larger flash reads /
      * sink calls than the old 64 B chunking (which throttled throughput over
-     * both the debug UART and, worse, LoRa). A sink that needs a smaller
-     * unit (or gets handed a larger one, e.g. MicroSD's block-sized chunks)
+     * both the debug UART and, worse, LoRa). A sink that needs a smaller unit
      * is free to split further itself. */
     uint8_t  au8Chunk[200];
 
@@ -339,4 +337,3 @@ void LOG_vPark(void)
     FLASH_vDeepPowerDown();
 }
 
-#endif /* STORAGE_BACKEND_FLASH */

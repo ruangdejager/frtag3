@@ -1,8 +1,8 @@
 /*
  * SolarPower_Driver.h
  *
- * Board-level macros for solar power ADC measurement.
- * No bias circuit — VSOLAR and RSENSE are measured directly.
+ * Board-level macros for solar panel voltage ADC measurement.
+ * No bias circuit — VSOLAR is measured directly through its divider.
  */
 
 #ifndef WORKER_SOLARPOWER_SOLARPOWER_DRIVER_H_
@@ -17,7 +17,6 @@
 #define SOLAR_DRIVER_bGetInterruptFlag() HAL_ADC_bGetInterruptFlag()
 #define SOLAR_DRIVER_vCleanInterrupt()   HAL_ADC_vClearInterruptFlag()
 #define SOLAR_DRIVER_vStartVsolar()      HAL_ADC_vStartConversion(VSOLAR_VOLTAGE_CHANNEL)
-#define SOLAR_DRIVER_vStartRsense()      HAL_ADC_vStartConversion(RSENSE_VOLTAGE_CHANNEL)
 #define SOLAR_DRIVER_u16GetResult()      HAL_ADC_u16GetResult()
 
 #endif /* WORKER_SOLARPOWER_SOLARPOWER_DRIVER_H_ */

@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "build_config.h"   /* ENABLE_MOVEMENT_SENSOR_DATA_API */
 #include "Movement_Config.h"
 
 /* ---- Motion state ---- */
@@ -22,7 +23,7 @@ typedef enum {
 void        MOVE_vInit(void);
 MoveState_e MOVE_eGetState(void);
 
-#ifdef SWITCH_MOVE_SENSOR_DATA
+#ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
 int8_t MOVE_i8SensorDataX(void);
 int8_t MOVE_i8SensorDataY(void);
 int8_t MOVE_i8SensorDataZ(void);

@@ -39,9 +39,8 @@ void     LOG_vErase(void);
  * reset ("tag flash eraseall"), not routine log maintenance. */
 void     LOG_vEraseAll(void);
 
-/* Release the backing storage device for the idle/STOP2 period that follows
- * (NOR flash -> deep-power-down; MicroSD -> flush any partial block + deselect).
- * Called by the DbgLog consumer as its last act before it blocks. */
+/* Release the NOR flash into deep-power-down for the idle/STOP2 period that
+ * follows. Called by the DbgLog consumer as its last act before it blocks. */
 void     LOG_vPark(void);
 
 /* Stream the entire log FIFO (oldest → newest) out the debug transport via

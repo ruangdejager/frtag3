@@ -42,9 +42,6 @@
 #include "MeshNetwork.h"
 #include "DeviceDiscovery.h"
 #include "Farmranger.h"
-#ifdef ENABLE_RADIO_TEST
-#  include "RadioTest.h"
-#endif
 #include "FrKernel_Config.h"
 #include "Battery.h"
 #include "SolarPower.h"
@@ -58,10 +55,6 @@
 #include "DbgLog.h"
 #include "SelfTest.h"
 
-#ifdef STORAGE_BACKEND_MICROSD
-#  include "MicroSD.h"
-#  include "AccLog.h"
-#endif
 
 #include "cmsis_os2.h"
 
@@ -107,16 +100,11 @@ void INIT_vInitialization(void *parameters)
      * metadata-migration path, which sat squarely in the same window.
      * (LOG_vWrite() now range-checks as well - see the guard there - so this
      * ordering is the belt and that check is the braces.) */
-#ifdef STORAGE_BACKEND_MICROSD
-    MICROSD_vInit();
-    LOG_vInit();
-#else
     FLASH_vInit();
     LOG_vInit();
     /* One-time OTA partition migration + latch installed-version into
      * TAMP->BKP3R for the bootloader to compare against (see Fota_Config.h). */
     FOTA_vInit();
-#endif
 
     /* Record the active build_config.h feature set at the top of every boot
      * log, so "what did I actually flash" is recoverable from the terminal
@@ -144,26 +132,44 @@ void INIT_vInitialization(void *parameters)
 #ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
         " FRKERNEL_INTERFACE_LORA_BRIDGE\r\n"
 #endif
-#ifdef STORAGE_BACKEND_FLASH
-        " STORAGE_BACKEND_FLASH\r\n"
-#endif
-#ifdef STORAGE_BACKEND_MICROSD
-        " STORAGE_BACKEND_MICROSD\r\n"
-#endif
 #ifdef DEBUG_OUTPUT_UART
         " DEBUG_OUTPUT_UART\r\n"
 #endif
 #ifdef DEBUG_OUTPUT_USB
         " DEBUG_OUTPUT_USB\r\n"
 #endif
-#ifdef LEDS_ALLOWED
-        " LEDS_ALLOWED\r\n"
-#endif
-#ifdef ENABLE_RADIO_TEST
-        " ENABLE_RADIO_TEST\r\n"
+#ifdef ENABLE_LEDS
+        " ENABLE_LEDS\r\n"
 #endif
 #ifdef ENABLE_LOW_POWER_RECOVERY
         " ENABLE_LOW_POWER_RECOVERY\r\n"
+#endif
+#ifdef ENABLE_FLASH_LOG
+        " ENABLE_FLASH_LOG\r\n"
+#endif
+#ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
+        " ENABLE_MOVEMENT_SENSOR_DATA_API\r\n"
+#endif
+#ifdef ENABLE_MESH_DIAG_COUNTERS
+        " ENABLE_MESH_DIAG_COUNTERS\r\n"
+#endif
+#ifdef ENABLE_MESH_VERBOSE_LOG
+        " ENABLE_MESH_VERBOSE_LOG\r\n"
+#endif
+#ifdef ENABLE_SOLAR_PERIODIC_LOG
+        " ENABLE_SOLAR_PERIODIC_LOG\r\n"
+#endif
+#ifdef ENABLE_GPS_PERIODIC_LOG
+        " ENABLE_GPS_PERIODIC_LOG\r\n"
+#endif
+#ifdef ENABLE_GNSS_LOGGER_BUILD
+        " ENABLE_GNSS_LOGGER_BUILD\r\n"
+#endif
+#ifdef ENABLE_GNSS_NMEA_GGA
+        " ENABLE_GNSS_NMEA_GGA\r\n"
+#endif
+#ifdef TIME_TZ_DEFAULT_BRISBANE
+        " TIME_TZ_DEFAULT_BRISBANE\r\n"
 #endif
         "\r\n");
 
@@ -188,33 +194,16 @@ void INIT_vInitialization(void *parameters)
     LORARADIO_vInit();
     FRKERNEL_vInit();
 
-#ifdef ENABLE_RADIO_TEST
-    /*
-     * Radio link/range test mode: the strapped secondary beacons every 5 s,
-     * the strapped primary listens and logs the RSSI/SNR of each beacon plus
-     * any gaps in its sequence number.  MeshNetwork and DeviceDiscovery are
-     * skipped because they also drive the radio and would interfere -- which
-     * also leaves the LoRa RX queue for RadioTest to drain itself.
-     * DBG output is visible on the debug UART (always enabled).
-     */
-    RADIO_TEST_vInit();
-
-    /* Same reasoning as the bridge below: without a permanently held sleep
-     * lock the system drops into STOP2, which parks the debug UART pins to
-     * analog (terminal goes dead) and suspends the core, so the radio task
-     * could only service RX once per 1 Hz RTC heartbeat. Survivable for the
-     * old fire-and-forget TX smoke test; fatal for a listener. */
-    SYSTEM_vSleepLockAcquire();
-#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
     /*
      * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
      * is relaying whatever the user types over the debug UART out as a LoRa
      * FrKernel command, and printing whatever answer comes back. MeshNetwork
      * supplies the radio TX/RX plumbing (its parser task is what delivers
      * inbound FrKernel packets to FRKERNEL.c's callback); DeviceDiscovery,
-     * Farmranger, GPS and Movement are all skipped, same rationale as
-     * ENABLE_RADIO_TEST -- a scheduled campaign or logger session would
-     * fight this device for the radio/UART instead of just relaying.
+     * Farmranger, GPS and Movement are all skipped -- a scheduled campaign or
+     * logger session would fight this device for the radio/UART instead of
+     * just relaying.
      */
     MESHNETWORK_vInit();
 
@@ -246,11 +235,6 @@ void INIT_vInitialization(void *parameters)
     {
         SOLAR_vInit();
         ACC_vInit();
-#ifdef STORAGE_BACKEND_MICROSD
-        /* Recover the ACC-data write head before the movement task (which feeds
-         * the logger from its 1 Hz FIFO drain) starts ticking. */
-        ACCLOG_vInit();
-#endif
         MOVE_vInit();
         GPS_vInit();
     }
@@ -276,7 +260,7 @@ void INIT_vInitialization(void *parameters)
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
     }
-#endif /* ENABLE_RADIO_TEST / FRKERNEL_INTERFACE_LORA_BRIDGE */
+#endif /* FRKERNEL_INTERFACE_LORA_BRIDGE */
 
     TIME_vInit();
     BAT_vInit();

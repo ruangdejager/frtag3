@@ -27,10 +27,8 @@
  *    its heap and ~6.5 KB more of it free — ever takes that path.
  *
  *  - The listener does NOT drain the LoRa RX queue. That queue belongs to
- *    MESHNETWORK_vParserTask in a production build, which is the key
- *    difference from the compile-time ENABLE_RADIO_TEST build in RadioTest.c
- *    (there, the mesh does not exist and RadioTest owns the queue outright).
- *    Beacons reach us through RADIOTESTMODE_vOnBeacon, called from the parser.
+ *    MESHNETWORK_vParserTask. Beacons reach us through
+ *    RADIOTESTMODE_vOnBeacon, called from the parser.
  *
  *  - The parser hands us beacons on its own task. We only parse and enqueue
  *    there; the logging and the Farmranger round-trip happen on our task,
@@ -67,7 +65,7 @@
 /* Listener only — the beacon role creates no task at all; see the note at the
  * top of the file and RADIOTESTMODE_u32ServiceBeacon below.
  *
- * Unlike the compile-time ENABLE_RADIO_TEST build, this task has to fit on the
+ * This task has to fit on the
  * heap ALONGSIDE everything the mesh build already created — LoRa radio task,
  * MeshNetwork's two tasks, DeviceDiscovery's two tasks, FrKernel, Farmranger's
  * two, Battery and Power. Those already commit on the order of 30 KB of the
@@ -216,11 +214,10 @@ bool RADIOTESTMODE_bEnter(void)
 
     /* A beaconing secondary has no task of its own — it rides MeshNetwork's TX
      * worker. Refuse up front if that worker is not there rather than entering
-     * a mode that would then never transmit: that is the case in an
-     * ENABLE_RADIO_TEST build, where MESHNETWORK_vInit is skipped entirely and
-     * the compile-time test in RadioTest.c owns the radio instead. A silent
-     * no-beacon "success" would be indistinguishable, from the far end of a
-     * range walk, from a link that simply does not reach. */
+     * a mode that would then never transmit (a bridge build skips
+     * MESHNETWORK_vInit's campaign side). A silent no-beacon "success" would be
+     * indistinguishable, from the far end of a range walk, from a link that
+     * simply does not reach. */
     if (!bIsListener && !MESHNETWORK_bTxWorkerReady())
     {
         pcLastEnterError = "no mesh TX worker";

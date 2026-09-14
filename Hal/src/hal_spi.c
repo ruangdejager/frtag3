@@ -95,11 +95,7 @@ static void HAL_SPI_vInitAccHw(void)
     bAccSpiParked = false;
 }
 
-/* Configure SPI2 at the given baud prescaler. The flash runs at a fixed /64;
- * the MicroSD card (same SPI2 bus, mutually exclusive HW) needs a slow /128
- * for its init handshake and a faster rate for block I/O, so the prescaler is
- * a parameter here. */
-static void HAL_SPI_vInitFlashHwPrescaled(uint32_t u32Prescaler)
+static void HAL_SPI_vInitFlashHw(void)
 {
     hFlashSpi.State                  = HAL_SPI_STATE_RESET;
     hFlashSpi.Instance               = FLASH_SPI;
@@ -109,7 +105,7 @@ static void HAL_SPI_vInitFlashHwPrescaled(uint32_t u32Prescaler)
     hFlashSpi.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hFlashSpi.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hFlashSpi.Init.NSS               = SPI_NSS_SOFT;
-    hFlashSpi.Init.BaudRatePrescaler = u32Prescaler;
+    hFlashSpi.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;  /* ~0.5 MHz at 32 MHz PCLK */
     hFlashSpi.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hFlashSpi.Init.TIMode            = SPI_TIMODE_DISABLE;
     hFlashSpi.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -118,18 +114,6 @@ static void HAL_SPI_vInitFlashHwPrescaled(uint32_t u32Prescaler)
     hFlashSpi.Init.NSSPMode          = SPI_NSS_PULSE_ENABLE;
     HAL_SPI_Init(&hFlashSpi);
     bFlashSpiParked = false;
-}
-
-static void HAL_SPI_vInitFlashHw(void)
-{
-    HAL_SPI_vInitFlashHwPrescaled(SPI_BAUDRATEPRESCALER_64);  /* ~0.5 MHz at 32 MHz PCLK */
-}
-
-/* Re-configure the shared SPI2 bus to a new baud prescaler for the MicroSD
- * driver. Clears any parked flag (the bus is live again on return). */
-void HAL_SPI_SD_vSetSpeed(uint32_t u32Prescaler)
-{
-    HAL_SPI_vInitFlashHwPrescaled(u32Prescaler);
 }
 
 void HAL_SPI_vInit(void)

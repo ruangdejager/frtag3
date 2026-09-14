@@ -14,31 +14,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Build-configuration flags. These MUST be defined before anything that tests
- * them: MESH_DIAG_COUNTERS below selects MESH_MAX_NEIGHBORS, and when this
- * block sat further down the header the test silently took the production
- * branch - the diag build compiled, linked on the last 8 bytes of RAM, and
- * carried a 120-entry table it was supposed to have traded away. */
-/*
- * Extra per-campaign diagnostic counters for a field-test build. OFF for
- * production, like MESH_LOG_VERBOSE above - but for a different reason. These
- * are not verbose (they add one aggregate line per campaign, nothing
- * per-packet); they cost RAM, and .bss is byte-exact full.
- *
- * What they exist to answer, none of which the production stats line can:
- *   - fwdBeacon vs fwdDreq/fwdAck/fwdTs: "forwarded=" is one lumped number, so
- *     beacon relay amplification - the term that should stop scaling with herd
- *     size now the dedupe ring holds 48 - cannot be separated from the rest.
- *   - dedupeHit: beacons correctly suppressed as already-seen. The direct read
- *     on whether the 16-bit fold bought real history.
- *   - bpSkipBeacon: beacon relays refused because the TX queue was already
- *     deep. The cleanest single measure of node saturation, and deliberately
- *     NOT in the production tally (see u16StatTxDropped, where counting
- *     back-pressure would make the number climb when things are working).
- *
- * Enabling this costs ~8 B of .bss, which does not fit alongside
- * MESH_MAX_NEIGHBORS at 120 - see there. */
-#define MESH_DIAG_COUNTERS
+/* ENABLE_MESH_DIAG_COUNTERS and ENABLE_MESH_VERBOSE_LOG live in build_config.h.
+ * This include MUST come before anything that tests them: the diag flag selects
+ * MESH_MAX_NEIGHBORS below, and a test that runs before the flag is visible
+ * silently takes the production branch — a diag build that linked on the last
+ * 8 bytes of RAM and still carried the 120-entry table it was supposed to have
+ * traded away. */
+#include "build_config.h"
 
 /* ---- Timing constants ---- */
 /* Beacon retry cadence while awaiting a D-Ack. Was one fixed 3500 ms period.
@@ -353,7 +335,7 @@
  * fleet — D-Acks carry MESH_MAX_ACK_IDS_PER_PACKET ids per
  * MESH_PRIMARY_ACK_INTERVAL_MS (12 per 4 s), so even 120 nodes need ~40 s of
  * ack airtime per campaign. */
-#ifdef MESH_DIAG_COUNTERS
+#ifdef ENABLE_MESH_DIAG_COUNTERS
 /* The diag counters need ~8 B that .bss does not have, so a field-test build
  * buys them by capping the table lower. 64 still clears a 30-50 node herd with
  * headroom, and each entry saved is 24 B of .bss plus 24 B of the stack array
@@ -532,19 +514,6 @@
  * APP_DISCOVERY_WINDOW_TIMEOUT_MS on its own - and it spends airtime in the
  * quiet spans the deep-wave floors exist to provide. */
 #define MESH_KEEPALIVE_QUIET_MS       3000U
-
-/*
- * Per-packet verbose text logging. During a campaign every node hears every
- * neighbour's (re)transmissions, so the per-packet plumbing lines — the
- * "Queued TX"/"TX (len=)" duplicates of "Transmitting ..." and the
- * "... seen before" dedup hits — multiply O(N) across the fleet and are the
- * dominant flash-log/ring-buffer noise. Off by default: the event narrative
- * (received/forwarded/sent, beacon start/stop, timesync applied) and a single
- * "Transmitting <type> len=" per TX are still logged. Define this for bench
- * debugging of the TX queue / dedup behaviour.
- */
-// #define MESH_LOG_VERBOSE
-
 
 /* ---- Packet types (wire, first byte) ---- */
 typedef enum {
@@ -876,8 +845,8 @@ uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void);
 
 /* TX-worker hooks for the runtime radio range test (RadioTestMode.c), whose
  * beaconing secondary has no task of its own and runs on the TX worker.
- * bTxWorkerReady lets it refuse to enter where there is no worker to run on
- * (an ENABLE_RADIO_TEST build skips MESHNETWORK_vInit); vWakeTxWorker breaks
+ * bTxWorkerReady lets it refuse to enter where there is no worker to run on;
+ * vWakeTxWorker breaks
  * the worker out of the indefinite wait it is in by the time the test's own
  * gates have silenced every other path to it. */
 bool MESHNETWORK_bTxWorkerReady(void);

@@ -2,8 +2,8 @@
  * RadioTestMode.h
  *
  * Runtime radio link/range test — R&D bench + field tool, built into the
- * PRODUCTION firmware (unlike ENABLE_RADIO_TEST in RadioTest.h, which is a
- * compile-time build that replaces the mesh entirely).
+ * PRODUCTION firmware. There is no separate radio-test build: the mode is
+ * entered at run time by FrKernel command and nothing else changes.
  *
  * Nothing here runs until a FrKernel command explicitly enters the mode, and
  * everything it touches is behind RADIOTESTMODE_bActive(). A unit that is

@@ -21,7 +21,7 @@
 typedef enum {
     SELFTEST_ERR_GPS   = 1,   /* secondary only; not run on primary  */
     SELFTEST_ERR_ACC   = 2,
-    SELFTEST_ERR_FLASH = 3,   /* not run under STORAGE_BACKEND_MICROSD */
+    SELFTEST_ERR_FLASH = 3,
 } SelfTestErr_e;
 
 /* Runs the three checks, records each outcome, and if any failed flashes
@@ -37,9 +37,8 @@ void SELFTEST_vRunAndReport(void);
  * FLASH is answered LIVE from the driver gate instead: that gate can close and
  * re-open at run time, so a boot snapshot would keep reporting OK on a unit
  * whose log and FOTA staging had since stopped working — the exact failure this
- * check is meant to catch. A "not applicable" test (GPS on primary, flash on
- * MicroSD build) counts as OK so callers can decide with the *Applicable()
- * pair. */
+ * check is meant to catch. A "not applicable" test (GPS on primary) counts as
+ * OK so callers can decide with the *Applicable() pair. */
 bool SELFTEST_bGpsOk(void);
 bool SELFTEST_bAccOk(void);
 bool SELFTEST_bFlashOk(void);

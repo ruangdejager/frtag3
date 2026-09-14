@@ -26,9 +26,7 @@
  *   commit metadata, AT+FWDONE=OK, arm bootloader, reset
  */
 
-#include "build_config.h"   /* STORAGE_BACKEND_FLASH */
-
-#ifdef STORAGE_BACKEND_FLASH
+#include "build_config.h"
 
 #include "Fota.h"
 #include "Fota_Config.h"
@@ -202,7 +200,6 @@ bool FOTA_bEraseScratch(void)
              * ambiguity is what made 18 h of "FWDONE=ERROR (delivered 0 B)"
              * unreadable from the fr9 side: the tag knew its flash gate was
              * shut and never said so. */
-#ifdef STORAGE_BACKEND_FLASH
             Flash_Health_t tHealth;
             FLASH_vGetHealth(&tHealth);
             DBG_LOG("Fota: scratch erase FAILED @0x%05lX - flash %s "
@@ -214,10 +211,6 @@ bool FOTA_bEraseScratch(void)
                     (unsigned)tHealth.bWriteProtected,
                     (unsigned)tHealth.bUnprotectFailed,
                     (unsigned)tHealth.u16EraseVerifyFails);
-#else
-            DBG_LOG("Fota: scratch erase FAILED @0x%05lX\r\n",
-                    (unsigned long)u32Addr);
-#endif
             return false;
         }
         osDelay(1);   /* yield between sectors (~45 ms each, ~3 s total) */
@@ -2347,4 +2340,3 @@ void FOTA_vSecondaryReceive(void)
     FOTA_vArmBootloaderAndReset(tPrep.u32Version);
 }
 
-#endif /* STORAGE_BACKEND_FLASH */

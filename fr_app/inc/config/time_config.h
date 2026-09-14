@@ -8,11 +8,13 @@
 #ifndef TIME_CONFIG_H_
 #define TIME_CONFIG_H_
 
+#include "build_config.h"   /* TIME_TZ_DEFAULT_BRISBANE */
+
 /* --------------------------------------------------------------------------
  * Timezone adjustment from UTC (seconds)
  * -------------------------------------------------------------------------- */
 #define TIME_TZ_GMT_ADJ_MIN     INT32_C(-43200)  /* UTC-12:00 */
-#ifdef POC_TZ
+#ifdef TIME_TZ_DEFAULT_BRISBANE
 /* Brisbane, Australia — UTC+10 */
 #  define TIME_TZ_GMT_ADJ_DEF   INT32_C(36000)
 #else

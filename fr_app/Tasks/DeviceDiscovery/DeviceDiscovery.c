@@ -38,11 +38,8 @@
 
 #include <stdlib.h>   /* rand() / srand() — basic-mode beacon jitter */
 
-/* STORAGE_BACKEND_FLASH comes from build_config.h (included above). */
-#ifdef STORAGE_BACKEND_FLASH
-#  include "Fota.h"
-#  include "version_config.h"
-#endif
+#include "Fota.h"
+#include "version_config.h"
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -202,12 +199,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* R6: drop any TX left over from the previous campaign (e.g. a
          * late-jittered forward) so it can't fire at the start of this one. */
         MESHNETWORK_vFlushTxQueue(false);
-#ifdef STORAGE_BACKEND_FLASH
         /* Likewise drop an OtaPrep latched last campaign but never serviced —
          * left set, it makes the session-id latch reject this campaign's Prep
          * and the unit stops accepting firmware entirely. */
         FOTA_vDropStalePrep();
-#endif
 
         DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());
@@ -638,7 +633,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                                                APP_SECONDARY_POLL_MS);
                 if (!(r & osFlagsError))
                 {
-#ifdef STORAGE_BACKEND_FLASH
                     /* OTA prep announced instead of a DReq: this wake slot
                      * becomes a firmware-receive session. On a complete +
                      * verified image the call resets into the bootloader;
@@ -648,7 +642,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         FOTA_vSecondaryReceive();
                         break;
                     }
-#endif
                     if (r & DEVICE_DISCOVERY_NOTIFY_TIMESYNC)
                     {
                         bTimeSync = true;
@@ -703,7 +696,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: TimeSync received\r\n",
                     LORARADIO_u32GetUniqueId());
 
-#ifdef STORAGE_BACKEND_FLASH
                 /* If armed (this wake's TimeSync auto-arm, or a still-armed
                  * leftover from a prior wake), the primary may follow this
                  * very TimeSync with a distribute session in the SAME wake
@@ -728,7 +720,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         }
                     }
                 }
-#endif
             }
             else
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
@@ -957,7 +948,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * all — secondaries have no Farmranger UART link. */
                 DEVICE_DISCOVERY_vSendTS();
 
-#ifdef STORAGE_BACKEND_FLASH
                 /* ---- LoRa distribution to secondaries (if a staged image is
                  * ready) ----
                  * Right after TimeSync, before the fr9 UART check: secondaries
@@ -995,7 +985,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * it into the ext-flash scratchpad. On success this arms the
                  * bootloader and RESETS — nothing after it runs this wake. */
                 FOTA_bUartAcquire();
-#endif
 
                 DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
             }
@@ -1034,7 +1023,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG_LOG("DeviceDiscovery: Kernel wakeup - waiting up to %u s for FrKernel session...\r\n",
                 DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS / 1000U);
 
-#ifdef STORAGE_BACKEND_FLASH
             /* Drop any leftover discovery TimeSync auto-arm before the kernel
              * session opens: this wake is for kernel commands, not OTA. Left
              * armed, a stray OtaPrep here would latch (bPrepPending) and — since
@@ -1046,7 +1034,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              * via the kernel path. */
             if (!FOTA_bAcceptanceArmedViaKernel())
                 FOTA_vDisarmAcceptance();
-#endif
 
             uint32_t u32WaitedMs = 0U;
             while (!FRKERNEL_bIsConnected() && u32WaitedMs < DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS)
@@ -1090,7 +1077,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             DBG("DeviceDiscovery: FrKernel session active — waiting for release...\r\n");
             while (FRKERNEL_bIsConnected())
             {
-#ifdef STORAGE_BACKEND_FLASH
                 if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
                     FOTA_bAcceptanceArmedViaKernel() && FOTA_bPrepPending())
                 {
@@ -1111,7 +1097,6 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     FOTA_vClearDistributeRequest();
                     FOTA_vDistribute();
                 }
-#endif
                 osDelay(500);
             }
         }
@@ -1203,56 +1188,8 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (bSolarWakeDisabled)
                 continue;
 
-#ifdef ENABLE_SOLAR_POWER_SENSE
-            if (SOLAR_u32GetPowerMW() >= SOLAR_ACTIVATION_POWER_MW)
-            {
-                eProductionState = PRODUCTION_ACTIVE;
-                /* Swap the STOP2-indicator LED back to red now that we're
-                 * no longer in ProductionSleep — see the setter's docs. */
-                HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
-
-                /* Hold off deep sleep until the resulting kernel window
-                 * completes (released at the end of
-                 * DEVICE_DISCOVERY_vAppTask's loop). Re-arm the debug UART
-                 * BEFORE logging so the activation is observable live —
-                 * STOP2 parked its pins analog and this branch is otherwise
-                 * the only wake path that forgets to restore them. */
-                SYSTEM_vSleepLockAcquire();
-                HAL_UART_vInit();
-                DEBUG_vInit();
-
-                DBG_LOG("DeviceDiscovery: Solar activation (%lu mW) — exiting ProductionSleep\r\n",
-                    SOLAR_u32GetPowerMW());
-
-                /* Fire a GPS fix immediately on takeoff, not just at the next
-                 * scheduled 3-min pre-trigger: a device that just spent an
-                 * unbounded stretch in ProductionSleep (no RTC-correcting
-                 * TimeSync while asleep) is exactly the case most likely to
-                 * have a drifted RTC, so get it corrected as early as
-                 * possible instead of waiting. GPS_vRequestFix() now owns
-                 * its own deep-sleep lock (taken on cold start, released in
-                 * GPS_vPowerOff()), independent of the kernel-window lock
-                 * acquired above (released separately at the AppTask loop
-                 * end). */
-                if (POWER_tGetState() & POWER_CLASS_NORMAL)
-                {
-                    DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
-                    /* bForce=true: RTC correction after unbounded
-                     * ProductionSleep must run even if the user disabled
-                     * routine GPS via fr9. */
-                    GPS_vRequestFix(true, 300, true);
-                }
-
-                /* Open a FrKernel window instead of an autonomous discovery
-                 * campaign (same path the shake-wakeup trigger uses); the
-                 * kernel's own 5-min inactivity timeout — or an explicit
-                 * "tag release" — is what returns the device to normal
-                 * scheduled-wake sleep from here. */
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
-            }
-#else
-            /* Panel power sensing is disabled (broken RSENSE front-end); gate
-             * ProductionSleep exit on panel VOLTAGE instead. */
+            /* ProductionSleep exit is gated on panel VOLTAGE — this board
+             * measures Vsolar only, no panel current. */
             if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
             {
                 eProductionState = PRODUCTION_ACTIVE;
@@ -1260,9 +1197,12 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                  * no longer in ProductionSleep — see the setter's docs. */
                 HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
 
-                /* See the ENABLE_SOLAR_POWER_SENSE branch above for why the
-                 * UART is re-armed here and why this opens a kernel window
-                 * rather than a discovery campaign. */
+                /* Hold off deep sleep until the resulting kernel window
+                 * completes (released at the end of DEVICE_DISCOVERY_vAppTask's
+                 * loop). Re-arm the debug UART BEFORE logging so the activation
+                 * is observable live — STOP2 parked its pins analog and this
+                 * branch is otherwise the only wake path that forgets to
+                 * restore them. */
                 SYSTEM_vSleepLockAcquire();
                 HAL_UART_vInit();
                 DEBUG_vInit();
@@ -1270,9 +1210,13 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Solar activation (%u mV) — exiting ProductionSleep\r\n",
                     SOLAR_u16GetVSolarMV());
 
-                /* See the ENABLE_SOLAR_POWER_SENSE branch above for why this
-                 * fires a GPS fix immediately (RTC correction on takeoff);
-                 * GPS_vRequestFix() owns its own sleep lock. */
+                /* Fire a GPS fix immediately on takeoff, not just at the next
+                 * scheduled 3-min pre-trigger: a device that just spent an
+                 * unbounded stretch in ProductionSleep (no RTC-correcting
+                 * TimeSync while asleep) is exactly the case most likely to
+                 * have a drifted RTC, so get it corrected as early as possible.
+                 * GPS_vRequestFix() owns its own deep-sleep lock, independent
+                 * of the kernel-window lock acquired above. */
                 if (POWER_tGetState() & POWER_CLASS_NORMAL)
                 {
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
@@ -1284,7 +1228,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
-#endif
             continue;
         }
 
@@ -1347,16 +1290,11 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
 
                 /* One solar reading per production wake instead of every 10 s
-                 * (see LOG_SOLAR_PERIODIC in SolarPower_Config.h). Primary has
+                 * (see ENABLE_SOLAR_PERIODIC_LOG in SolarPower_Config.h). Primary has
                  * no solar panel. */
                 if (eDeviceRole == DEVICE_ROLE_SECONDARY)
                 {
-#ifdef ENABLE_SOLAR_POWER_SENSE
-                    DBG_LOG("solar: Vsolar=%u mV  P=%lu mW\r\n",
-                        SOLAR_u16GetVSolarMV(), SOLAR_u32GetPowerMW());
-#else
                     DBG_LOG("solar: Vsolar=%u mV\r\n", SOLAR_u16GetVSolarMV());
-#endif
                 }
 
                 osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_WAKEUP_BIT);
@@ -1515,7 +1453,6 @@ static void DEVICE_DISCOVERY_vSendTS(void)
      * slot; announcing it here costs 4 bytes and one flash-metadata read,
      * no dedicated round trip. */
     uint32_t u32StagedVer = 0U;
-#ifdef STORAGE_BACKEND_FLASH
     FotaMeta_t tMeta;
     if (FOTA_bGetMeta(&tMeta) && tMeta.bValid)
     {
@@ -1535,7 +1472,6 @@ static void DEVICE_DISCOVERY_vSendTS(void)
                     (unsigned long)tMeta.u32Version);
         }
     }
-#endif
 
     MESHNETWORK_vSendTimeSync(RTC_u64GetUTC(), MESHNETWORK_tGetWakeupInterval(),
                                u32StagedVer,
