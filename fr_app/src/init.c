@@ -1,0 +1,312 @@
+/*
+ * init.c
+ *
+ * Boot-sequence task.
+ * Runs once immediately after the scheduler starts, initialises all
+ * hardware and software subsystems in the correct order, then exits.
+ *
+ * Order matters:
+ *   1. GPIO (board direction, charger enable)
+ *   2. Device-role detection (primary vs secondary)
+ *   3. UART (required by DBG macros)
+ *   4. DbgLog, ext-flash, text log
+ *   5. ADC, TIM2 tick counter
+ *   6. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
+ *   7. Settings
+ *   8. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
+ *   9. LoRa radio stack
+ *  10. Role-specific subsystems
+ *  11. Time, battery, power management
+ */
+
+#include "init.h"
+#include "build_config.h"
+#include "version_config.h"
+#include "hal_rtc.h"
+#include "hal_timer.h"
+#include "hal_uart.h"
+#include "hal_spi.h"
+#include "hal_system.h"
+#include "platform.h"
+#include "hal_gpio.h"
+#include "hal_adc.h"
+#include "hal_wdt.h"
+#include "settings.h"
+#include "main.h"
+
+#include "Gps.h"
+#include "Acc.h"
+
+#include "Movement.h"
+#include "LoraRadio.h"
+#include "MeshNetwork.h"
+#include "DeviceDiscovery.h"
+#include "Farmranger.h"
+#ifdef ENABLE_RADIO_TEST
+#  include "RadioTest.h"
+#endif
+#include "FrKernel_Config.h"
+#include "Battery.h"
+#include "SolarPower.h"
+#include "Power.h"
+#include "FrKernel.h"
+
+#include "flashLog.h"
+#include "Flash.h"
+#include "Log.h"
+#include "Fota.h"
+#include "DbgLog.h"
+#include "SelfTest.h"
+
+#ifdef STORAGE_BACKEND_MICROSD
+#  include "MicroSD.h"
+#  include "AccLog.h"
+#endif
+
+#include "cmsis_os2.h"
+
+volatile bool systemReadyForSleep = false;
+
+void INIT_vInitialization(void *parameters)
+{
+    (void)parameters;
+
+    FLASHLOG_vInit();
+
+    /* Board-level GPIO */
+    HAL_GPIO_vInit();
+
+    /* Determine primary / secondary role before UART init. This is the only
+     * read of the role strap (PB12); it tristates the pin immediately after, so
+     * latch the role into the UART layer here for the USART1 baud/swap choice
+     * rather than having HAL_UART_vInit() re-read the strap on every (re-)init. */
+    DEVICE_DISCOVERY_vConfigDeviceRole();
+    HAL_UART_vSetRole(DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
+
+    HAL_UART_vInit();
+
+    /* Both SPI peripherals (ACC + flash) must be up before FLASH_vInit and any
+     * DBG_LOG call that writes to ext-flash.  Single call covers both. */
+    HAL_SPI_vInit();
+
+    DBGLOG_vInit();
+
+    /* Storage backend + log-FIFO recovery BEFORE the first DBG_LOG.
+     *
+     * Ordering is load-bearing, not cosmetic. DBG_LOG publishes to the DbgLog
+     * ring and wakes its consumer task, which runs at osPriorityAboveNormal
+     * and so preempts this osPriorityNormal init task immediately. The
+     * consumer's flash sink is LOG_vWrite(), whose head pointer is a
+     * zero-initialised static - and 0 is OTA_SCRATCH_START_ADDR, the base of
+     * the staged firmware image. Logging before LOG_vInit() therefore aimed
+     * the log's own sector-erase at the image. Because it is boot-only code
+     * the damage only ever appeared after a power cycle, with the image
+     * verifying clean right up until the reset.
+     *
+     * FOTA_vInit() is deliberately after LOG_vInit() too: it DBG_LOGs on its
+     * metadata-migration path, which sat squarely in the same window.
+     * (LOG_vWrite() now range-checks as well - see the guard there - so this
+     * ordering is the belt and that check is the braces.) */
+#ifdef STORAGE_BACKEND_MICROSD
+    MICROSD_vInit();
+    LOG_vInit();
+#else
+    FLASH_vInit();
+    LOG_vInit();
+    /* One-time OTA partition migration + latch installed-version into
+     * TAMP->BKP3R for the bootloader to compare against (see Fota_Config.h). */
+    FOTA_vInit();
+#endif
+
+    /* Record the active build_config.h feature set at the top of every boot
+     * log, so "what did I actually flash" is recoverable from the terminal
+     * (or, once persisted, the flash/SD log) instead of only from whatever
+     * .cproject or build_config.h happened to say at build time. Only lists
+     * options this TU actually saw defined -- the string is assembled by the
+     * preprocessor, not read back at runtime.
+     *
+     * Now that this runs after LOG_vInit(), the banner actually reaches the
+     * persisted log - previously it was queued while bDevicePresent was still
+     * false and silently dropped, which is why "Build config:" never appeared
+     * in any field-pulled flash log. */
+    DBG_LOG("\r\n\r\nBuild config:\r\n"
+        " FW v%u.%u.%u\r\n",
+        (unsigned)VERSION_SW_MAJOR,
+        (unsigned)VERSION_SW_MINOR,
+        (unsigned)VERSION_SW_PATCH);
+    DBG_LOG(""
+#ifdef FRKERNEL_INTERFACE_UART
+        " FRKERNEL_INTERFACE_UART\r\n"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA
+        " FRKERNEL_INTERFACE_LORA\r\n"
+#endif
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+        " FRKERNEL_INTERFACE_LORA_BRIDGE\r\n"
+#endif
+#ifdef STORAGE_BACKEND_FLASH
+        " STORAGE_BACKEND_FLASH\r\n"
+#endif
+#ifdef STORAGE_BACKEND_MICROSD
+        " STORAGE_BACKEND_MICROSD\r\n"
+#endif
+#ifdef DEBUG_OUTPUT_UART
+        " DEBUG_OUTPUT_UART\r\n"
+#endif
+#ifdef DEBUG_OUTPUT_USB
+        " DEBUG_OUTPUT_USB\r\n"
+#endif
+#ifdef LEDS_ALLOWED
+        " LEDS_ALLOWED\r\n"
+#endif
+#ifdef ENABLE_RADIO_TEST
+        " ENABLE_RADIO_TEST\r\n"
+#endif
+#ifdef ENABLE_LOW_POWER_RECOVERY
+        " ENABLE_LOW_POWER_RECOVERY\r\n"
+#endif
+        "\r\n");
+
+    FLASHLOG_vDump();     /* no-op unless ENABLE_FLASH_LOG + DEBUG_OUTPUT_UART both defined */
+
+    // Enable WDT
+    HAL_WDT_vInit();
+    HAL_WDT_vReset();
+
+    HAL_ADC_vInit();
+    HAL_TIMER_vInit();
+
+    /* Platform must be created before RTC so the heartbeat task handle
+     * exists when the first RTC wakeup ISR fires. */
+    PLATFORM_vInit();
+    SETTINGS_vInit();
+
+    HAL_RTC_vInit();
+
+    osDelay(100);
+
+    LORARADIO_vInit();
+    FRKERNEL_vInit();
+
+#ifdef ENABLE_RADIO_TEST
+    /*
+     * Radio link/range test mode: the strapped secondary beacons every 5 s,
+     * the strapped primary listens and logs the RSSI/SNR of each beacon plus
+     * any gaps in its sequence number.  MeshNetwork and DeviceDiscovery are
+     * skipped because they also drive the radio and would interfere -- which
+     * also leaves the LoRa RX queue for RadioTest to drain itself.
+     * DBG output is visible on the debug UART (always enabled).
+     */
+    RADIO_TEST_vInit();
+
+    /* Same reasoning as the bridge below: without a permanently held sleep
+     * lock the system drops into STOP2, which parks the debug UART pins to
+     * analog (terminal goes dead) and suspends the core, so the radio task
+     * could only service RX once per 1 Hz RTC heartbeat. Survivable for the
+     * old fire-and-forget TX smoke test; fatal for a listener. */
+    SYSTEM_vSleepLockAcquire();
+#elif defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
+    /*
+     * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
+     * is relaying whatever the user types over the debug UART out as a LoRa
+     * FrKernel command, and printing whatever answer comes back. MeshNetwork
+     * supplies the radio TX/RX plumbing (its parser task is what delivers
+     * inbound FrKernel packets to FRKERNEL.c's callback); DeviceDiscovery,
+     * Farmranger, GPS and Movement are all skipped, same rationale as
+     * ENABLE_RADIO_TEST -- a scheduled campaign or logger session would
+     * fight this device for the radio/UART instead of just relaying.
+     */
+    MESHNETWORK_vInit();
+
+    /* This rig has to stay reachable at any moment: a sleep lock acquired
+     * and never released holds the whole system on the tickless-idle LIGHT
+     * WFI path forever, so it never drops into STOP2. That matters for two
+     * things at once -- STOP2 parks the debug UART pins to analog (the
+     * terminal would go dead), and it suspends the CPU core entirely, so
+     * the LoRa radio task could only service RX/TX once per 1 Hz RTC
+     * heartbeat instead of promptly. Without this the bridge looks "asleep"
+     * within moments of boot completing. */
+    SYSTEM_vSleepLockAcquire();
+
+    /* Sample the channel noise floor for the whole life of this build. The
+     * bridge is the rig a range test is watched from, and a beacon's RSSI
+     * means little without the noise it is competing against — without this
+     * every beacon line it prints would read "nf=n/a".
+     *
+     * Affordable precisely here and nowhere else: it costs the radio task one
+     * extra SUBGRF read per idle pass of its 50 ms loop, which is nothing on a
+     * mains-or-bench rig that is already pinned out of STOP2 by the lock
+     * above, and would be a needless wakeup cost on a battery-powered node. */
+    LORARADIO_vSetNoiseFloorSampling(true);
+#else
+    MESHNETWORK_vInit();
+    DEVICE_DISCOVERY_vInit();
+
+    if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
+    {
+        SOLAR_vInit();
+        ACC_vInit();
+#ifdef STORAGE_BACKEND_MICROSD
+        /* Recover the ACC-data write head before the movement task (which feeds
+         * the logger from its 1 Hz FIFO drain) starts ticking. */
+        ACCLOG_vInit();
+#endif
+        MOVE_vInit();
+        GPS_vInit();
+    }
+    else
+    {
+        /* The accelerometer is fitted and powered on primaries too, but the
+         * primary doesn't track movement. Left in its undefined power-on state
+         * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
+         * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
+         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun.
+         *
+         * Full AN3308 bring-up runs first, then the idle profile on top. The
+         * idle table only writes 6 registers and assumes power-on defaults for
+         * every other one — true after a cold boot, but not after a warm reset
+         * (an OTA install resets into a running device whose ACC keeps its
+         * previous configuration). Establishing the known-good baseline first
+         * makes the primary's ACC state identical to the secondary's before
+         * the idle profile is applied, so the boot self-test reads a device in
+         * a defined state on both roles. */
+        ACC_vInit();
+        ACC_vConfigIdle();
+        /* Primary: bring up the Farmranger UART link to the fr9 logger board.
+         * (Debug UART is a separate peripheral, so the two no longer conflict.) */
+        FARMRANGER_vInit();
+    }
+#endif /* ENABLE_RADIO_TEST / FRKERNEL_INTERFACE_LORA_BRIDGE */
+
+    TIME_vInit();
+    BAT_vInit();
+    POWER_vInit();
+
+    /* Peripheral smoke test — checks GPS UART, ACC WHO_AM_I and ext-flash
+     * JEDEC ID. Records each result for later FrKernel queries and flashes
+     * a yellow-LED error code for anything that failed. Blocking; returns
+     * once the LED sequence is done (no delay on a clean boot). Never
+     * fatal — normal boot always proceeds after this. */
+    SELFTEST_vRunAndReport();
+
+    BSP_LED_Off(LED_YELLOW);
+
+    /* Let the whole boot-time DBG_LOG output -- including the build-config
+     * line above -- actually drain out of DbgLog's ring and off the wire
+     * before this task exits. systemReadyForSleep is what gates the first
+     * STOP2 entry (INIT_bIsSleepReady(), checked by
+     * vPortSuppressTicksAndSleep()), so delaying it here is what makes the
+     * boot log's completion a precondition of the first sleep, not a race
+     * against it (same "let the log line drain" pattern used before
+     * FrKernel's prodsleep and FOTA_vArmBootloaderAndReset's reset). */
+    osDelay(100);
+
+    systemReadyForSleep = true;
+
+    osThreadExit();
+}
+
+bool INIT_bIsSleepReady(void)
+{
+    return systemReadyForSleep;
+}

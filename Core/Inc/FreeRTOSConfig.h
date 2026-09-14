@@ -1,0 +1,197 @@
+/* USER CODE BEGIN Header */
+/*
+ * FreeRTOS Kernel V10.2.1
+ * Portion Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+ * Portion Copyright (C) 2019 StMicroelectronics, Inc.  All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * http://www.FreeRTOS.org
+ * http://aws.amazon.com/freertos
+ *
+ * 1 tab == 4 spaces!
+ */
+/* USER CODE END Header */
+
+#ifndef FREERTOS_CONFIG_H
+#define FREERTOS_CONFIG_H
+
+/*-----------------------------------------------------------
+ * Application specific definitions.
+ *
+ * These definitions should be adjusted for your particular hardware and
+ * application requirements.
+ *
+ * These parameters and more are described within the 'configuration' section of the
+ * FreeRTOS API documentation available on the FreeRTOS.org web site.
+ *
+ * See http://www.freertos.org/a00110.html
+ *----------------------------------------------------------*/
+
+/* USER CODE BEGIN Includes */
+/* Section where include file can be added */
+/* USER CODE END Includes */
+
+/* Ensure definitions are only used by the compiler, and not by the assembler. */
+#if defined(__ICCARM__) || defined(__CC_ARM) || defined(__GNUC__)
+  #include <stdint.h>
+  extern uint32_t SystemCoreClock;
+#endif
+#define configENABLE_FPU                         0
+#define configENABLE_MPU                         0
+
+#define configUSE_PREEMPTION                     1
+#define configSUPPORT_STATIC_ALLOCATION          1
+#define configSUPPORT_DYNAMIC_ALLOCATION         1
+#define configUSE_IDLE_HOOK                      0
+#define configUSE_TICK_HOOK                      0
+#define configCPU_CLOCK_HZ                       ( SystemCoreClock )
+#define configTICK_RATE_HZ                       ((TickType_t)1000)
+#define configMAX_PRIORITIES                     ( 56 )
+#define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
+/* 45 KB (was 44 KB): FRKERNEL_INTERFACE_LORA allocates an extra inbound
+ * queue (FrKernel.c s_rxQueue, 4 x sizeof(FrKernelPkt_t)=129 B + the queue
+ * control block, ~650 B) that the UART interface doesn't need. First real
+ * boot of the LORA interface hit heap exhaustion -- POWER_vInit()'s task is
+ * the last one created in the boot sequence, so it's the one that finally
+ * found nothing left, regardless of which earlier allocation was the actual
+ * tipping point. +1 KB comfortably covers it with margin (chip has ~4.1 KB
+ * of RAM sitting idle outside .bss/.data at 44 KB, so this still leaves
+ * ~3.1 KB free afterward). This 44 KB base already includes the earlier LoRa
+ * TX queue (24->8 slots) and mesh TX item-size (128->64 B) reductions. */
+#define configTOTAL_HEAP_SIZE                    ((size_t)46080)
+#define configMAX_TASK_NAME_LEN                  ( 16 )
+#define configUSE_TRACE_FACILITY                 1
+#define configUSE_16_BIT_TICKS                   0
+#define configUSE_MUTEXES                        1
+/* 8 -> 0: this registry exists purely for an RTOS-aware debugger to show
+ * queue/mutex/semaphore names. Every osMutexNew/osMessageQueueNew/
+ * osSemaphoreNew call in this codebase passes a NULL attr (grep confirms
+ * it - none ever assign a name), so vQueueAddToRegistry is never actually
+ * invoked and the array queue.c allocates for it
+ * (xQueueRegistry[configQUEUE_REGISTRY_SIZE]) sat there fully unused,
+ * costing 8 B/slot. queue.c wraps the whole array in
+ * "#if (configQUEUE_REGISTRY_SIZE > 0)", so 0 removes it entirely rather
+ * than just zeroing its length - reclaims the full 64 B with no behavior
+ * change (there was never anything TO see in a debugger's queue view). */
+#define configQUEUE_REGISTRY_SIZE                0
+#define configUSE_RECURSIVE_MUTEXES              1
+#define configUSE_COUNTING_SEMAPHORES            1
+#define configUSE_PORT_OPTIMISED_TASK_SELECTION  0
+/* USER CODE BEGIN MESSAGE_BUFFER_LENGTH_TYPE */
+/* Defaults to size_t for backward compatibility, but can be changed
+   if lengths will always be less than the number of bytes in a size_t. */
+#define configMESSAGE_BUFFER_LENGTH_TYPE         size_t
+/* USER CODE END MESSAGE_BUFFER_LENGTH_TYPE */
+
+/* Co-routine definitions. */
+#define configUSE_CO_ROUTINES                    0
+#define configMAX_CO_ROUTINE_PRIORITIES          ( 2 )
+
+/* Software timer definitions. */
+#define configUSE_TIMERS                         1
+#define configTIMER_TASK_PRIORITY                ( 2 )
+#define configTIMER_QUEUE_LENGTH                 10
+#define configTIMER_TASK_STACK_DEPTH             256
+
+/* The following flag must be enabled only when using newlib */
+#define configUSE_NEWLIB_REENTRANT          1
+
+/* Set the following definitions to 1 to include the API function, or zero
+to exclude the API function. */
+#define INCLUDE_vTaskPrioritySet             1
+#define INCLUDE_uxTaskPriorityGet            1
+#define INCLUDE_vTaskDelete                  1
+#define INCLUDE_vTaskCleanUpResources        0
+#define INCLUDE_vTaskSuspend                 1
+#define INCLUDE_vTaskDelayUntil              1
+#define INCLUDE_vTaskDelay                   1
+#define INCLUDE_xTaskGetSchedulerState       1
+#define INCLUDE_xTimerPendFunctionCall       1
+#define INCLUDE_xQueueGetMutexHolder         1
+#define INCLUDE_uxTaskGetStackHighWaterMark  1
+#define INCLUDE_eTaskGetState                1
+
+/*
+ * The CMSIS-RTOS V2 FreeRTOS wrapper is dependent on the heap implementation used
+ * by the application thus the correct define need to be enabled below
+ */
+#define USE_FreeRTOS_HEAP_4
+
+/* Cortex-M specific definitions. */
+#ifdef __NVIC_PRIO_BITS
+ /* __BVIC_PRIO_BITS will be specified when CMSIS is being used. */
+ #define configPRIO_BITS         __NVIC_PRIO_BITS
+#else
+ #define configPRIO_BITS         4
+#endif
+
+/* The lowest interrupt priority that can be used in a call to a "set priority"
+function. */
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY   15
+
+/* The highest interrupt priority that can be used by any interrupt service
+routine that makes calls to interrupt safe FreeRTOS API functions.  DO NOT CALL
+INTERRUPT SAFE FREERTOS API FUNCTIONS FROM ANY INTERRUPT THAT HAS A HIGHER
+PRIORITY THAN THIS! (higher priorities are lower numeric values. */
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+
+/* Interrupt priorities used by the kernel port layer itself.  These are generic
+to all Cortex-M ports, and do not rely on any particular library functions. */
+#define configKERNEL_INTERRUPT_PRIORITY 		( configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
+/* !!!! configMAX_SYSCALL_INTERRUPT_PRIORITY must not be set to zero !!!!
+See http://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html. */
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY 	( configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS) )
+
+/* Normal assert() semantics without relying on the provision of an assert.h
+header file. */
+/* USER CODE BEGIN 1 */
+#define configASSERT( x ) if ((x) == 0) {taskDISABLE_INTERRUPTS(); for( ;; );}
+/* USER CODE END 1 */
+
+/* Definitions that map the FreeRTOS port interrupt handlers to their CMSIS
+standard names. */
+#define vPortSVCHandler    SVC_Handler
+#define xPortPendSVHandler PendSV_Handler
+
+/* IMPORTANT: This define is commented when used with STM32Cube firmware, when the timebase source is SysTick,
+              to prevent overwriting SysTick_Handler defined within STM32Cube HAL */
+
+#define xPortSysTickHandler SysTick_Handler
+
+/* USER CODE BEGIN Defines */
+/* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+
+/* Tickless idle: a custom vPortSuppressTicksAndSleep() in Hal/src/hal_system.c
+ * overrides the weak ARM_CM3 port implementation. It parks the core in STOP2
+ * between RTC heartbeats and reconciles the FreeRTOS tick from the RTC on wake.
+ * The default SysTick-based suppress logic is unusable here because SysTick is
+ * stopped in STOP2; the RTC (LSE) is the only timebase that survives sleep.
+ * INCLUDE_vTaskSuspend (above) is required and already set to 1. */
+#define configUSE_TICKLESS_IDLE                  1
+
+/* Trap stack overflows instead of letting them corrupt silently. Method 2
+ * checks the magic-pattern fill at the stack end on every context switch (in
+ * addition to the high-water check), so it catches a task that overruns deep
+ * inside a call (e.g. the radio init) rather than only at switch-out boundaries.
+ * Requires vApplicationStackOverflowHook() — defined in Core/Src/app_freertos.c. */
+#define configCHECK_FOR_STACK_OVERFLOW           2
+
+/* USER CODE END Defines */
+
+#endif /* FREERTOS_CONFIG_H */
