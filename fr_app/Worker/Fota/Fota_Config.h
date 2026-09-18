@@ -26,12 +26,16 @@
  *   0x08000000 - 0x08004FFF   bootloader (20 KB, frtag2_bootloader project)
  *   0x08005000 - 0x0803FFFF   application (236 KB)
  *
- * ---- External NOR map (AT25EU0041A, 512 KB, 4 KB sectors) ----
+ * ---- External NOR map (AT25XE041B, 512 KB, 4 KB sectors) ----
  *
  *   0x00000 - 0x3AFFF   OTA image scratchpad (sectors 0-58, 236 KB;
  *                       scratch offset N maps to OTA_APP_BASE_ADDR + N)
  *   0x3B000 - 0x3BFFF   OTA metadata (sector 59)
- *   0x3C000 - 0x7FFFF   text log (sectors 60-127; see Services/Log/Log.h)
+ *   0x3C000 - 0x7EFFF   text log (sectors 60-126; see Services/Log/Log.h)
+ *   0x7F000 - 0x7FFFF   flash self-test scratch (sector 127; see
+ *                       Device/Flash/Flash_Config.h). Not part of the
+ *                       app/bootloader contract - the bootloader never
+ *                       reads above the metadata sector.
  *
  * ---- Metadata record (at OTA_META_ADDR) ----
  *

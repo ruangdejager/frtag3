@@ -1,7 +1,7 @@
 /*
  * Log.h
  *
- * Circular FIFO text log on external NOR flash (AT25EU0041A, 512 KB).
+ * Circular FIFO text log on external NOR flash (AT25XE041B, 512 KB).
  *
  * FIFO semantics: u32WriteAddr is the head, u32StartAddr is the tail.
  * When the log wraps and a sector is erased, the tail advances past the
@@ -14,11 +14,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Log partition: the upper 272 KB of the 512 KB device. The lower region
- * (0x00000-0x3BFFF) belongs to the OTA image scratchpad + metadata — see
- * fr_app/Worker/Fota/Fota_Config.h for the full partition map. */
+/* Log partition: 0x3C000-0x7EFFF, 268 KB of the 512 KB device.
+ *
+ * The region below (0x00000-0x3BFFF) belongs to the OTA image scratchpad +
+ * metadata — see fr_app/Worker/Fota/Fota_Config.h for the full partition map.
+ *
+ * The region ABOVE - the last 4 KB sector, 0x7F000 - was taken off the log and
+ * given to the flash self-test, which needs somewhere it can erase and program
+ * destructively at boot. The two candidates were this sector and a sector of
+ * the OTA scratchpad; erasing part of a staged firmware image on every power
+ * cycle is not a trade anyone would take, and 4 KB is ~1.5% of the log. See
+ * FLASH_SELFTEST_ADDR in Device/Flash/Flash_Config.h.
+ *
+ * The bootloader is unaffected: it only ever reads the scratchpad and the
+ * metadata sector, both far below this boundary. */
 #define LOG_FLASH_START_ADDR    0x03C000UL
-#define LOG_FLASH_END_ADDR      0x080000UL
+#define LOG_FLASH_END_ADDR      0x07F000UL
 #define LOG_FLASH_SIZE_BYTES    (LOG_FLASH_END_ADDR - LOG_FLASH_START_ADDR)
 
 void     LOG_vInit(void);

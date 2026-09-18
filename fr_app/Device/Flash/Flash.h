@@ -1,7 +1,7 @@
 /*
  * Flash.h
  *
- * Public API for the AT25EU0041A external NOR flash device driver.
+ * Public API for the AT25XE041B external NOR flash device driver.
  */
 
 #ifndef DEVICE_FLASH_FLASH_H_
@@ -59,6 +59,16 @@ typedef struct
     uint16_t u16ProbeFailures;  /* probes that never saw the right mfr ID     */
     uint16_t u16Recoveries;     /* times the gate re-opened after being shut  */
     uint16_t u16EraseVerifyFails;
+    bool     bEpeSeen;          /* device's own EPE bit reported a failed
+                                 * erase/program at least once (SR1 bit 5,
+                                 * new on the AT25XE041B - the previous part
+                                 * had no such bit and the driver had to
+                                 * infer a failed erase from a read-back)    */
+    uint16_t u16EpeFails;
+    uint16_t u16ReadCrcRetries; /* reads that disagreed on the first compare
+                                 * and were re-read (see FLASH_vRead)        */
+    uint16_t u16ReadCrcFails;   /* reads that never converged within the
+                                 * retry budget - returned bytes are suspect */
 } Flash_Health_t;
 
 void    FLASH_vGetHealth(Flash_Health_t *ptHealth);
@@ -76,6 +86,12 @@ typedef enum
     FLASH_RDFAIL_WAITREADY,  /* still WIP after FLASH_WAIT_READY_TIMEOUT_MS   */
     FLASH_RDFAIL_CMD,        /* SPI transmit of the 4-byte read command failed */
     FLASH_RDFAIL_DATA,       /* SPI receive of the payload failed             */
+    FLASH_RDFAIL_CRC,        /* the transfer succeeded but two reads of the
+                              * same bytes disagreed and never converged - so
+                              * the bus worked and the DATA is wrong, which is
+                              * a different fault from every reason above and
+                              * the only one that points at the board rather
+                              * than at the driver                            */
 } Flash_ReadFailReason_t;
 
 /* Read-failure tally since the last call; reading clears it (same idiom as
@@ -103,6 +119,23 @@ bool    FLASH_vSectorErase(uint32_t addr);  /* erases 4 KB sector containing add
 bool    FLASH_vBlockErase(uint32_t addr);   /* erases 64 KB block containing addr  */
 bool    FLASH_vChipErase(void);
 
+/* Park the device in ULTRA-Deep Power-Down (79h) and bring it back.
+ *
+ * The names are kept from the previous part so the ~25 call sites in Fota.c,
+ * Log.c and DbgLog.c do not churn, but the mode underneath changed: the
+ * AT25XE041B offers both Deep Power-Down (B9h, exit ABh, 4.5 uA typ) and
+ * Ultra-Deep Power-Down (79h, exit by CS# pulse, 200 nA typ), and this driver
+ * parks in the latter.
+ *
+ * TWO CONSEQUENCES CALLERS DO NOT SEE, both handled inside the driver:
+ *
+ *  - Exit is a CS# pulse of at least tCSLU followed by tXUDPD = 70 us, not an
+ *    opcode. Nothing may be clocked at the device inside that window.
+ *  - Datasheet §12.5.3: "Upon recovery from Ultra Deep Power Down, all
+ *    internal registers are in the Power-On default state." The sector
+ *    protection default is PROTECTED, so every wake leaves the whole array
+ *    write-locked until a Global Unprotect. The driver re-runs that lazily
+ *    on the first program or erase after a wake; reads never pay for it. */
 void    FLASH_vDeepPowerDown(void);
 void    FLASH_vReleaseDeepPowerDown(void);
 
@@ -114,5 +147,20 @@ void    FLASH_vReleaseDeepPowerDown(void);
  * mid-verify, reads the same image cleanly), so for the multi-minute OTA
  * transfer we keep the flash awake the whole time. */
 void    FLASH_vInhibitDeepPowerDown(bool bInhibit);
+
+/* Read-verify (CRC) tally since the last call; reading clears it. Same
+ * read-and-clear idiom as FLASH_u16GetAndClearReadFails, and for the same
+ * reason - FLASH_vRead is called ~1900 times per whole-image XOR pass, so a
+ * log line per event would perturb the very timing being measured.
+ *
+ * pu16Retries counts reads that disagreed on the first compare and were
+ * recovered by a re-read; pu16Fails counts reads that never converged and
+ * whose returned bytes are therefore not trustworthy. A non-zero retry count
+ * with a zero fail count is this feature doing its job. Both optional.
+ *
+ * Always available; returns zeroes when ENABLE_FLASH_READ_CRC is not defined,
+ * so callers need no #ifdef. */
+uint32_t FLASH_u32GetAndClearReadCrcStats(uint16_t *pu16Retries,
+                                          uint16_t *pu16Fails);
 
 #endif /* DEVICE_FLASH_FLASH_H_ */

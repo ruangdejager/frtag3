@@ -46,4 +46,10 @@ bool SELFTEST_bFlashOk(void);
 bool SELFTEST_bGpsApplicable(void);
 bool SELFTEST_bFlashApplicable(void);
 
+/* The flash self-test's reason code from boot, as a short string
+ * ("PASS", "FAIL:wrong-part", "FAIL:no-comms", ...). SELFTEST_bFlashOk() says
+ * whether the flash works NOW; this says what was wrong with it at boot, which
+ * is the part an operator can act on. Never NULL. */
+const char *SELFTEST_pcFlashDetail(void);
+
 #endif /* SERVICES_SELFTEST_SELFTEST_H_ */

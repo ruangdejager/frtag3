@@ -147,6 +147,15 @@ void INIT_vInitialization(void *parameters)
 #ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
         " ENABLE_MOVEMENT_SENSOR_DATA_API\r\n"
 #endif
+#ifdef ENABLE_FLASH_SELFTEST_DESTRUCTIVE
+        " ENABLE_FLASH_SELFTEST_DESTRUCTIVE\r\n"
+#endif
+#ifdef ENABLE_FLASH_READ_CRC
+        " ENABLE_FLASH_READ_CRC\r\n"
+#endif
+#ifdef ENABLE_FLASH_STRESS_TEST
+        " ENABLE_FLASH_STRESS_TEST\r\n"
+#endif
 #ifdef ENABLE_MESH_DIAG_COUNTERS
         " ENABLE_MESH_DIAG_COUNTERS\r\n"
 #endif

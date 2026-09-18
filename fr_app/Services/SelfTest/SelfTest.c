@@ -16,6 +16,7 @@
 
 #include "Flash.h"                 /* FLASH_bRecoverDevice, health   */
 #include "Flash_Config.h"          /* FLASH_MANUFACTURER_ID          */
+#include "Flash_SelfTest.h"        /* FLASH_eSelfTest                */
 
 /* Result flags default to true so a not-applicable test naturally reports
  * OK (e.g. GPS on primary). */
@@ -25,6 +26,11 @@ static bool bFlashOk     = true;
 
 static bool bGpsRan      = false;   /* whether the test actually executed */
 static bool bFlashRan    = false;
+
+/* Kept so a human asking later gets the same verdict the boot log carried, not
+ * just a bool. "flash=FAIL" tells an operator to do something; "FAIL:wrong-part"
+ * tells them what. */
+static Flash_SelfTestResult_t eFlashResult = FLASH_ST_PASS;
 
 /* --- LED flash sequence ---------------------------------------------------
  * User spec: for each failed test, flash the code (N short flashes) three
@@ -95,25 +101,28 @@ void SELFTEST_vRunAndReport(void)
      * a self-test that repairs the fault it was about to report is strictly
      * better than one that only names it, on a unit nobody can reach by wire. */
     {
-        uint8_t au8Id[3]   = {0};
-        uint8_t u8Attempts = 0U;
-
         bFlashRan = true;
-        bFlashOk  = FLASH_bRecoverDevice(au8Id, &u8Attempts);
 
-        /* Always log the raw ID bytes, not just the verdict. A single bad
-         * JEDEC read was reporting FAIL on units whose flash was demonstrably
-         * healthy (reading, writing and holding the log), and with only a
-         * pass/fail there was no way to tell a real fault from a transient.
-         * The byte pattern is the diagnostic — see FLASH_bVerifyDeviceEx. */
-        if (bFlashOk && u8Attempts > 1U)
-            DBG_LOG("SelfTest: flash JEDEC %02X %02X %02X OK on attempt %u (first read(s) transient)\r\n",
-                    au8Id[0], au8Id[1], au8Id[2], (unsigned)u8Attempts);
-        else if (!bFlashOk)
-            DBG_LOG("SelfTest: flash JEDEC read FAILED %ux - last bytes %02X %02X %02X (expected mfr %02X) "
-                    "- writes/erases DISABLED (log + FOTA staging) until a re-probe succeeds\r\n",
-                    (unsigned)u8Attempts, au8Id[0], au8Id[1], au8Id[2],
-                    (unsigned)FLASH_MANUFACTURER_ID);
+        /* Delegated to FLASH_eSelfTest, which does what this block used to do
+         * (a retried, evidence-reporting JEDEC probe) and then keeps going:
+         * status register by name, and - where the build asks for it - an
+         * erase, a program and a byte-for-byte compare with the mismatch
+         * CLASSIFIED. It logs every step itself, so nothing is duplicated
+         * here; what comes back is the one verdict this file has to turn into
+         * an LED code and a summary line.
+         *
+         * The driver gate is still what "flash=OK" means, exactly as before -
+         * see SELFTEST_bFlashOk below and the 18-hour false-OK it exists to
+         * prevent. FLASH_eSelfTest opens with FLASH_bRecoverDevice, so a gate
+         * found shut at boot still gets one repair attempt before it is
+         * reported. */
+        eFlashResult = FLASH_eSelfTest();
+        bFlashOk     = (eFlashResult == FLASH_ST_PASS) && FLASH_bDevicePresent();
+
+        if (!bFlashOk)
+            DBG_LOG("SelfTest: flash %s - writes/erases may be DISABLED "
+                    "(log + FOTA staging) until this is resolved\r\n",
+                    FLASH_pcSelfTestResult(eFlashResult));
 
         /* Anything the driver has had to survive gets said out loud, even when
          * the verdict is OK — a unit that recovered, or that is running on a
@@ -121,21 +130,35 @@ void SELFTEST_vRunAndReport(void)
          * that was clean, and the distinction is invisible from "flash=OK". */
         Flash_Health_t tHealth;
         FLASH_vGetHealth(&tHealth);
-        if (tHealth.bEverAbsent || tHealth.bWriteProtected || tHealth.bEraseVerifyFail)
+        /* bWriteProtected is deliberately NOT a trigger any more. On the
+         * AT25XE041B the array's power-on default is protected and every
+         * ultra-deep-power-down exit restores that default, so bring-up clears
+         * it on literally every boot - printing a health line for it would
+         * make the one line that means "something is wrong" fire every time
+         * and stop meaning anything. What still matters is an unprotect that
+         * did NOT take. */
+        if (tHealth.bEverAbsent || tHealth.bUnprotectFailed ||
+            tHealth.bEraseVerifyFail || tHealth.bEpeSeen ||
+            (tHealth.u16ReadCrcFails > 0U))
             DBG_LOG("SelfTest: flash health - absent=%u recoveries=%u probeFails=%u "
-                    "wprot=%u unprotFail=%u eraseVfyFails=%u\r\n",
+                    "wprot=%u unprotFail=%u eraseVfyFails=%u epe=%u "
+                    "crcRetries=%u crcFails=%u\r\n",
                     (unsigned)tHealth.bEverAbsent,
                     (unsigned)tHealth.u16Recoveries,
                     (unsigned)tHealth.u16ProbeFailures,
                     (unsigned)tHealth.bWriteProtected,
                     (unsigned)tHealth.bUnprotectFailed,
-                    (unsigned)tHealth.u16EraseVerifyFails);
+                    (unsigned)tHealth.u16EraseVerifyFails,
+                    (unsigned)tHealth.u16EpeFails,
+                    (unsigned)tHealth.u16ReadCrcRetries,
+                    (unsigned)tHealth.u16ReadCrcFails);
     }
 
     DBG_LOG("SelfTest: gps=%s acc=%s flash=%s\r\n",
             bGpsRan   ? (bGpsOk   ? "OK" : "FAIL") : "n/a",
             bAccOk    ? "OK" : "FAIL",
-            bFlashRan ? (bFlashOk ? "OK" : "FAIL") : "n/a");
+            bFlashRan ? (bFlashOk ? "OK" : FLASH_pcSelfTestResult(eFlashResult))
+                      : "n/a");
 
     /* Collect the failure codes in enum order so a multi-failure sequence
      * is deterministic. */
@@ -174,6 +197,14 @@ bool SELFTEST_bFlashOk(void)
 bool SELFTEST_bGpsApplicable(void)
 {
     return DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY;
+}
+
+/* The boot verdict in words. Live pass/fail still comes from
+ * SELFTEST_bFlashOk(); this is the extra detail an operator needs to act on it,
+ * which is why it is a separate accessor rather than a widened return. */
+const char *SELFTEST_pcFlashDetail(void)
+{
+    return FLASH_pcSelfTestResult(eFlashResult);
 }
 
 bool SELFTEST_bFlashApplicable(void)

@@ -3,7 +3,7 @@
  *
  * SPI drivers for:
  *   SPI1 — accelerometer (LIS2DH or compatible), PA1/PA6/PA7/PA11
- *   SPI2 — external NOR flash (AT25EU0041A),     PA5/PA8/PA10/PA15
+ *   SPI2 — external NOR flash (AT25XE041B),     PA5/PA8/PA10/PA15
  *
  * HAL_SPI_vInit() initialises both peripherals in one call.
  * Call it once at boot (before Flash_vInit) and once after every STOP2 wake.
@@ -105,7 +105,7 @@ static void HAL_SPI_vInitFlashHw(void)
     hFlashSpi.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hFlashSpi.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hFlashSpi.Init.NSS               = SPI_NSS_SOFT;
-    hFlashSpi.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;  /* ~0.5 MHz at 32 MHz PCLK */
+    hFlashSpi.Init.BaudRatePrescaler = FLASH_SPI_PRESCALER;       /* 12 MHz, see hal_spi.h */
     hFlashSpi.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hFlashSpi.Init.TIMode            = SPI_TIMODE_DISABLE;
     hFlashSpi.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
@@ -190,11 +190,19 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *spiHandle)
         /* PA5 (MISO) — AF3 (SPI2_MISO on port A).
          * Pull-up keeps the line defined while the flash is deselected or
          * absent, so a read of an unpopulated device returns all-ones rather
-         * than a floating pattern that could look like data. */
+         * than a floating pattern that could look like data.
+         *
+         * GPIO_SPEED_FREQ_HIGH on all three signal pins below, raised from LOW
+         * when the bus went from 750 kHz to 12 MHz. A LOW-speed pad's slew is
+         * specified for far slower edges than a 12 MHz clock needs, and on a
+         * 1.8 V rail the margin between a slow edge and a missed setup time is
+         * not somewhere to economise - this driver is being asked to prove
+         * that reads are trustworthy, so the pads must not be the reason they
+         * are not. CS# stays LOW-speed: it moves once per transaction. */
         GPIO_InitStruct.Pin       = BSP_FLASH_MISO_PIN;
         GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
         GPIO_InitStruct.Pull      = GPIO_PULLUP;
-        GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+        GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
         GPIO_InitStruct.Alternate = GPIO_AF3_SPI2;
         HAL_GPIO_Init(BSP_FLASH_MISO_PORT, &GPIO_InitStruct);
 

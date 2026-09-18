@@ -69,6 +69,42 @@
 // #define ENABLE_MOVEMENT_SENSOR_DATA_API
 
 /* --------------------------------------------------------------------------
+ * External flash bring-up and diagnostics
+ *
+ * See fr_app/Device/Flash/Flash_SelfTest.c for all three.
+ * -------------------------------------------------------------------------- */
+/* Destructive half of the boot flash self-test: erase, program and byte-compare
+ * a 256-byte pattern on the reserved sector at FLASH_SELFTEST_ADDR (0x7F000 -
+ * the log's top sector, which is not shared with anything). The read-only half
+ * - JEDEC ID and status register - always runs, with or without this.
+ *
+ * Off in production. It costs one 4 KB erase per boot against a 100,000-cycle
+ * endurance rating (so the wear is negligible) plus ~50 ms of boot time, but a
+ * production image has nothing to do with the answer: the write path is
+ * exercised continuously by the log anyway. This is a bring-up and returns
+ * tool. */
+// #define ENABLE_FLASH_SELFTEST_DESTRUCTIVE
+
+/* Verify every buffer FLASH_vRead returns by reading it a second time and
+ * comparing, retrying up to FLASH_READ_CRC_MAX_RETRIES before giving up, and
+ * counting both outcomes. Turns silent read corruption from something only
+ * visible as a downstream checksum failure into a counted, loggable event with
+ * an address attached - readable at any time with "tag flash crc".
+ *
+ * Costs one extra read per FLASH_vRead. That is real on the OTA verify path
+ * (~1900 reads per whole-image pass) and invisible everywhere else. Left ON
+ * because this board has an open defect whose whole difficulty is that
+ * corrupted reads report success. */
+#define ENABLE_FLASH_READ_CRC
+
+/* Console flash diagnostics: "tag flash test" and
+ * "tag flash stress [tx|park] <N>". The stress loop is the harness for the
+ * post-TX read corruption - it takes a callback so the disturbance under
+ * investigation is injectable rather than hard-wired, which is what lets a TX,
+ * a power-down cycle and a quiet baseline be compared against each other. */
+#define ENABLE_FLASH_STRESS_TEST
+
+/* --------------------------------------------------------------------------
  * Mesh
  * -------------------------------------------------------------------------- */
 /*

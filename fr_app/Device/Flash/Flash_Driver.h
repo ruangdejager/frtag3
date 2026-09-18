@@ -1,7 +1,7 @@
 /*
  * Flash_Driver.h
  *
- * Board abstraction layer for the AT25EU0041A NOR flash on SPI2.
+ * Board abstraction layer for the AT25XE041B NOR flash on SPI2.
  * All calls route through the HAL SPI2 macros defined in hal_spi.h.
  */
 

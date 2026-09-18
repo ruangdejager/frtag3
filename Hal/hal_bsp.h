@@ -157,7 +157,7 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
 
 /* -----------------------------------------------------------------------
  * External Flash SPI (SPI2) — PA5/PA8/PA10/PA15
- * AT25EU0041A-SSHN-T, 512 KB NOR flash
+ * AT25XE041B-MAHN-T, 512 KB NOR flash
  * ----------------------------------------------------------------------- */
 #define BSP_FLASH_MISO_PORT         GPIOA
 #define BSP_FLASH_MISO_PIN          GPIO_PIN_5

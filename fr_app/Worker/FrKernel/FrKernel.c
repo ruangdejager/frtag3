@@ -82,6 +82,7 @@
 #include "stm32wlxx_hal.h"     /* TAMP->BKP2R for the bootloader version    */
 #include "Fota.h"
 #include "Flash.h"            /* flash health query / on-demand recovery   */
+#include "Flash_SelfTest.h"   /* flash self-test + stress harness          */
 
 #if defined(FRKERNEL_INTERFACE_UART) || defined(FRKERNEL_INTERFACE_LORA_BRIDGE)
 #  include "Debug.h"
@@ -223,7 +224,7 @@ static bool FRKERNEL_bQueryOnlyCmd(const char *p)
 {
     static const char *const apacQueries[] = {
         "-help", "juice", "fwver", "discovery schedule",
-        "flash stream", "flash",
+        "flash stream", "flash", "flash crc", "flash test",
         "selftest", "selftest gps", "selftest acc", "selftest flash",
     };
     for (size_t i = 0U; i < (sizeof(apacQueries) / sizeof(apacQueries[0])); i++)
@@ -276,6 +277,106 @@ static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
 #endif
 
 /* -------------------------------------------------------------------------- */
+
+#ifdef ENABLE_FLASH_STRESS_TEST
+/* ---- Stress-test disturbance callbacks ------------------------------------
+ *
+ * These exist so the thing being blamed for the post-TX read corruption is
+ * INJECTED rather than assumed. The stress loop itself names neither the radio
+ * nor the power-down path; it just calls whichever of these the operator asked
+ * for, which is what makes the three runs comparable:
+ *
+ *   flash stress <N>        quiet baseline. Anything that shows up here is a
+ *                           property of the bus at 12 MHz, not of the radio.
+ *   flash stress tx <N>     a real PA pulse between every read.
+ *   flash stress park <N>   an ultra-deep-power-down park and wake between
+ *                           every read, with no radio activity at all.
+ *
+ * The second and third are the discriminating pair. The existing field
+ * evidence (see OTA_LORA_CHUNK_GAP_MS in Fota_Config.h) is consistent with
+ * either a PA current spike or an unhonoured flash recovery time, because in
+ * production the two always happen close together - a DBG_LOG in a radio gap
+ * parks the chip, and the next read wakes it. Separating them is the point.
+ * -------------------------------------------------------------------------- */
+
+/* Key the PA and wait until it has actually fired, not merely been queued.
+ *
+ * LORARADIO_bTxPacket only enqueues; the radio task's carrier sense can defer
+ * the real transmission by up to LORA_TX_CARRIER_WAIT_MS. A stress run that
+ * did not wait would scatter its TX pulses across later iterations and report
+ * a diffuse, uninterpretable result - which is precisely the decoupling that
+ * makes FOTA_bSendChunk hard to reason about. LORARADIO_bTxQuiet(0) going true
+ * means nothing is queued, nothing is in flight, and the pulse is behind us. */
+static void FRKERNEL_vStressTxCallback(void)
+{
+    LoraRadio_Packet_t pkt = {0};
+    pkt.buffer[0] = (uint8_t)MeshPktType_FrKernel;
+    pkt.buffer[1] = (uint8_t)'S';
+    pkt.length    = 2U;
+
+    if (!LORARADIO_bTxPacketWait(&pkt, 1000U))
+        return;
+
+    uint32_t u32Start = osKernelGetTickCount();
+    while (!LORARADIO_bTxQuiet(0U) &&
+           ((osKernelGetTickCount() - u32Start) < 2000U))
+        osDelay(5);
+}
+
+/* Park the flash and let the next read wake it, with the radio untouched.
+ * FLASH_vDeepPowerDown is a no-op while an OTA session holds the inhibit, so
+ * this measures nothing during a firmware transfer - which is correct, and
+ * worth knowing if a run reports suspiciously clean numbers. */
+static void FRKERNEL_vStressParkCallback(void)
+{
+    FLASH_vDeepPowerDown();
+}
+
+/* Shared tail for all three variants. */
+static void FRKERNEL_vRunStress(FrKernelXport_e eXport, char *resp, size_t szResp,
+                                uint32_t u32Cycles, void (*pfnCb)(void),
+                                const char *pcLabel)
+{
+    Flash_StressStats_t tStats;
+
+    if (u32Cycles == 0UL) u32Cycles = 100UL;
+    if (u32Cycles > 10000UL) u32Cycles = 10000UL;   /* ~10 s at 1 ms/cycle */
+
+    if (!FLASH_bStressTest(u32Cycles, pfnCb, &tStats))
+    {
+        snprintf(resp, szResp,
+                 "flash stress: reference page not programmed - run "
+                 "'flash test' first\r\n");
+        FRKERNEL_vRespond(eXport, resp);
+        return;
+    }
+
+    /* One line, every classification. A bare mismatch count would not
+     * distinguish the hypotheses this run exists to separate.
+     *
+     * READ drvRetry FIRST when ENABLE_FLASH_READ_CRC is on. The driver's own
+     * read-verify retries corruption away before this loop ever sees it, so
+     * "bad" is the RESIDUAL - what survived three attempts - and drvRetry is
+     * the sensitive measure of how often the bus lied at all. A run with
+     * bad=0 and drvRetry=40 is not a clean run; it is forty disturbances that
+     * were caught. With the option off, "bad" carries the whole signal. */
+    snprintf(resp, szResp,
+             "flash stress %s: %lu cycles, %lu bad (FF=%lu 00=%lu shift=%lu "
+             "noise=%lu) readFail=%lu first=%lu drvRetry=%u drvFail=%u\r\n",
+             pcLabel,
+             (unsigned long)tStats.u32Cycles,
+             (unsigned long)tStats.u32Mismatch,
+             (unsigned long)tStats.u32AllFF,
+             (unsigned long)tStats.u32All00,
+             (unsigned long)tStats.u32Shifted,
+             (unsigned long)tStats.u32Noise,
+             (unsigned long)tStats.u32ReadFail,
+             (unsigned long)tStats.u32FirstBadCycle,
+             (unsigned)tStats.u16DriverRetries,
+             (unsigned)tStats.u16DriverFails);
+    FRKERNEL_vRespond(eXport, resp);
+}
+#endif /* ENABLE_FLASH_STRESS_TEST */
 
 static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
 {
@@ -389,6 +490,13 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag selftest gps|acc|flash  single result\r\n"
                 "  tag flash                   ext-flash health (gate, ids, faults)\r\n"
                 "  tag flash recover           force a flash re-probe + bring-up\r\n"
+                "  tag flash crc               read-verify counters (clears them)\r\n"
+                "  tag flash test              run the flash self-test now\r\n"
+#ifdef ENABLE_FLASH_STRESS_TEST
+                "  tag flash stress [tx|park] <N>  read a known page N times,\r\n"
+                "                              optionally keying the PA or\r\n"
+                "                              parking the flash between reads\r\n"
+#endif
                 "  tag discovery schedule      wakeup interval (min)\r\n"
                 "  tag discovery schedule <N>  set wakeup interval (15/30/60/120/240 min)\r\n"
                 "  tag prodsleep               enter production sleep (secondary only)\r\n"
@@ -412,6 +520,13 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                 "  tag <ID> selftest gps|acc|flash  single result\r\n"
                 "  tag <ID> flash              ext-flash health (gate, ids, faults)\r\n"
                 "  tag <ID> flash recover      force a flash re-probe + bring-up\r\n"
+                "  tag <ID> flash crc          read-verify counters (clears them)\r\n"
+                "  tag <ID> flash test         run the flash self-test now\r\n"
+#ifdef ENABLE_FLASH_STRESS_TEST
+                "  tag <ID> flash stress [tx|park] <N>  read a known page N\r\n"
+                "                              times, optionally keying the PA\r\n"
+                "                              or parking the flash between\r\n"
+#endif
                 "  tag <ID> discovery schedule wakeup interval (min)\r\n"
                 "  tag <ID> discovery schedule <N>  set wakeup interval (15/30/60/120/240)\r\n"
                 "  tag <ID> prodsleep          enter production sleep (secondary only)\r\n"
@@ -489,7 +604,8 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         FLASH_vGetHealth(&tHealth);
         snprintf(resp, sizeof(resp),
                  "flash: %s id=%02X%02X%02X tries=%u absent=%u recov=%u "
-                 "probeFail=%u wprot=%u unprotFail=%u eraseVfy=%u\r\n",
+                 "probeFail=%u wprot=%u unprotFail=%u eraseVfy=%u epe=%u "
+                 "crcRetry=%u crcFail=%u\r\n",
                  tHealth.bPresent ? "USABLE" : "GATED-OFF",
                  tHealth.au8LastId[0], tHealth.au8LastId[1], tHealth.au8LastId[2],
                  (unsigned)tHealth.u8LastAttempts,
@@ -498,7 +614,10 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  (unsigned)tHealth.u16ProbeFailures,
                  (unsigned)tHealth.bWriteProtected,
                  (unsigned)tHealth.bUnprotectFailed,
-                 (unsigned)tHealth.u16EraseVerifyFails);
+                 (unsigned)tHealth.u16EraseVerifyFails,
+                 (unsigned)tHealth.u16EpeFails,
+                 (unsigned)tHealth.u16ReadCrcRetries,
+                 (unsigned)tHealth.u16ReadCrcFails);
         FRKERNEL_vRespond(eXport, resp);
     }
     else if (strcmp(p, "flash recover") == 0)
@@ -516,6 +635,58 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  au8Id[0], au8Id[1], au8Id[2], (unsigned)u8Attempts);
         FRKERNEL_vRespond(eXport, resp);
     }
+    else if (strcmp(p, "flash crc") == 0)
+    {
+        /* The read-verify tally. Retries recovered; fails did not, and those
+         * bytes went to a caller that believed them. Reading clears it, so two
+         * consecutive calls bracket whatever happened in between - which is how
+         * to attribute corruption to an OTA session, a log stream or a TX
+         * burst rather than to "sometime since boot". */
+        uint16_t u16Retries = 0U;
+        uint16_t u16Fails   = 0U;
+        (void)FLASH_u32GetAndClearReadCrcStats(&u16Retries, &u16Fails);
+        snprintf(resp, sizeof(resp),
+                 "flash crc: retries=%u fails=%u (cleared)\r\n",
+                 (unsigned)u16Retries, (unsigned)u16Fails);
+        FRKERNEL_vRespond(eXport, resp);
+    }
+    else if (strcmp(p, "flash test") == 0)
+    {
+        /* Re-runs the boot self-test on demand, which is also what leaves the
+         * known pattern at FLASH_SELFTEST_ADDR for the stress variants below.
+         * Destructive to the reserved sector only - never to the log or to a
+         * staged OTA image, and only where the build asked for the destructive
+         * half at all (ENABLE_FLASH_SELFTEST_DESTRUCTIVE); otherwise it is the
+         * identification and status-register checks on their own.
+         *
+         * Deliberately NOT inside the stress-test guard: this is the command an
+         * operator reaches for when a unit is misbehaving, and it costs nothing
+         * to keep in every build that has a console. */
+        Flash_SelfTestResult_t eRes = FLASH_eSelfTest();
+        snprintf(resp, sizeof(resp), "flash test: %s\r\n",
+                 FLASH_pcSelfTestResult(eRes));
+        FRKERNEL_vRespond(eXport, resp);
+    }
+#ifdef ENABLE_FLASH_STRESS_TEST
+    else if (strncmp(p, "flash stress tx", 15) == 0)
+    {
+        FRKERNEL_vRunStress(eXport, resp, sizeof(resp),
+                            (uint32_t)strtoul(p + 15, NULL, 10),
+                            FRKERNEL_vStressTxCallback, "tx");
+    }
+    else if (strncmp(p, "flash stress park", 17) == 0)
+    {
+        FRKERNEL_vRunStress(eXport, resp, sizeof(resp),
+                            (uint32_t)strtoul(p + 17, NULL, 10),
+                            FRKERNEL_vStressParkCallback, "park");
+    }
+    else if (strncmp(p, "flash stress", 12) == 0)
+    {
+        FRKERNEL_vRunStress(eXport, resp, sizeof(resp),
+                            (uint32_t)strtoul(p + 12, NULL, 10),
+                            NULL, "quiet");
+    }
+#endif /* ENABLE_FLASH_STRESS_TEST */
     else if (strcmp(p, "selftest gps") == 0)
     {
         snprintf(resp, sizeof(resp), "selftest gps: %s\r\n",
@@ -530,8 +701,11 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     }
     else if (strcmp(p, "selftest flash") == 0)
     {
-        snprintf(resp, sizeof(resp), "selftest flash: %s\r\n",
-                 SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
+        /* The live gate AND the boot reason code. "FAIL" alone sends an
+         * operator to guess; "FAIL:wrong-part" sends them to the BOM. */
+        snprintf(resp, sizeof(resp), "selftest flash: %s (boot: %s)\r\n",
+                 SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a",
+                 SELFTEST_pcFlashDetail());
         FRKERNEL_vRespond(eXport, resp);
     }
     else if (strncmp(p, "discovery schedule ", 19) == 0)
