@@ -1,8 +1,16 @@
 /*
  * GPS_driver.h
  *
- * GNSS module board-level driver macros for frtag2.
- * Power is controlled by a single GNSS_ON pin (BSP_GNSS_ON).
+ * GNSS module board-level driver macros for frtag3 (Tagskaap V3 RevA). The
+ * GNSS receiver is fitted on secondaries only.
+ *
+ * Power is a single GNSS_ON pin (PA0, BSP_GNSS_ON): it drives the enable of
+ * the LDO that supplies GNSS_VCC, active high. On a primary the same pin is
+ * the fr9 wake line instead (see Farmranger.h), and these macros are never
+ * used. The module's 1.8 V I/O sits on PB6/PB7 (USART1). The power-up order
+ * (rail, settle, then pins) and the power-down order (pins, then rail) live
+ * in one place in GPS.c, GPS_vHwPowerOn() / GPS_vHwPowerOff(); call those
+ * rather than sequencing these macros by hand.
  */
 
 #ifndef DEVICE_GPS_GPS_DRIVER_H_

@@ -2,9 +2,10 @@
  * Flash_SelfTest.c — see Flash_SelfTest.h for the contract.
  *
  * The design rule for everything here: a diagnostic that says "failed" is
- * barely better than no diagnostic. This board has a documented history of
- * healthy parts being declared dead by a single bad read, and of a gated-off
- * driver reporting flash=OK for 18 hours, so a test that cannot distinguish
+ * barely better than no diagnostic. This firmware has a documented history
+ * (on frtag2 hardware, before the fork) of healthy parts being declared dead
+ * by a single bad read, and of a gated-off driver reporting flash=OK for 18
+ * hours, so a test that cannot distinguish
  * "the chip is absent" from "the chip answered and the bytes were wrong" would
  * be repeating a mistake this codebase has already paid for twice.
  *
@@ -88,10 +89,12 @@ static uint8_t au8Actual[FLASH_SELFTEST_PATTERN_LEN];
  *             edge, or CPOL/CPHA disagreeing with the device - and it is the
  *             one classification that says "the data is fine, the transport
  *             is not".
- *   noise     none of the above. Individual bytes wrong in no pattern, which
- *             is what a supply-rail disturbance during the transfer looks
- *             like, and is the classification the TX-corruption hypothesis
- *             predicts.
+ *   noise     none of the above. Individual bytes wrong in no pattern. That
+ *             is what electrical noise on the data lines during the transfer
+ *             looks like - most likely coupling onto the very long MISO/MOSI
+ *             runs over a non-continuous ground plane, though the untested
+ *             TX rail-sag theory would land here too - and it is the
+ *             classification the TX-corruption hypothesis predicts.
  * -------------------------------------------------------------------------- */
 
 /* Is the received buffer the expected one, displaced? Tries whole-byte
@@ -239,8 +242,8 @@ Flash_SelfTestResult_t FLASH_eSelfTest(void)
         {
             /* Nothing is driving the bus. Not a flash fault as such - this is
              * what an unpopulated footprint, a dry joint, a CS that never goes
-             * low, or SPI2 pins left parked analog after a STOP2 wake all look
-             * like from here. */
+             * low, or SPI2 pins left parked as GPIO after a STOP2 wake (never
+             * restored to their alternate function) all look like from here. */
             DBG_LOG("FlashTest: no communication - ID read back all %02X. Check "
                     "CS#/SCK/MOSI/MISO, the part being fitted, and that "
                     "HAL_SPI_FLASH_vEnsureAwake restored the bus\r\n", au8Id[0]);
@@ -391,10 +394,10 @@ Flash_SelfTestResult_t FLASH_eSelfTest(void)
      * The second read is the most valuable line in this whole test. A fault
      * that repeats identically is in the stored bytes or in a fixed property
      * of the bus; a fault that clears, or comes back DIFFERENT, is a transient
-     * - and those two point at completely different investigations. This board
-     * has a documented case of exactly the second kind: a read right after a
-     * TX was wrong, an immediate re-read was also wrong AND DIFFERENT, and a
-     * third read ~65 ms later was correct. */
+     * - and those two point at completely different investigations. frtag2 (V2)
+     * hardware has a documented case of exactly the second kind: a read right
+     * after a TX was wrong, an immediate re-read was also wrong AND DIFFERENT,
+     * and a third read ~65 ms later was correct. */
     DBG_LOG("FlashTest: pattern MISMATCH - %s\r\n", FLASH_pcMismatchName(eKind));
     FLASH_vLogFirstBytes(au8Expected, au8Actual);
 

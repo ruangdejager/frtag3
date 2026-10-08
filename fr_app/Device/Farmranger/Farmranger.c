@@ -83,6 +83,29 @@ static osThreadId_t  Farmranger_vATHandlerTask_handle;
 static osMessageQueueId_t xLineQueue;
 static osMessageQueueId_t xATQueue;
 
+/* Minimum time PA0 (the fr9 wake line) is held low between two sessions, in
+ * ms (= ticks at the 1 kHz tick). The fr9 debounces its wake input for 20 ms
+ * and opens a session only on a debounced RISING edge (fr9_application
+ * frtag.c: the edge interrupt sets a flag, the level is re-checked 20 ms
+ * later from its main loop). A low shorter than that is invisible to it.
+ * That used to happen on the basic-mode boundary flush in DeviceDiscovery,
+ * which closes a session and reopens one straight away: PA0 dropped for well
+ * under 1 ms, the fr9 never saw a new edge, and the tag waited out the full
+ * 3 s RDY timeout ("RDY not received") while its time sync and settings
+ * fetch depended on the fr9 still treating the old session as open. 50 ms is
+ * the hold RadioTestMode already used by hand: 2.5x the debounce, so a late
+ * poll on the fr9 side still catches the low. Enforced inside
+ * FARMRANGER_bDeviceOn() so no caller has to remember it. */
+#define FR_WAKE_MIN_LOW_MS      50U
+
+/* PA0 state as this driver last drove it, and the tick at which it last went
+ * low. bFrWakeLowTickValid stays false until the first session ends: until
+ * then PA0 has been low since HAL_GPIO_vInit() in main(), far longer than
+ * FR_WAKE_MIN_LOW_MS, so the first session after boot does not wait. */
+static bool     bFrWakeHigh          = false;
+static bool     bFrWakeLowTickValid  = false;
+static uint32_t u32FrWakeLowTick;
+
 /* ---- Device state ---- */
 bool bFRDeviceOn;
 
@@ -219,6 +242,18 @@ void FARMRANGER_vNotifyOnRX(void)
 }
 
 /* --------------------------------------------------------------------------
+ * FARMRANGER_vWakeLineLow — drive PA0 low and note when, for the minimum
+ * low-time check in FARMRANGER_bDeviceOn().
+ * -------------------------------------------------------------------------- */
+static void FARMRANGER_vWakeLineLow(void)
+{
+    FR_DRIVER_vIntDisable();
+    bFrWakeHigh         = false;
+    u32FrWakeLowTick    = osKernelGetTickCount();
+    bFrWakeLowTickValid = true;
+}
+
+/* --------------------------------------------------------------------------
  * FARMRANGER_bDeviceOn — power up device and wait for RDY
  * -------------------------------------------------------------------------- */
 bool FARMRANGER_bDeviceOn(void)
@@ -235,8 +270,36 @@ bool FARMRANGER_bDeviceOn(void)
     taskEXIT_CRITICAL();
     osMessageQueueReset(xLineQueue);        /* drop any queued stale lines */
 
+    /* UART first, then the PA0 rising edge. The fr9 opens a session on the
+     * rising edge of PA0 (after a ~20 ms debounce) and answers RDY some time
+     * after it, so USART1 is attached before the edge: the tag's receiver is
+     * ready whenever the fr9 talks, without relying on the fr9's current
+     * ~1 s response delay. And with PB6 already push-pull at its idle-high
+     * level, the fr9's RX sees a clean idle line when it wakes instead of
+     * whatever a parked analog pin floats to (PB6 has no MCU pull).
+     *
+     * This is the reverse of the GNSS power order on a secondary (rail, then
+     * pins: GPS_vHwPowerOn in GPS.c), and deliberately so: on a V3 RevA
+     * primary PA0 is only the fr9 wake line, and no GNSS module is fitted, so
+     * there is no unpowered 1.8 V I/O on these pins to protect. */
     FR_DRIVER_vEnableUart(&farmranger.UartHandle);
+
+    /* A rising edge needs PA0 to have been low for at least
+     * FR_WAKE_MIN_LOW_MS (see its definition). If an earlier attempt failed
+     * on RDY without FARMRANGER_vDeviceOff() being called, PA0 is still high
+     * and raising it again would be no edge at all, so drop it first. Then
+     * wait out whatever part of the minimum low time has not yet passed since
+     * PA0 last went low. */
+    if (bFrWakeHigh)
+        FARMRANGER_vWakeLineLow();
+    if (bFrWakeLowTickValid)
+    {
+        uint32_t u32LowMs = osKernelGetTickCount() - u32FrWakeLowTick;
+        if (u32LowMs < FR_WAKE_MIN_LOW_MS)
+            osDelay(FR_WAKE_MIN_LOW_MS - u32LowMs);
+    }
     FR_DRIVER_vIntEnable();
+    bFrWakeHigh = true;
 
     char respBuf[32] = {0};
     DBG_LOG("Wait for RDY...\r\n");
@@ -262,8 +325,12 @@ bool FARMRANGER_bDeviceOn(void)
 void FARMRANGER_vDeviceOff(void)
 {
     osThreadSuspend(Farmranger_vRxTask_handle);
+    /* UART off (PB6/PB7 back to analog), then PA0 low. The fr9 only acts on
+     * the next RISING edge after a debounced low; FARMRANGER_bDeviceOn()
+     * enforces the minimum low time (FR_WAKE_MIN_LOW_MS) from the tick
+     * recorded here, so a caller may reopen a session immediately. */
     FR_DRIVER_vDisableUart(&farmranger.UartHandle);
-    FR_DRIVER_vIntDisable();
+    FARMRANGER_vWakeLineLow();
     bFRDeviceOn = false;
     DBG_LOG("Farmranger released.\r\n");
 }
@@ -462,6 +529,12 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  * before that path was sped up for the (USART2) flash-log dump. */
 #define FR_LOG_ROW_GAP_MS 10U
 
+/* Upper bound (ms) on waiting for one CSV row to leave the wire. A row is at
+ * most FR_CSV_ROW_MAX bytes, ~7 ms at 115200, so this only trips when USART1
+ * is wedged. Without a bound such a wait hangs the AppTask with the campaign
+ * sleep lock held, so the device never reaches STOP2 again. */
+#define FR_LOG_TX_DRAIN_TIMEOUT_MS 3500U
+
 /* Format neighbor `i` into `row` (size FR_CSV_ROW_MAX). Returns the byte
  * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
 static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
@@ -572,7 +645,7 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
         uint32_t u32TxStart = osKernelGetTickCount();
         while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
         {
-            if ((osKernelGetTickCount() - u32TxStart) >= 3500)
+            if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
             {
                 EVTLOG(LOG_FRLOG_ERROR, 2);
                 DBG_LOG("UART TX timeout\r\n");
@@ -685,9 +758,26 @@ static bool FARMRANGER_bLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
         int rn = FARMRANGER_iFormatBasicRow(row, &neighbors[i]);
         if (rn <= 0 || rn >= (int)sizeof(row))
             return false;
-        for (int b = 0; b < rn; b++)
-            FR_DRIVER_vUartPutByte(&farmranger.UartHandle, (uint8_t)row[b]);
-        while (!HAL_UART_bTxIdle(&farmranger.UartHandle)) osDelay(1);
+        /* Same as the advanced path: queue the whole row through
+         * HAL_UART_vTxPutBuffer, then wait - bounded - for it to leave the
+         * wire. This used to push the row byte-by-byte, ignore whether each
+         * byte fit the TX ring (safe only while FR_CSV_ROW_MAX stays below the
+         * ring's capacity), and wait for TxIdle with no bound at all, so a
+         * wedged USART1 hung the AppTask with the campaign sleep lock held. */
+        HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)rn);
+
+        uint32_t u32TxStart = osKernelGetTickCount();
+        while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
+        {
+            if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
+            {
+                EVTLOG(LOG_FRLOG_ERROR, 2);
+                DBG_LOG("LogData: UART TX timeout (basic)\r\n");
+                return false;
+            }
+            osDelay(1);
+        }
+
         osDelay(FR_LOG_ROW_GAP_MS);
     }
 
@@ -874,7 +964,7 @@ static bool FARMRANGER_bRtLogAttempt(const FarmrangerRtBeacon_t *pBeacons,
         uint32_t u32TxStart = osKernelGetTickCount();
         while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
         {
-            if ((osKernelGetTickCount() - u32TxStart) >= 3500U)
+            if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
             {
                 DBG_LOG("RtLog: UART TX timeout\r\n");
                 return false;

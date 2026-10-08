@@ -4,9 +4,17 @@
  * Farmranger device layer — UART-based AT command interface to the
  * companion logger board.
  *
- * Uses CMSIS-RTOS v2 throughout.  The data-send path streams all rows into
- * the interrupt-driven TX ring (which copies each byte) and then polls
- * HAL_UART_bTxIdle() once for the line to drain before tearing down the UART.
+ * Uses CMSIS-RTOS v2 throughout.  The data-send path paces the upload one
+ * row at a time: each row is copied into the interrupt-driven TX ring, then
+ * the sender polls HAL_UART_bTxIdle() until that row has fully left the wire
+ * and pauses FR_LOG_ROW_GAP_MS before the next, so at most one row is ever in
+ * flight and the fr9's RX ring cannot overflow (see FR_LOG_ROW_GAP_MS in
+ * Farmranger.c).
+ *
+ * Hardware (frtag3, Tagskaap V3 RevA, PRIMARY role only): the fr9 link is
+ * USART1 on PB6 (TX) / PB7 (RX) with the standard mapping, no TX/RX swap, and
+ * the fr9 wake line is PA0 (BSP_FR_WAKE, the same pin a secondary uses as
+ * GNSS_ON). No GNSS is fitted on a primary.
  */
 
 #ifndef DEVICE_FARMRANGER_FARMRANGER_H_
@@ -23,8 +31,9 @@
 #define FR_DRIVER_vEnableUart(drv)          HAL_UART_vEnable(drv)
 #define FR_DRIVER_vDisableUart(drv)         HAL_UART_vDisable(drv)
 #define FR_DRIVER_vUartPutByte(drv, byte)   HAL_UART_vTxPutByte(drv, byte)
-#define FR_DRIVER_vIntEnable()              HAL_GPIO_WritePin(BSP_FR_GPIO_INT_PORT, BSP_FR_GPIO_INT_PIN, GPIO_PIN_SET)
-#define FR_DRIVER_vIntDisable()             HAL_GPIO_WritePin(BSP_FR_GPIO_INT_PORT, BSP_FR_GPIO_INT_PIN, GPIO_PIN_RESET)
+/* PA0 rising edge = fr9 session request (an output; shares the pin with GNSS_ON, see hal_bsp.h). */
+#define FR_DRIVER_vIntEnable()              HAL_GPIO_WritePin(BSP_FR_WAKE_PORT, BSP_FR_WAKE_PIN, GPIO_PIN_SET)
+#define FR_DRIVER_vIntDisable()             HAL_GPIO_WritePin(BSP_FR_WAKE_PORT, BSP_FR_WAKE_PIN, GPIO_PIN_RESET)
 
 /* ---- Public API ---- */
 void     FARMRANGER_vInit(void);

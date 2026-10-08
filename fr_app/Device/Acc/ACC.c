@@ -5,10 +5,20 @@
  *
  * Initialises the device via a register configuration table and exposes
  * the public API for ID verification, FIFO sample count and data read.
+ *
+ * Secondary only on Tagskaap V3 RevA: a primary has no accelerometer fitted,
+ * and init.c neither starts the SPI1 bus (HAL_SPI_ACC_vInit) nor calls into
+ * this module there. Everything below assumes the bus has been started.
+ * ACC_INT (PC13, the part's INT1) is routed on the board but unused and parked
+ * analog; Movement polls the FIFO level instead (ACC_u8NumSamplesInFifo).
  */
+
+#include <string.h>
 
 #include "ACC.h"
 #include "platform.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 /* SPI frame bit positions */
 #define SPI_READ_NWRITE_BP      7
@@ -19,7 +29,7 @@ static const acc_reg_config_t AccRegConfig_P[] =
 {
     { ACC_CTRL_REG0,        0b00010000 },   /* default */
     { ACC_TEMP_CFG_REG,     0b00000000 },   /* default */
-    { ACC_CTRL_REG1,        0b00110111 },   /* high-res, 25 Hz ODR, XYZ enabled */
+    { ACC_CTRL_REG1,        0b00110111 },   /* normal mode (LPen=0; HR=0 in CTRL_REG4), 25 Hz ODR, XYZ enabled */
     { ACC_CTRL_REG2,        0b00000000 },   /* default */
     { ACC_CTRL_REG3,        0b00000010 },   /* FIFO overrun on INT1 */
     { ACC_CTRL_REG4,        0b00000000 },   /* default */
@@ -75,6 +85,28 @@ static const acc_reg_config_t AccRegConfigErr_P[] =
     { ACC_CTRL_REG5,        0x00 },   /* ERROR (repeat) */
 };
 
+/* Bus serialisation.
+ *
+ * Every SPI1 transaction below (select, transfer, deselect) runs with the
+ * scheduler suspended. The accelerometer bus has more than one task-context
+ * user on a secondary: the Movement task (osPriorityLow) reads the FIFO every
+ * second from the moment MOVE_vInit() starts it, and the boot self-test
+ * (SELFTEST_vRunAndReport, init task, osPriorityNormal) reads WHO_AM_I after
+ * that. With nothing serialising them, the init task could preempt Movement
+ * inside an open chip-select window, or inside the lazy SPI1 re-init that
+ * HAL_SPI_ACC_vSelect() runs after a STOP2 wake, and corrupt both transfers or
+ * the hAccSpi handle itself. (The flash bus has FLASH_vLock for the same
+ * reason; this bus had nothing.)
+ *
+ * Scheduler suspension rather than a mutex: a transaction is at most a few
+ * bytes at 375 kHz (~150 us), interrupts stay live (HAL_GetTick runs off
+ * TIM16, so the HAL SPI timeouts still work), and it also makes the lazy
+ * re-init atomic against the other task. Nothing inside the suspended region
+ * may block: no osDelay, no logging - the retry delay in ACC_bDeviceIdOkEx
+ * sits outside these helpers. */
+#define ACC_BUS_vLock()     vTaskSuspendAll()
+#define ACC_BUS_vUnlock()   ((void)xTaskResumeAll())
+
 /* Private prototypes */
 void    _vDeviceReadRegArray(uint8_t u8RegAddrStart, uint8_t *pau8Buf, uint8_t u8NumBytes);
 void    _vDeviceWriteReg(uint8_t u8RegAddr, uint8_t u8RegData);
@@ -89,35 +121,6 @@ void ACC_vInit(void)
 }
 
 /* --------------------------------------------------------------------------
- * ACC_vConfigIdle — low-power idle config for roles that don't track movement.
- *
- * The primary doesn't use movement. Three states were measured on its rail:
- *   - unconfigured power-on default  ~115 uA (undefined I/O)
- *   - configured active 25 Hz + FIFO  ~45 uA (FIFO fills and overruns, never
- *     drained because there's no movement task)
- *   - full power-down (CTRL_REG1=0)  WORSE (floating SPI inputs into the now-
- *     idle I/O crowbar)
- * So keep the I/O drivers active but remove the overrun source: low-power mode,
- * low ODR, and NO FIFO (bypass) with no INT routing. CTRL_REG4=0 selects 4-wire
- * SPI so the interface is in a defined state.
- * -------------------------------------------------------------------------- */
-static const acc_reg_config_t AccRegConfigIdle_P[] =
-{
-    { ACC_CTRL_REG0,        0b00010000 },   /* default (SDO pull-up state)        */
-    { ACC_CTRL_REG4,        0b00000000 },   /* 4-wire SPI                          */
-    { ACC_CTRL_REG3,        0b00000000 },   /* no INT routing                      */
-    { ACC_CTRL_REG5,        0b00000000 },   /* FIFO disabled                       */
-    { ACC_FIFO_CTRL_REG,    0b00000000 },   /* bypass mode (nothing to overrun)    */
-    { ACC_CTRL_REG1,        0b00101111 },   /* low-power mode, 10 Hz, XYZ on       */
-};
-
-void ACC_vConfigIdle(void)
-{
-    _vDeviceRegsConfig(AccRegConfigIdle_P,
-                       sizeof(AccRegConfigIdle_P) / sizeof(acc_reg_config_t));
-}
-
-/* --------------------------------------------------------------------------
  * _vDeviceReadRegArray — read N sequential registers via SPI
  * -------------------------------------------------------------------------- */
 void _vDeviceReadRegArray(uint8_t u8RegAddrStart, uint8_t *pau8Buf, uint8_t u8NumBytes)
@@ -126,10 +129,24 @@ void _vDeviceReadRegArray(uint8_t u8RegAddrStart, uint8_t *pau8Buf, uint8_t u8Nu
 
     u8RegAddrStart &= ACC_SPI_ADDR_MASK;
     u8Data = (1 << SPI_READ_NWRITE_BP) | (1 << SPI_MULTI_NSINGLE_BP) | u8RegAddrStart;
+
+    ACC_BUS_vLock();
     HAL_SPI_ACC_vSelect();
-    HAL_SPI_ACC_vSpiWritePacket(&u8Data, 1);
-    HAL_SPI_ACC_vSpiReadPacket(pau8Buf, u8NumBytes);
+    bool bOk = (HAL_SPI_ACC_vSpiWritePacket(&u8Data, 1) == HAL_OK);
+    if (bOk)
+        bOk = (HAL_SPI_ACC_vSpiReadPacket(pau8Buf, u8NumBytes) == HAL_OK);
     HAL_SPI_ACC_vDeselect();
+    ACC_BUS_vUnlock();
+
+    /* A failed transfer (HAL_BUSY on a bus that was never started, or a
+     * timeout) leaves the caller's buffer untouched or half-written, and the
+     * single-register read below used to hand back an uninitialised stack
+     * byte as the "last byte" in the WHO_AM_I diagnostics. Return a defined
+     * 0x00 instead: it can never equal ACC_WHO_AM_I_VALUE, and it reads as
+     * "no response" rather than 0xFF, which ACC_bDeviceIdOkEx reports as an
+     * idle MISO. */
+    if (!bOk)
+        memset(pau8Buf, 0x00, u8NumBytes);
 }
 
 /* --------------------------------------------------------------------------
@@ -137,7 +154,7 @@ void _vDeviceReadRegArray(uint8_t u8RegAddrStart, uint8_t *pau8Buf, uint8_t u8Nu
  * -------------------------------------------------------------------------- */
 uint8_t _u8DeviceReadReg(uint8_t u8RegAddr)
 {
-    uint8_t u8Data;
+    uint8_t u8Data = 0x00U;
     _vDeviceReadRegArray(u8RegAddr, &u8Data, 1);
     return u8Data;
 }
@@ -151,10 +168,12 @@ void _vDeviceWriteReg(uint8_t u8RegAddr, uint8_t u8RegData)
 
     u8RegAddr &= ACC_SPI_ADDR_MASK;
     u8Data = (0 << SPI_READ_NWRITE_BP) | (0 << SPI_MULTI_NSINGLE_BP) | u8RegAddr;
+    ACC_BUS_vLock();
     HAL_SPI_ACC_vSelect();
     HAL_SPI_ACC_vSpiWritePacket(&u8Data, 1);
     HAL_SPI_ACC_vSpiWritePacket(&u8RegData, 1);
     HAL_SPI_ACC_vDeselect();
+    ACC_BUS_vUnlock();
 }
 
 /* --------------------------------------------------------------------------
@@ -191,11 +210,16 @@ bool ACC_bDeviceIdOkEx(uint8_t *pu8Id, uint8_t *pu8Attempts)
     uint8_t u8Try = 0U;
 
     /* Retried, not single-shot — same reasoning as FLASH_bVerifyDeviceEx.
-     * A lone WHO_AM_I read is not trustworthy on this board: a supply-rail
-     * sag from a concurrent radio/GPS current spike corrupts one read of a
-     * perfectly healthy part, and the first read after HAL_SPI_ACC_vSelect()
-     * re-inits a parked bus is the most exposed of all. Calling that "ACC
-     * FAIL" is the same false negative the flash test used to produce.
+     * A lone WHO_AM_I read has been seen to come back wrong from a perfectly
+     * healthy part. On frtag2 (V2) hardware that was blamed on supply-rail sag
+     * from a concurrent radio/GPS current spike, but that mechanism was never
+     * tested and TX was not shown to sag the rail; the likelier cause is noise
+     * on the very long MISO/MOSI runs over a non-continuous ground plane (see
+     * OTA_LORA_CHUNK_GAP_MS in Fota_Config.h). V3 RevA is a new layout and has
+     * not been characterised for it either way. The first read after
+     * HAL_SPI_ACC_vSelect() re-inits a parked bus was considered the most
+     * exposed. Whatever the cause, calling one bad read "ACC FAIL" is the same
+     * false negative the flash test used to produce, so the read is retried.
      *
      * The raw byte goes back to the caller so a real failure is diagnosable:
      *   0x00 -> no clock/data (AF, wiring, bus not restored)
@@ -206,7 +230,7 @@ bool ACC_bDeviceIdOkEx(uint8_t *pu8Id, uint8_t *pu8Attempts)
         u8Id = ACC_u8GetDeviceId();
         if (u8Id == ACC_WHO_AM_I_VALUE) { bOk = true; break; }
 
-        osDelay(2);   /* let the rail settle before re-reading */
+        osDelay(2);   /* short gap before re-reading */
     }
 
     if (pu8Id != NULL)

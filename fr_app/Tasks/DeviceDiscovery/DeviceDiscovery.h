@@ -296,7 +296,7 @@ osThreadId_t       DEVICE_DISCOVERY_xGetTaskHandle(void);
 void               DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
 
 /* Super-deep sleep (secondary only): discovery, acc logging and scheduled
- * wakes all stop; the STOP2 indicator goes yellow. The two variants differ
+ * wakes all stop; the STOP2 indicator goes green. The two variants differ
  * only in what may wake the device again:
  *   vEnterProductionSleep — a rising panel level OR the shake sequence.
  *   vEnterSolarSleep      — the shake sequence ONLY, so a flat unit can take

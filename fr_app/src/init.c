@@ -5,18 +5,25 @@
  * Runs once immediately after the scheduler starts, initialises all
  * hardware and software subsystems in the correct order, then exits.
  *
+ * The board GPIO safe state (LEDs, enables, chip-selects, RF switch, unused
+ * pins) is NOT set here. HAL_GPIO_vInit() runs in main(), right after
+ * HAL_Init() and before SystemClock_Config(): when the image runs without the
+ * bootloader, the LSE start there can take seconds, and PA0/PA4/PB2/PA9/PA11 have no external pulls, so the pins
+ * have to reach a safe state before it rather than after it.
+ *
  * Order matters:
- *   1. GPIO (board direction, charger enable)
- *   2. Device-role detection (primary vs secondary)
- *   3. UART (required by DBG macros)
- *   4. DbgLog, ext-flash, text log
- *   5. ADC, TIM2 tick counter
- *   6. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
- *   7. Settings
- *   8. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
- *   9. LoRa radio stack
- *  10. Role-specific subsystems
- *  11. Time, battery, power management
+ *   1. Device-role detection (primary vs secondary)
+ *   2. UART (required by DBG macros)
+ *   3. Flash SPI bus, DbgLog, ext-flash, text log
+ *   4. ADC, TIM2 tick counter
+ *   5. Platform (creates heartbeat task — must come before HAL_RTC_vInit)
+ *   6. Settings
+ *   7. RTC  (starts 1 Hz wakeup interrupt — heartbeat task must exist)
+ *   8. LoRa radio stack
+ *   9. Role-specific subsystems (the accelerometer SPI bus is started here,
+ *      on a secondary only)
+ *  10. Time, battery, power management
+ *  11. Boot self-test
  */
 
 #include "init.h"
@@ -66,21 +73,25 @@ void INIT_vInitialization(void *parameters)
 
     FLASHLOG_vInit();
 
-    /* Board-level GPIO */
-    HAL_GPIO_vInit();
+    /* No HAL_GPIO_vInit() here any more: the board GPIO safe state is set in
+     * main() before SystemClock_Config() (see the file header), so by the time
+     * this task runs every board pin is already in its defined state. */
 
     /* Determine primary / secondary role before UART init. This is the only
-     * read of the role strap (PB12); it tristates the pin immediately after, so
-     * latch the role into the UART layer here for the USART1 baud/swap choice
-     * rather than having HAL_UART_vInit() re-read the strap on every (re-)init. */
+     * read of the role strap (PB12); it parks the pin analog immediately after,
+     * so latch the role into the UART layer here for the USART1 baud and
+     * PB6/PB7 drive mode choice rather than having HAL_UART_vInit() re-read the
+     * strap on every (re-)init. */
     DEVICE_DISCOVERY_vConfigDeviceRole();
     HAL_UART_vSetRole(DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
     HAL_UART_vInit();
 
-    /* Both SPI peripherals (ACC + flash) must be up before FLASH_vInit and any
-     * DBG_LOG call that writes to ext-flash.  Single call covers both. */
-    HAL_SPI_vInit();
+    /* The flash bus (SPI2) must be up before FLASH_vInit and any DBG_LOG call
+     * that writes to ext-flash. The flash is fitted on both roles. The
+     * accelerometer bus (SPI1) is started further down, on a secondary only:
+     * there is no accelerometer on a V3 RevA primary. */
+    HAL_SPI_FLASH_vInit();
 
     DBGLOG_vInit();
 
@@ -108,7 +119,7 @@ void INIT_vInitialization(void *parameters)
 
     /* Record the active build_config.h feature set at the top of every boot
      * log, so "what did I actually flash" is recoverable from the terminal
-     * (or, once persisted, the flash/SD log) instead of only from whatever
+     * (or, once persisted, the flash log) instead of only from whatever
      * .cproject or build_config.h happened to say at build time. Only lists
      * options this TU actually saw defined -- the string is assembled by the
      * preprocessor, not read back at runtime.
@@ -240,28 +251,31 @@ void INIT_vInitialization(void *parameters)
     if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
     {
         SOLAR_vInit();
+        /* The accelerometer bus has to be up before ACC_vInit(): every
+         * register write goes through HAL_SPI_ACC_vSelect, and on a bus that
+         * was never started the transfers return HAL_BUSY and do nothing -
+         * the AN3308 bring-up would be silently skipped. */
+        HAL_SPI_ACC_vInit();
         ACC_vInit();
         MOVE_vInit();
         GPS_vInit();
     }
     else
     {
-        /* The accelerometer is fitted and powered on primaries too, but the
-         * primary doesn't track movement. Left in its undefined power-on state
-         * its I/O drew ~115 uA; configured-but-active (25 Hz, un-drained FIFO)
-         * ~45 uA; full power-down was worse (floating SPI inputs crowbar). So
-         * use a low-power, no-FIFO idle config - I/O active, nothing to overrun.
+        /* No accelerometer on a Tagskaap V3 RevA primary, so nothing of it is
+         * touched here. SPI1 is never started, so PA1/PA6/PA7 keep their reset
+         * analog state and are left out of the STOP2 park. PA11 (ACC_CS) was
+         * driven high by HAL_GPIO_vInit before the role was known; nothing is
+         * fitted on it and it has no external pull, so that costs nothing.
+         * Movement is not started either: MOVE_eGetState() reports its MOVING
+         * default, as it always has on a primary, and the boot self-test
+         * reports acc=n/a.
          *
-         * Full AN3308 bring-up runs first, then the idle profile on top. The
-         * idle table only writes 6 registers and assumes power-on defaults for
-         * every other one — true after a cold boot, but not after a warm reset
-         * (an OTA install resets into a running device whose ACC keeps its
-         * previous configuration). Establishing the known-good baseline first
-         * makes the primary's ACC state identical to the secondary's before
-         * the idle profile is applied, so the boot self-test reads a device in
-         * a defined state on both roles. */
-        ACC_vInit();
-        ACC_vConfigIdle();
+         * frtag2 primaries did carry an accelerometer they did not use, and
+         * applied a low-power idle register profile to it here; its current
+         * measurements now live with HAL_SPI_vOnSleep in hal_spi.c, where they
+         * are the reason a secondary's ACC pins are driven in STOP2. */
+
         /* Primary: bring up the Farmranger UART link to the fr9 logger board.
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
@@ -272,14 +286,14 @@ void INIT_vInitialization(void *parameters)
     BAT_vInit();
     POWER_vInit();
 
-    /* Peripheral smoke test — checks GPS UART, ACC WHO_AM_I and ext-flash
-     * JEDEC ID. Records each result for later FrKernel queries and flashes
-     * a yellow-LED error code for anything that failed. Blocking; returns
-     * once the LED sequence is done (no delay on a clean boot). Never
-     * fatal — normal boot always proceeds after this. */
+    /* Peripheral smoke test — checks GPS UART and ACC WHO_AM_I on a secondary,
+     * and the ext-flash on both roles. Records each result for later FrKernel
+     * queries and flashes a green-LED error code for anything that failed.
+     * Blocking; returns once the LED sequence is done (no delay on a clean
+     * boot). Never fatal — normal boot always proceeds after this. */
     SELFTEST_vRunAndReport();
 
-    BSP_LED_Off(LED_YELLOW);
+    BSP_LED_Off(LED_GREEN);
 
     /* Let the whole boot-time DBG_LOG output -- including the build-config
      * line above -- actually drain out of DbgLog's ring and off the wire

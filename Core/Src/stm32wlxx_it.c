@@ -1,7 +1,7 @@
 /*
  * stm32wlxx_it.c
  *
- * Interrupt Service Routines for frtag2.
+ * Interrupt Service Routines for frtag3.
  */
 
 #include "main.h"

@@ -24,15 +24,15 @@
 
 /* Shake-sequence step/complete confirmation flash. Always blinks whichever
  * LED is NOT the current sleep indicator (HAL_SYSTEM_eGetSleepIndicatorLed):
- * yellow normally (indicator is red), but red instead during
- * ProductionSleep/SolarSleep (indicator is yellow there) — otherwise the
- * STOP2 entry/exit and 2 Hz lock-held pulsing that also drive yellow in
+ * green normally (indicator is red), but red instead during
+ * ProductionSleep/SolarSleep (indicator is green there) — otherwise the
+ * STOP2 entry/exit and 2 Hz lock-held pulsing that also drive green in
  * that mode would stomp this flash and the operator shaking the device
  * awake would never see step confirmation. */
 static inline void MOVE_DRIVER_vLedOn(void)
 {
     if (HAL_SYSTEM_eGetSleepIndicatorLed() == HAL_SYSTEM_SLEEP_LED_RED)
-        BSP_LED_On(LED_YELLOW);
+        BSP_LED_On(LED_GREEN);
     else
         BSP_LED_On(LED_RED);
 }
@@ -40,7 +40,7 @@ static inline void MOVE_DRIVER_vLedOn(void)
 static inline void MOVE_DRIVER_vLedOff(void)
 {
     if (HAL_SYSTEM_eGetSleepIndicatorLed() == HAL_SYSTEM_SLEEP_LED_RED)
-        BSP_LED_Off(LED_YELLOW);
+        BSP_LED_Off(LED_GREEN);
     else
         BSP_LED_Off(LED_RED);
 }

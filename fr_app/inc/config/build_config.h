@@ -93,8 +93,12 @@
  *
  * Costs one extra read per FLASH_vRead. That is real on the OTA verify path
  * (~1900 reads per whole-image pass) and invisible everywhere else. Left ON
- * because this board has an open defect whose whole difficulty is that
- * corrupted reads report success. */
+ * because frtag2 had an open defect whose whole difficulty is that corrupted
+ * reads report success: flash reads issued soon after a radio TX came back
+ * wrong (see OTA_LORA_CHUNK_GAP_MS in Fota_Config.h). The mechanism was never
+ * established - the supply-rail-sag explanation is untested, and noise on the
+ * long MISO/MOSI lines over a non-continuous ground plane is the likelier
+ * cause - and the V3 RevA layout has not yet been shown to be free of it. */
 #define ENABLE_FLASH_READ_CRC
 
 /* Console flash diagnostics: "tag flash test" and

@@ -218,9 +218,9 @@
 /* --------------------------------------------------------------------------
  * AC timing — §13.3, Table 18 (1.65-3.6 V, -40 to +85 C)
  *
- * This board runs at 1.8 V; a sibling board runs the same firmware at 3.0 V.
- * Every constant below is therefore taken from the 1.65-3.6 V column, which
- * is the worse of the two, so one set of numbers is correct on both boards.
+ * This board (Tagskaap V3 RevA) runs VDD = 2.0 V; frtag2 ran at 1.8 V. Every
+ * constant below is taken from the 1.65-3.6 V column, the worst case, so the
+ * numbers hold anywhere in that range rather than only at one board's rail.
  * Where Table 19 (-40 to +125 C) is worse still, the timeout is sized off
  * Table 19 instead and says so.
  * -------------------------------------------------------------------------- */
@@ -296,16 +296,22 @@
 /* --------------------------------------------------------------------------
  * Probe and recovery policy
  *
- * Unchanged from the previous part. The reasoning is about this BOARD, not
- * about the flash: a single read is not trustworthy here, and the driver has
- * to survive that without declaring a healthy chip dead.
+ * Unchanged from the previous part. The reasoning is about the BOARD, not
+ * about the flash: a single read was not trustworthy on frtag2, V3 RevA has
+ * not yet been shown to be any different, and the driver has to survive that
+ * without declaring a healthy chip dead.
  * -------------------------------------------------------------------------- */
 
 /* JEDEC-ID read attempts before declaring the part absent/faulty. A single
- * read is not trustworthy on this board — a transient (supply-rail sag from a
- * concurrent radio/GPS current spike) can corrupt one read of an otherwise
- * healthy chip, and calling that "flash FAIL" is both wrong and dangerous if
- * anything acts on it. */
+ * read was not trustworthy on frtag2 (V2) hardware, and V3 RevA has not yet
+ * been shown to be any different: a transient can corrupt one read of
+ * an otherwise healthy chip, and calling that "flash FAIL" is both wrong and
+ * dangerous if anything acts on it. On frtag2 (V2) hardware the transients
+ * correlated with radio TX and were blamed on supply-rail sag from a radio/GPS
+ * current spike, but that mechanism was never tested and TX was not shown to
+ * sag the rail; noise on the very long MISO/MOSI runs over a non-continuous
+ * ground plane is the likelier cause (see OTA_LORA_CHUNK_GAP_MS in
+ * Fota_Config.h). V3 RevA has not been characterised for it. */
 #define FLASH_JEDEC_READ_ATTEMPTS   5U
 
 /* Cooldown between automatic re-probes once the device has been declared
@@ -326,9 +332,9 @@
 
 /* Extra probe rounds at boot only, each a full FLASH_JEDEC_READ_ATTEMPTS burst
  * separated by a longer settle. Boot is the one moment where getting this wrong
- * is most expensive and retrying is cheapest: FLASH_vInit runs a few
- * milliseconds after power-up, in the worst part of the rail for a clean SPI
- * read, and LOG_vInit immediately behind it scans every sector to find the log
+ * is most expensive and retrying is cheapest: FLASH_vInit runs early in boot,
+ * when the supply and the part have had the least time to settle, and
+ * LOG_vInit immediately behind it scans every sector to find the log
  * head. Entering that scan with the gate wrongly shut costs a whole boot's
  * logging; spending ~150 ms up front to avoid it is free by comparison. */
 #define FLASH_BOOT_PROBE_ROUNDS     3U

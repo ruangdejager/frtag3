@@ -28,15 +28,18 @@ volatile char *pcLastStackOverflowTask = NULL;
  * must not add its own stack usage on top of it. */
 static char acOverflowMsg[80];
 
-/* Stack-overflow flash code: the yellow LED flashes (50ms on / 50ms off) N
+/* Stack-overflow flash code: the green LED flashes (50ms on / 50ms off) N
  * times, holds off for 2s, then repeats — N is this table's 1-based index
  * of pcTaskName. A task name not in this table holds the LED solid ON
- * instead, which is visually distinct from any numbered code.
+ * instead, which is visually distinct from any numbered code. Retired slots
+ * keep their index so later flash codes do not move in the field (20 was
+ * BatPurgeTask, removed when Battery started seeding its average from the
+ * first valid sample).
  *
  *  1 = InitTask          9 = CheckWakeupSched    17 = FRAtHandlerTask
  *  2 = Heartbeat        10 = SolarSampleTask     18 = BatSampleTask
  *  3 = DbgLog           11 = SolarSchedTask      19 = BatSchedTask
- *  4 = LogTask          12 = Movement            20 = BatPurgeTask
+ *  4 = LogTask          12 = Movement            20 = (retired)
  *  5 = FrKernel         13 = GPSRxTask           21 = PowerStateMgr
  *  6 = MeshParser       14 = GPSDispatcher       22 = RadioTest
  *  7 = MeshTx           15 = LoRaRadioTask
@@ -47,7 +50,7 @@ static const char * const apcOverflowTaskNames[] = {
     "MeshParser", "MeshTx", "DevDiscoveryApp", "CheckWakeupSched",
     "SolarSampleTask", "SolarSchedTask", "Movement", "GPSRxTask",
     "GPSDispatcher", "LoRaRadioTask", "FRRxTask", "FRAtHandlerTask",
-    "BatSampleTask", "BatSchedTask", "BatPurgeTask",
+    "BatSampleTask", "BatSchedTask", "(retired)",
     "PowerStateMgr", "RadioTest"
 };
 
@@ -100,7 +103,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     if (len > 0)
         DEBUG_vPutBufferBlocking((const uint8_t *)acOverflowMsg, (uint16_t)len);
 
-    /* Visual flash code on the yellow LED — see apcOverflowTaskNames[] above
+    /* Visual flash code on the green LED — see apcOverflowTaskNames[] above
      * for the task/flash-count mapping. Runs forever; no debugger or UART
      * required. */
     uint8_t u8FlashCount = u8GetOverflowFlashCode(pcTaskName);
@@ -109,7 +112,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     {
         /* Unrecognized task name: solid-on is visually distinct from any
          * numbered code. */
-        BSP_LED_On(LED_YELLOW);
+        BSP_LED_On(LED_GREEN);
         for (;;) { }
     }
 
@@ -117,9 +120,9 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
     {
         for (uint8_t i = 0; i < u8FlashCount; i++)
         {
-            BSP_LED_On(LED_YELLOW);
+            BSP_LED_On(LED_GREEN);
             LED_vBlockingDelayMs(50);
-            BSP_LED_Off(LED_YELLOW);
+            BSP_LED_Off(LED_GREEN);
             LED_vBlockingDelayMs(50);
         }
         LED_vBlockingDelayMs(2000);

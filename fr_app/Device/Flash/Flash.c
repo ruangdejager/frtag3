@@ -256,7 +256,6 @@ static bool FLASH_bGlobalUnprotect(void)
 
     if (!FLASH_bWaitReady())
         return false;
-    BSP_LED_Off(LED_YELLOW);
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
     bool bOk = (FLASH_DRIVER_vWrite(cmd, 2) == HAL_OK);
@@ -421,10 +420,12 @@ static bool FLASH_bProbeLocked(uint8_t *pu8Id, uint8_t *pu8Attempts)
 
     /* A single JEDEC read can come back wrong while the part is perfectly
      * healthy - the same transient this codebase already documents elsewhere
-     * (see OTA_LORA_CHUNK_GAP_MS: a supply-rail sag makes a too-soon flash read
-     * return corrupt bytes). Reporting FAIL off one bad read was declaring
-     * every unit's flash dead while it was demonstrably reading, writing and
-     * holding the log fine.
+     * (see OTA_LORA_CHUNK_GAP_MS: on frtag2, a flash read issued too soon after
+     * a TX came back corrupt). That note used to blame supply-rail sag; the
+     * mechanism was never confirmed, and noise on the long MISO/MOSI runs over
+     * a non-continuous ground plane is the likelier cause. Reporting FAIL off
+     * one bad read was declaring every unit's flash dead while it was
+     * demonstrably reading, writing and holding the log fine.
      *
      * The raw bytes are handed back so the caller can log what actually came
      * off the wire, which is what distinguishes the cases:
@@ -459,7 +460,7 @@ static bool FLASH_bProbeLocked(uint8_t *pu8Id, uint8_t *pu8Attempts)
             (id[1] == FLASH_DEVICE_ID1)      &&
             (id[2] == FLASH_DEVICE_ID2))     { bOk = true; break; }
 
-        osDelay(2);   /* let the rail settle before re-reading */
+        osDelay(2);   /* short gap before re-reading */
     }
 
     if (u8Try > FLASH_JEDEC_READ_ATTEMPTS) u8Try = FLASH_JEDEC_READ_ATTEMPTS;

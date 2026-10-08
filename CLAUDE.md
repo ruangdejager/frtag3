@@ -3,8 +3,9 @@
 Firmware for the Farmranger LoRa tag (STM32WLE5CC, FreeRTOS, STM32CubeIDE).
 
 frtag3 is a fork of `../frtag2` created for new hardware with a slightly different pin
-configuration. The code is currently an exact copy of frtag2 apart from the project name
-and the firmware version; divergence for the new board starts from here.
+configuration. It targets the Tagskaap V3 RevA board: VDD 2.0 V (frtag2 ran at 1.8 V); GNSS
+and accelerometer fitted on secondaries only; no USART1 TX/RX swap (the primary needs an fr9
+with the corrected TX/RX crossing). See `Hal/hal_bsp.h` for the pin map.
 
 ## Working rules
 
@@ -53,7 +54,8 @@ work to concentrate in `Hal/`.
 | --- | --- |
 | `Device/` | Peripheral drivers owned by this board: `Acc`, `Flash`, `Gps`, `LoraRadio`, `Farmranger` (UART link to the fr9 board). Bus I/O via `Hal/`, plus device protocol and health/retry logic. |
 | `Worker/` | Subsystems with their own lifecycle or state machine: `Battery`, `Fota`, `FrKernel`, `MeshNetwork`, `Movement`, `Power`, `SolarPower`. Built on one or more Devices. |
-| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTestMode` (runtime link/range test, entered with `tag <ID> radiotest`; not a separate build). |
+| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTest` (`RadioTestMode.c`: runtime link/range test, entered with `tag <ID> radiotest`; not a separate build). |
+| `Services/` | Application services used across modules: `Debug` (raw debug transport, USART2), `Log` (circular text log on the external NOR flash), `SelfTest` (boot-time peripheral smoke tests, reported on the green LED and over FrKernel). |
 | `inc/`, `src/` | Cross-cutting glue that is not a module: `main.c`, `init.c` (boot sequencer), `DbgLog`, `flashLog`, `math_func`, `time_driver`, `uart_callbacks`, `inc/config/` build and version headers. |
 | `settings/` | `settings_default.c/h` — the persisted-settings struct and its compile-time defaults. |
 
@@ -72,7 +74,10 @@ Per-module file pattern:
 
 There is no task registry. `fr_app/src/init.c` is a single ordered bootstrap that calls each
 subsystem's `MODULE_vInit()` in a documented sequence, then exits its own thread. Each module
-wires itself up inside its own init.
+wires itself up inside its own init. The one exception is `HAL_GPIO_vInit()`, which `main()`
+calls right after `HAL_Init()` and before `SystemClock_Config()`, so the board pins reach a
+safe state before the LSE start, which can take seconds; it must stay free of RTOS, log and
+delay calls.
 
 Two idioms:
 
@@ -138,10 +143,11 @@ from `../frtag2_bootloader`.
 
 ## OTA
 
-`fr_app/Worker/Fota/Fota_Config.h` is a byte-identical mirror of the same file in
-`frtag2_bootloader/fr_bootloader/inc/` — it is the app/bootloader contract, so any change
-must be made in both places. This coupling still points at frtag2's bootloader and will need
-resolving when frtag3 diverges.
+`fr_app/Worker/Fota/Fota_Config.h` shares its flash layout and handoff constants with the
+same file in `frtag2_bootloader/fr_bootloader/inc/` — those are the app/bootloader contract,
+so any change to them must be made in both places. The two files are no longer
+byte-identical: the app copy carries application-only additions. This coupling still points
+at frtag2's bootloader and will need resolving when frtag3 diverges.
 
 Flow: fr9 fetches `version.json` and the `.bin`, streams it over UART to the primary tag; the
 primary writes it into the external NOR scratchpad (mapped 1:1 to the app base address),

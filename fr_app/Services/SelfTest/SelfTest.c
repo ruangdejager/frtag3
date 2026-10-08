@@ -19,12 +19,13 @@
 #include "Flash_SelfTest.h"        /* FLASH_eSelfTest                */
 
 /* Result flags default to true so a not-applicable test naturally reports
- * OK (e.g. GPS on primary). */
+ * OK (GPS and ACC on primary). */
 static bool bGpsOk       = true;
 static bool bAccOk       = true;
 static bool bFlashOk     = true;
 
 static bool bGpsRan      = false;   /* whether the test actually executed */
+static bool bAccRan      = false;
 static bool bFlashRan    = false;
 
 /* Kept so a human asking later gets the same verdict the boot log carried, not
@@ -35,8 +36,8 @@ static Flash_SelfTestResult_t eFlashResult = FLASH_ST_PASS;
 /* --- LED flash sequence ---------------------------------------------------
  * User spec: for each failed test, flash the code (N short flashes) three
  * times with a 2 s gap between repeats. If more than one test failed, put
- * a 3 s gap between codes. Yellow LED off at the end so the existing
- * BSP_LED_Off(LED_YELLOW) at the init tail has nothing left to clean up.
+ * a 3 s gap between codes. Green LED off at the end so the existing
+ * BSP_LED_Off(LED_GREEN) at the init tail has nothing left to clean up.
  * -------------------------------------------------------------------------- */
 #define SELFTEST_FLASH_ON_MS       200U
 #define SELFTEST_FLASH_OFF_MS      200U
@@ -50,9 +51,9 @@ static void selftest_vFlashCode(uint8_t u8Code)
     {
         for (uint8_t i = 0; i < u8Code; i++)
         {
-            BSP_LED_On(LED_YELLOW);
+            BSP_LED_On(LED_GREEN);
             osDelay(SELFTEST_FLASH_ON_MS);
-            BSP_LED_Off(LED_YELLOW);
+            BSP_LED_Off(LED_GREEN);
             osDelay(SELFTEST_FLASH_OFF_MS);
         }
         if (r + 1U < SELFTEST_REPEATS)
@@ -70,15 +71,24 @@ void SELFTEST_vRunAndReport(void)
         bGpsOk  = GPS_bSelfTest(1500U);   /* > one 1 Hz NMEA epoch */
     }
 
-    /* Accelerometer — fitted on both roles. Retried and raw-byte reported for
-     * the same reason as the flash JEDEC read below: one bad WHO_AM_I is a
-     * rail transient, and a bare pass/fail can't tell that from a real fault.
-     * This is what was reporting acc=FAIL on primaries whose ACC was fine. */
+    /* Accelerometer — secondary only. A Tagskaap V3 RevA primary has no
+     * accelerometer fitted and never starts its SPI bus, so a WHO_AM_I read
+     * there could only ever fail: that is what used to report acc=FAIL and
+     * flash error code 2 (about 6 s of blocking LED sequence) on every
+     * primary boot. On a primary bAccOk keeps its true default, the n/a
+     * state, exactly like GPS.
+     *
+     * Retried and raw-byte reported for the same reason as the flash JEDEC
+     * read below: a lone bad WHO_AM_I has been seen from a healthy part (cause
+     * unproven - see ACC_bDeviceIdOkEx), and a bare pass/fail can't tell that
+     * from a real fault. */
+    if (SELFTEST_bAccApplicable())
     {
         uint8_t u8Id       = 0U;
         uint8_t u8Attempts = 0U;
 
-        bAccOk = ACC_bDeviceIdOkEx(&u8Id, &u8Attempts);
+        bAccRan = true;
+        bAccOk  = ACC_bDeviceIdOkEx(&u8Id, &u8Attempts);
 
         if (bAccOk && u8Attempts > 1U)
             DBG_LOG("SelfTest: acc WHO_AM_I %02X OK on attempt %u (first read(s) transient)\r\n",
@@ -156,16 +166,17 @@ void SELFTEST_vRunAndReport(void)
 
     DBG_LOG("SelfTest: gps=%s acc=%s flash=%s\r\n",
             bGpsRan   ? (bGpsOk   ? "OK" : "FAIL") : "n/a",
-            bAccOk    ? "OK" : "FAIL",
+            bAccRan   ? (bAccOk   ? "OK" : "FAIL") : "n/a",
             bFlashRan ? (bFlashOk ? "OK" : FLASH_pcSelfTestResult(eFlashResult))
                       : "n/a");
 
     /* Collect the failure codes in enum order so a multi-failure sequence
-     * is deterministic. */
+     * is deterministic. A test that did not run never contributes a code, so
+     * a clean primary flashes nothing. */
     uint8_t au8Codes[3];
     uint8_t u8Count = 0U;
     if (bGpsRan   && !bGpsOk)   au8Codes[u8Count++] = (uint8_t)SELFTEST_ERR_GPS;
-    if              (!bAccOk)   au8Codes[u8Count++] = (uint8_t)SELFTEST_ERR_ACC;
+    if (bAccRan   && !bAccOk)   au8Codes[u8Count++] = (uint8_t)SELFTEST_ERR_ACC;
     if (bFlashRan && !bFlashOk) au8Codes[u8Count++] = (uint8_t)SELFTEST_ERR_FLASH;
 
     for (uint8_t i = 0; i < u8Count; i++)
@@ -175,7 +186,7 @@ void SELFTEST_vRunAndReport(void)
             osDelay(SELFTEST_GAP_BETWEEN_MS);
     }
 
-    BSP_LED_Off(LED_YELLOW);
+    BSP_LED_Off(LED_GREEN);
 }
 
 /* --- Query API ------------------------------------------------------------ */
@@ -197,6 +208,21 @@ bool SELFTEST_bFlashOk(void)
 bool SELFTEST_bGpsApplicable(void)
 {
     return DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY;
+}
+
+/* Same rule as GPS: the accelerometer is fitted on a secondary only, and the
+ * FRKERNEL_INTERFACE_LORA_BRIDGE build never starts SPI1 or runs ACC_vInit on
+ * either role (init.c), so a WHO_AM_I read there could only fail - n/a, as
+ * GPS_bSelfTest reports for the same build. Also what SELFTEST_vRunAndReport
+ * uses to decide whether to run the WHO_AM_I test, so the boot run and
+ * FrKernel's later "n/a" cannot disagree. */
+bool SELFTEST_bAccApplicable(void)
+{
+#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+    return false;
+#else
+    return DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY;
+#endif
 }
 
 /* The boot verdict in words. Live pass/fail still comes from

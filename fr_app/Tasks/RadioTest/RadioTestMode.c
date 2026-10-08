@@ -833,7 +833,9 @@ static void RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow)
      * edge before the next beacon raises it again. It debounces GPIO1 for
      * 20 ms and starts a session on the RISING edge, so back-to-back sessions
      * that never showed a clean low would look like no edge at all. There are
-     * ~5 s until the next beacon, so this costs nothing. */
+     * ~5 s until the next beacon, so this costs nothing. FARMRANGER_bDeviceOn()
+     * now enforces the same minimum low time itself (FR_WAKE_MIN_LOW_MS), so
+     * this hold is belt-and-braces rather than load-bearing. */
     osDelay(50);
 
     if (bOk)

@@ -55,7 +55,7 @@ uint32_t                  u32DreqId;
 static volatile ProductionState_e eProductionState = PRODUCTION_READY;
 
 /* SolarSleep variant of PRODUCTION_SLEEP: identical super-deep-sleep state
- * (same yellow STOP2 indicator, same suppressed discovery/acc logging), but
+ * (same green STOP2 indicator, same suppressed discovery/acc logging), but
  * a rising panel voltage must NOT wake it — only the shake sequence may.
  * That lets a flat unit sit with the whole system disabled and take a full
  * charge off the panel instead of waking the moment the sun hits it.
@@ -1163,7 +1163,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             /* SolarSleep ("tag solarsleep"): shake-to-wake only. Skip the
              * solar-activation check below entirely — the whole point is to
              * stay disabled while the panel charges the battery, so a rising
-             * Vsolar/Psolar must not pull us out. The continue still applies,
+             * Vsolar must not pull us out. The continue still applies,
              * so no scheduled discovery wake fires either. Exit is via the
              * shake sequence -> DEVICE_DISCOVERY_vTriggerKernelWakeup(). */
             if (bSolarWakeDisabled)
@@ -1271,7 +1271,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                 DBG_LOG("\r\n--- WAKEUP ---\r\n");
 
                 /* One solar reading per production wake instead of every 10 s
-                 * (see ENABLE_SOLAR_PERIODIC_LOG in SolarPower_Config.h). Primary has
+                 * (see ENABLE_SOLAR_PERIODIC_LOG in build_config.h). Primary has
                  * no solar panel. */
                 if (eDeviceRole == DEVICE_ROLE_SECONDARY)
                 {
@@ -1594,11 +1594,20 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vConfigDeviceRole(void)
 {
-    /* The role strap was set up as input-pulldown by HAL_GPIO_vInit(); read it
-     * once here. After this the role is fixed for the life of the device, so the
-     * pin is no longer needed — tristate it (analog, no pull) so it draws no
-     * current (a PRIMARY ties the strap HIGH; leaving the pulldown active would
-     * sink ~VDD/R_pd continuously) and is never read again. */
+    /* The role strap (PB12) has a 10k external pull-down that defines LOW, and
+     * a PRIMARY straps it HIGH, so it is read as a plain input with NO internal
+     * pull - an internal pull could only fight the strap.
+     *
+     * HAL_GPIO_vInit() already configured it that way in main(), but the input
+     * is re-asserted here, immediately before the read, so this function does
+     * not depend on what any earlier code left on the pin. No settle wait is
+     * needed: the pad already sits at the level the board drives.
+     *
+     * Read it exactly once. The role is fixed for the life of the device, so
+     * the pin is then parked analog with its pull cleared
+     * (HAL_GPIO_vInitAnalogNoPull clears PUPDR, which the vendor HAL leaves
+     * alone in analog mode) and is never read again. */
+    HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_NOPULL);
     eDeviceRole = HAL_GPIO_ReadPin(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN)
                   ? DEVICE_ROLE_PRIMARY
                   : DEVICE_ROLE_SECONDARY;
@@ -1665,11 +1674,11 @@ static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake)
      * timeout; forcing it here would risk a worse mess than the short wait. */
     GPS_vShutdown();
 
-    /* Swap the STOP2-indicator LED to yellow so the bench can tell
+    /* Swap the STOP2-indicator LED to green so the bench can tell
      * "asleep in ProductionSleep/SolarSleep, waiting for solar/shake" apart
      * from the normal red "asleep between scheduled wakes" at a glance. Any
      * exit path (solar activation or Kernel wakeup) swaps it back to red. */
-    HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_YELLOW);
+    HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_GREEN);
     DBG_LOG("DeviceDiscovery: Entering %s\r\n", pacName);
 }
 

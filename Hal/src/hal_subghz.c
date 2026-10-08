@@ -12,7 +12,9 @@ SUBGHZ_HandleTypeDef hsubghz;
 
 /* RF_SW_VDD state. Read by the path-select call (radio_board_if.c) and by the
  * STOP2 entry path (hal_gpio.c), neither of which can infer it from the pin:
- * the pin is also low for a brief window during power-up sequencing. */
+ * during power-up the pin is already HIGH for the whole
+ * BSP_RF_SW_VDD_SETTLE_US settle, before the switch is usable, and this flag
+ * only becomes true once that settle has finished. */
 static volatile bool bRfSwitchPowered = false;
 
 void HAL_vSUBGHZ_Init(void)

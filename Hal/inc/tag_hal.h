@@ -19,10 +19,11 @@
 #include "hal_system.h"
 #include "hal_wdt.h"
 
-#define HAL_vInit()  { \
-    HAL_Init(); \
-    SystemClock_Config(); \
-}
+/* There is deliberately no combined "HAL_vInit()" here any more. main() calls
+ * HAL_Init(), HAL_GPIO_vInit() and SystemClock_Config() explicitly, in that
+ * order, so the constraint that the board pins reach their safe state before
+ * the LSE start (multi-second only when this image runs without the
+ * bootloader; behind the bootloader the LSE is already running) is visible where it matters. */
 
 #define HAL_vResetMCU()  NVIC_SystemReset()
 

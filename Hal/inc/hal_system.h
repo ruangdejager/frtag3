@@ -31,28 +31,30 @@ void Error_Handler(void);
  * durations to the tens of microseconds the settle actually needs. */
 void HAL_SYSTEM_vBusyWaitUs(uint32_t u32Us);
 
-/* Enters STOP2 and restores clocks/peripherals on wake. Called from the
- * tickless-idle sleep path (vPortSuppressTicksAndSleep) with interrupts
- * already masked and deep-sleep eligibility already decided. */
+/* Parks the pins, enters STOP2, and restores the clocks on wake; the SPI
+ * buses and the ADC are only flagged as parked and are restored lazily by
+ * their owners on first use. Called from the tickless-idle sleep path
+ * (vPortSuppressTicksAndSleep) with interrupts already masked and deep-sleep
+ * eligibility already decided. */
 void HAL_SYSTEM_vEnterStop2(void);
 
 /* Which LED indicates STOP2 residency (off in STOP2, on otherwise). Red
- * is the default; DeviceDiscovery swaps it to yellow while the secondary
+ * is the default; DeviceDiscovery swaps it to green while the secondary
  * is in ProductionSleep so the bench can distinguish "asleep waiting for
  * solar / kernel wakeup" from "asleep between normal scheduled wakes".
  *
  * The setter turns the previously-selected LED off before switching so
  * two indicator LEDs are never lit at once. Safe to call from any task
  * context; the switch takes effect on the next STOP2 entry/exit. */
-typedef enum { HAL_SYSTEM_SLEEP_LED_RED = 0, HAL_SYSTEM_SLEEP_LED_YELLOW = 1 } HalSystemSleepLed_e;
+typedef enum { HAL_SYSTEM_SLEEP_LED_RED = 0, HAL_SYSTEM_SLEEP_LED_GREEN = 1 } HalSystemSleepLed_e;
 void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed);
 
 /* Current sleep-indicator LED. Movement's shake-sequence confirmation flash
  * (Movement_Driver.h) reads this to always blink the OTHER LED, so it's never
  * fighting the sleep indicator for the same physical LED — e.g. during
- * ProductionSleep/SolarSleep the indicator owns yellow, so the shake flash
+ * ProductionSleep/SolarSleep the indicator owns green, so the shake flash
  * moves to red instead of being stomped by the STOP2 entry/exit and 2 Hz
- * lock-held pulsing that also drive yellow in that mode. */
+ * lock-held pulsing that also drive green in that mode. */
 HalSystemSleepLed_e HAL_SYSTEM_eGetSleepIndicatorLed(void);
 
 /* GPS-powered indication. While set, the companion LED (whichever one is NOT

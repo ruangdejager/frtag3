@@ -1,10 +1,15 @@
 /*
  * hal_uart.c
  *
- * Interrupt-driven UART driver with ring-buffer TX/RX for the frtag2 board.
+ * Interrupt-driven UART driver with ring-buffer TX/RX for the frtag3 board
+ * (Tagskaap V3 RevA).
  *
  * USART2 = debug UART (PA2/PA3).
- * USART1 = GPS / Farmranger UART (PB6/PB7), mutually exclusive by device role.
+ * USART1 = GPS / Farmranger UART (PB6/PB7), mutually exclusive by device role:
+ * the GNSS receiver on a SECONDARY, the fr9 logger link on a PRIMARY. The pin
+ * mapping is standard on both roles (PB6 = USART1_TX, PB7 = USART1_RX); what
+ * differs per role is the baud (HAL_UART_vInit) and the pin electricals
+ * (HAL_UART_vEnable).
  *
  * Per-UART receive notifications are dispatched through weak callback stubs
  * (UART1_vNotifyOnRX / UART2_vNotifyOnRX). Override these in the application
@@ -35,9 +40,18 @@ static hal_uart_t *uart2_buffer = NULL;
 #define HAL_UART_TX_STALL_TIMEOUT_MS   2000U
 
 /* Device role, latched once at boot from the strap (HAL_UART_vSetRole) so the
- * USART1 baud/swap can be chosen without re-reading PB12 on every HAL_UART_vInit
- * — the strap pin is tristated right after that single read. */
+ * USART1 baud (HAL_UART_vInit) and PB6/PB7 drive mode (HAL_UART_vEnable) can
+ * be chosen without re-reading PB12 — the strap pin is parked analog right
+ * after that single read. The default (false, i.e. SECONDARY) deliberately
+ * selects the GNSS-safe pin configuration (PB6 open-drain, PB7 no pull), so
+ * if USART1 were ever enabled before the role is latched it could still not
+ * drive or pull the 1.8 V GNSS I/O above its rail. */
 static bool s_bPrimaryRole = false;
+
+/* Set once HAL_UART_vInit() has configured USART1, at its first (boot) call.
+ * Only ever written by HAL_UART_vInit(); see the comment there for why USART1
+ * is configured exactly once. */
+static bool s_bUsart1Configured = false;
 
 static usart_buf_ptr_t UART_u8RxBufUsedSpace(hal_uart_t *pHandle);
 static usart_buf_ptr_t UART_u8RxBufFreeSpace(hal_uart_t *pHandle);
@@ -49,8 +63,9 @@ __attribute__((weak)) void UART2_vNotifyOnRX(void) {}
 /* --------------------------------------------------------------------------
  * HAL_UART_vSetRole
  * Latch the device role once, after it has been read from the strap at boot.
- * Lets HAL_UART_vInit() pick the USART1 baud/swap without touching PB12 again,
- * so the strap pin can be permanently tristated after that single read.
+ * Lets HAL_UART_vInit() pick the USART1 baud and HAL_UART_vEnable() pick the
+ * PB6/PB7 drive mode without touching PB12 again, so the strap pin can be
+ * permanently parked after that single read.
  * -------------------------------------------------------------------------- */
 void HAL_UART_vSetRole(bool bPrimary)
 {
@@ -78,12 +93,29 @@ void HAL_UART_vInit(void)
      * wakes stop. So only (re)configure USART1 when it is IDLE; when it's in
      * use, leave it entirely to its owner. USART1's baud/mode registers are
      * retained across STOP2 and clock-gating, so the boot-time init (the one
-     * call where USART1 is guaranteed idle) is all it ever needs. */
+     * call where USART1 is guaranteed idle) is all it ever needs.
+     *
+     * The idle snapshot alone was not enough. It is a check-then-act: the
+     * wake-path callers (DeviceDiscovery AppTask / CheckWakeupSched,
+     * FARMRANGER_vUartOnWake) run at osPriorityNormal, the same priority as
+     * the GPS dispatcher, with tick time-slicing on. A task switch between
+     * this read and the __HAL_RCC_USART1_CLK_DISABLE() at the bottom let the
+     * dispatcher enable USART1 and start a GNSS session, which this code then
+     * clock-gated underneath it: a dead GNSS UART for the whole session (the
+     * VALSET dropped after the 2 s TX stall, then a TTFF timeout). So USART1 is
+     * now configured once, at the first call - init.c's boot call, made from
+     * the init task before any USART1 owner exists - and never touched again.
+     * Later calls cannot race because they no longer go near USART1 at all.
+     * Nothing needs the re-init: HAL_UART_vDisable() only clears UE and gates
+     * the clock, the configuration registers keep their boot values, and
+     * HAL_UART_vEnable() sets UE again. The idle snapshot stays as a second
+     * guard on that first call. */
     bool bUsart1Idle = (__HAL_RCC_USART1_IS_CLK_ENABLED() != 1);
 
     __HAL_RCC_USART2_CLK_ENABLE();
 
-    /* Debug / Farmranger UART (USART2) */
+    /* Debug UART (USART2, PA2/PA3) — debug log and FrKernel console only. The
+     * Farmranger link is USART1, configured below. */
     USART_InitStruct.BaudRate             = BSP_DEBUG_UART_BAUD;
     USART_InitStruct.DataWidth            = LL_USART_DATAWIDTH_8B;
     USART_InitStruct.StopBits             = LL_USART_STOPBITS_1;
@@ -100,23 +132,38 @@ void HAL_UART_vInit(void)
                      NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));
 
     /* GPS / Farmranger UART (USART1), mutually exclusive by device role:
-     * a SECONDARY runs GNSS (9600, MAX-M10S default); a PRIMARY has no GPS and
-     * uses this UART as the Farmranger link to the fr9 board, whose UART is
-     * fixed at 115200. The role was latched once at boot from the strap
-     * (HAL_UART_vSetRole, fed by DEVICE_DISCOVERY_vConfigDeviceRole), and the
-     * strap pin (PB12) has since been tristated — so use the cached role here
-     * instead of re-reading it. This and every wake-path re-init therefore
-     * leave PB12 untouched.
+     * a SECONDARY runs GNSS at 9600, the MAX-M10S factory default (the
+     * firmware never changes the receiver's baud: the cold-start VALSET set
+     * in GPS.c carries no CFG-UART1-BAUDRATE key); a PRIMARY has no GNSS
+     * fitted and uses this UART as the Farmranger link to the fr9 board, whose
+     * UART is fixed at 115200. The role was latched once at boot from the
+     * strap (HAL_UART_vSetRole, fed by DEVICE_DISCOVERY_vConfigDeviceRole),
+     * and the strap pin (PB12) has since been parked analog — so use the
+     * cached role here instead of re-reading it. This and every wake-path
+     * re-init therefore leave PB12 untouched.
      *
-     * On a PRIMARY the pins are also TX/RX-swapped: the daughterboard wiring
-     * to the fr9 Farmranger UART crosses PB6/PB7 the opposite way to the
-     * GNSS module wiring, so the MCU-side SWAP bit corrects for it.
+     * Pin mapping is STANDARD on both roles: PB6 = USART1_TX, PB7 = USART1_RX.
+     * frtag2 primaries set CR2.SWAP because the harness to the fr9 crossed
+     * TX/RX the opposite way to the GNSS wiring. On frtag3 that crossing is
+     * being fixed on the fr9 side, so the tag leaves SWAP at its reset value
+     * and the only per-role difference left is electrical (PB6 open-drain or
+     * push-pull, PB7 pull), applied in HAL_UART_vEnable(). This is a
+     * deployment-order dependency and a hardware-compatibility requirement: a
+     * frtag3 primary paired with an fr9 (or a harness) that still crosses
+     * TX/RX never receives RDY, so every logger session — upload, timestamp
+     * and settings sync, OTA pull — fails, with the "RDY not received" log
+     * line and the per-step failures behind it to show for it. Worse, the old
+     * crossing puts the fr9's TX on PB6, which is push-pull on a primary
+     * (BSP_GPS_UART_TX_MODE_FR9), so the two outputs fight on every 0 bit
+     * either side sends. Only pair a frtag3 primary with a corrected fr9;
+     * there is no firmware fallback.
      *
-     * Skipped entirely when USART1 is already in use (see bUsart1Idle above):
-     * its owner has it configured, and touching it here would race a live
-     * transfer. */
-    if (bUsart1Idle)
+     * Done once, at the boot call (see s_bUsart1Configured above), and
+     * skipped if USART1 is somehow already in use even then. */
+    if (!s_bUsart1Configured && bUsart1Idle)
     {
+        s_bUsart1Configured = true;
+
         __HAL_RCC_USART1_CLK_ENABLE();
 
         bool bPrimary = s_bPrimaryRole;
@@ -125,8 +172,13 @@ void HAL_UART_vInit(void)
         LL_USART_Init(BSP_GPS_USART_INSTANCE, &USART_InitStruct);
         LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
         LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);
-        LL_USART_SetTXRXSwap(BSP_GPS_USART_INSTANCE,
-                              bPrimary ? LL_USART_TXRX_SWAPPED : LL_USART_TXRX_STANDARD);
+        /* Standard TX/RX mapping on both roles (see above). SWAP resets to 0,
+         * the frtag2 bootloader runs HAL_DeInit() (a forced peripheral reset)
+         * before jumping here, and nothing in this firmware sets it, so this
+         * line records the intent rather than changing anything. The bit is
+         * only writable while UE = 0, which holds at the boot call and on the
+         * first re-init after HAL_UART_vDisable() has cleared UE. */
+        LL_USART_SetTXRXSwap(BSP_GPS_USART_INSTANCE, LL_USART_TXRX_STANDARD);
         LL_USART_Enable(BSP_GPS_USART_INSTANCE);
         NVIC_SetPriority(BSP_GPS_USART_IRQn,
                          NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 6, 0));
@@ -191,26 +243,81 @@ void HAL_UART_vSetFlowControlFunctions(hal_uart_t *drv,
     drv->flowControlSetAssertRts  = setRtsFunction;
 }
 
+/* --------------------------------------------------------------------------
+ * HAL_UART_vEnable
+ * Attach the UART's pins to the peripheral (AF7), enable the USART and clear
+ * the ring.
+ *
+ * Every GPIO_InitTypeDef field is set inside each case rather than once at
+ * the top of the function. The two UARTs need different electricals. frtag2
+ * applied one shared default (AF push-pull with pull-up) to PB6/PB7 and the
+ * debug pins alike, and on a frtag3 secondary that is exactly the setting
+ * that drives 2.0 V into the 1.8 V GNSS I/O. Setting each case in full keeps
+ * one UART's choice from leaking into the other's.
+ *
+ * USART1 (GPS_UART) electricals follow the role latched by
+ * HAL_UART_vSetRole(); the values live in hal_bsp.h (BSP_GPS_UART_TX_MODE_*,
+ * BSP_GPS_UART_RX_PULL_*):
+ *   SECONDARY (GNSS)  PB6 open-drain, no pull; PB7 no pull. The GNSS I/O is a
+ *                     1.8 V domain (abs max 1.98 V) against the MCU's 2.0 V
+ *                     VDD, and R18 (4.7k) pulls PB6 up to GNSS_VCC, so the
+ *                     MCU may only ever pull PB6 low and must not pull PB7 up
+ *                     to its own rail. The caller (GPS_vHwPowerOn in GPS.c)
+ *                     raises GNSS_ON and waits for the rail before this runs.
+ *   PRIMARY (fr9)     PB6 push-pull, no pull; PB7 pull-up. No GNSS is fitted,
+ *                     so a driven TX keeps the link independent of whether R18
+ *                     and the GNSS LDO are populated, and the pull-up holds RX
+ *                     idle-high while the fr9 is not driving it.
+ * The s_bPrimaryRole default (false) selects the SECONDARY set, the one that
+ * cannot harm the GNSS I/O.
+ *
+ * PB7 (RX) is attached before PB6 (TX), in two separate HAL_GPIO_Init calls,
+ * so the receive side is already in its final state when the transmit pin
+ * starts presenting an idle level to the far end. The vendor HAL_GPIO_Init
+ * writes OTYPER before MODER, so switching PB6 from analog to AF open-drain
+ * never passes through push-pull on the way. HAL_UART_vDisable() puts both
+ * pins back to analog through HAL_GPIO_DeInit(), which also clears OTYPER
+ * and PUPDR, so nothing from one session carries into the next.
+ * -------------------------------------------------------------------------- */
 void HAL_UART_vEnable(hal_uart_t *drv)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Pull  = GPIO_PULLUP;
 
     switch (drv->uart_id)
     {
         case DEBUG_UART:
             __HAL_RCC_USART2_CLK_ENABLE();
-            GPIO_InitStruct.Alternate = BSP_DEBUG_UART_AF;
+            /* PA2 = USART2_TX, PA3 = USART2_RX: push-pull with pull-up, as
+             * on frtag2. Only the debug cable is on these pins. */
             GPIO_InitStruct.Pin       = BSP_DEBUG_UART_TX_PIN | BSP_DEBUG_UART_RX_PIN;
+            GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+            GPIO_InitStruct.Pull      = GPIO_PULLUP;
+            GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+            GPIO_InitStruct.Alternate = BSP_DEBUG_UART_AF;
             HAL_GPIO_Init(BSP_DEBUG_UART_TX_PORT, &GPIO_InitStruct);
             NVIC_EnableIRQ(BSP_DEBUG_USART_IRQn);
             break;
         case GPS_UART:
             __HAL_RCC_USART1_CLK_ENABLE();
+            /* PB7 = USART1_RX: GNSS TXD on a secondary, fr9 TX on a primary.
+             * The output type is irrelevant for a receive pin; AF_PP is the
+             * neutral choice. */
+            GPIO_InitStruct.Pin       = BSP_GPS_UART_RX_PIN;
+            GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+            GPIO_InitStruct.Pull      = s_bPrimaryRole ? BSP_GPS_UART_RX_PULL_FR9
+                                                       : BSP_GPS_UART_RX_PULL_GNSS;
+            GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
             GPIO_InitStruct.Alternate = BSP_GPS_UART_AF;
-            GPIO_InitStruct.Pin       = BSP_GPS_UART_TX_PIN | BSP_GPS_UART_RX_PIN;
+            HAL_GPIO_Init(BSP_GPS_UART_RX_PORT, &GPIO_InitStruct);
+
+            /* PB6 = USART1_TX: GNSS RXD on a secondary, fr9 RX on a primary.
+             * Never pulled internally on either role. */
+            GPIO_InitStruct.Pin       = BSP_GPS_UART_TX_PIN;
+            GPIO_InitStruct.Mode      = s_bPrimaryRole ? BSP_GPS_UART_TX_MODE_FR9
+                                                       : BSP_GPS_UART_TX_MODE_GNSS;
+            GPIO_InitStruct.Pull      = GPIO_NOPULL;
+            GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+            GPIO_InitStruct.Alternate = BSP_GPS_UART_AF;
             HAL_GPIO_Init(BSP_GPS_UART_TX_PORT, &GPIO_InitStruct);
             NVIC_EnableIRQ(BSP_GPS_USART_IRQn);
             break;

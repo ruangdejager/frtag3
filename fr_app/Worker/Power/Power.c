@@ -8,7 +8,8 @@
  *
  * The PowerStateManager task only runs on secondary devices; it subscribes
  * to the 1-second platform heartbeat and adjusts the power class based on
- * the measured battery voltage.
+ * the measured battery voltage, starting at the first valid battery sample.
+ * A primary never creates it and stays in NORMAL for good.
  *
  * Uses CMSIS-RTOS v2 throughout.
  */
@@ -111,6 +112,26 @@ uint32_t POWER_tGetState(void)
  * Hysteresis windows prevent oscillation:
  *   LOW ↔ NORMAL boundary  : 20 mV (3500 → 3520)
  *   LOW ↔ RECOVERY boundary: 50 mV (3400 → 3450)
+ *
+ * Evaluation starts at the first valid battery sample (BAT_bHasValidSample()).
+ * Until then the class stays at the NORMAL that POWER_vInit() set. Reading the
+ * still-empty average as 0 mV used to push a freshly booted secondary into a
+ * bogus low-power class in two ways: a 1 s drop to LOW (GPS refused) when the
+ * first heartbeat beat the boot sample, or - when the boot sample failed and
+ * seeded the buffer with 0 mV - LOW and then RECOVERY (scheduled wakes and
+ * beacons suppressed) for ~70-80 s until good samples refilled the average.
+ * Consequence, by design: if samples keep failing at the conversion or
+ * plausibility level, a secondary stays in NORMAL indefinitely with an unknown battery voltage. It fails
+ * operational (still discoverable, GPS allowed) instead of failing into
+ * RECOVERY as it did before. Failed samples are counted in Battery
+ * (BAT_u16GetAndClearSampleFails()), not here. An ADC enable/stop/disable
+ * timeout counts the same way: the HAL error bit it latches is cleared on the
+ * next lazy HAL_ADC_vInit() once the peripheral is confirmed idle (see
+ * hal_adc.c). Only an ADC that cannot be stopped at all still ends in
+ * Error_Handler() and a watchdog reset.
+ *
+ * No logging in this task: it runs on a configMINIMAL_STACK_SIZE (512 B) stack
+ * and a DBG_LOG call chain needs about 536 B.
  * -------------------------------------------------------------------------- */
 static void POWER_vStateManagerTask(void *arg)
 {
@@ -121,6 +142,15 @@ static void POWER_vStateManagerTask(void *arg)
     for (;;)
     {
         osThreadFlagsWait(0x7FFFFFFFU, osFlagsWaitAny, osWaitForever);
+
+        /* No battery sample has succeeded since boot: hold the NORMAL class
+         * POWER_vInit() set (nothing else changes the class) rather than read
+         * the empty average as 0 mV and walk down to RECOVERY.
+         * BAT_bHasValidSample() is monotonic, so once it opens, later failed
+         * conversions leave the last good average in place and evaluation
+         * never pauses again. */
+        if (!BAT_bHasValidSample())
+            continue;
 
         uint16_t u16Bat   = BAT_u16GetVoltage();
         uint32_t u32State = POWER_tGetState();

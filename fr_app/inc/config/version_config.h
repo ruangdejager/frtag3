@@ -9,7 +9,7 @@
  * version comparisons are consistent across the OTA chain (server -> fr9 ->
  * primary -> secondaries).
  *
- * build_scripts/create_release_hex_files.ps1 (frtag2 and fr9_application)
+ * build_scripts/create_release_hex_files.ps1 (this repo's post-build step)
  * reads VERSION_SW_MAJOR/MINOR/PATCH out of this file by regex to name the
  * release hex — keep the macro names and this file's path in sync with that
  * script if either changes.

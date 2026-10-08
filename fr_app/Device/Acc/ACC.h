@@ -2,6 +2,11 @@
  * ACC.h
  *
  * Accelerometer (LIS2DH) public interface.
+ *
+ * Secondary only on Tagskaap V3 RevA: no accelerometer is fitted on a primary,
+ * so nothing may call into this module there. Its SPI bus (SPI1) must have been
+ * started with HAL_SPI_ACC_vInit() before the first call; init.c does that on a
+ * secondary just before ACC_vInit(). ACC_INT (PC13) is routed but unused.
  */
 
 #ifndef DEVICE_ACC_ACC_H_
@@ -41,7 +46,6 @@ typedef struct _acc_reg_config_t {
 } acc_reg_config_t;
 
 void    ACC_vInit(void);
-void    ACC_vConfigIdle(void);
 uint8_t ACC_u8GetDeviceId(void);
 bool    ACC_bDeviceIdOk(void);
 

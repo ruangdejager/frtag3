@@ -22,7 +22,7 @@
 static volatile uint32_t gSleepLockCount = 0;
 
 /* Which LED indicates STOP2 residency (see HAL_SYSTEM_vSetSleepIndicatorLed
- * in hal_system.h). Red by default; DeviceDiscovery flips to yellow while
+ * in hal_system.h). Red by default; DeviceDiscovery flips to green while
  * in ProductionSleep so the bench can tell "asleep in prodsleep" from
  * "asleep between normal wakes" at a glance. */
 static volatile HalSystemSleepLed_e eSleepLed = HAL_SYSTEM_SLEEP_LED_RED;
@@ -38,7 +38,7 @@ static volatile HalSystemSleepLed_e eSleepLed = HAL_SYSTEM_SLEEP_LED_RED;
  *     solid on — far less duty than solid-on and visually distinct from the
  *     slow 3 s sleep pulse, so a stuck/awake device is obvious.
  * Both patterns drive whichever LED eSleepLed currently selects, so the
- * ProductionSleep red<->yellow swap keeps working. */
+ * ProductionSleep red<->green swap keeps working. */
 #define SLEEP_PULSE_WAKE_DIVIDER   3U      /* STOP2 wakes per LED pulse (~3 s @1 Hz) */
 #define LIGHT_PULSE_PERIOD_MS      500U    /* 2 Hz repeat rate                       */
 #define LIGHT_PULSE_ON_MS          20U     /* ... short on-flash each period         */
@@ -58,11 +58,11 @@ static void HAL_SYSTEM_vSleepLedOn(void)
     if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
     {
         BSP_LED_On(LED_RED);
-        if (bGpsActive) BSP_LED_On(LED_YELLOW);
+        if (bGpsActive) BSP_LED_On(LED_GREEN);
     }
     else
     {
-        BSP_LED_On(LED_YELLOW);
+        BSP_LED_On(LED_GREEN);
         if (bGpsActive) BSP_LED_On(LED_RED);
     }
 }
@@ -72,11 +72,11 @@ static void HAL_SYSTEM_vSleepLedOff(void)
     if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
     {
         BSP_LED_Off(LED_RED);
-        if (bGpsActive) BSP_LED_Off(LED_YELLOW);
+        if (bGpsActive) BSP_LED_Off(LED_GREEN);
     }
     else
     {
-        BSP_LED_Off(LED_YELLOW);
+        BSP_LED_Off(LED_GREEN);
         if (bGpsActive) BSP_LED_Off(LED_RED);
     }
 }
@@ -91,7 +91,7 @@ void HAL_SYSTEM_vSetGpsActive(bool bActive)
      * so it can't be stranded lit once it stops being driven. */
     if (!bActive)
     {
-        if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_YELLOW);
+        if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED) BSP_LED_Off(LED_GREEN);
         else                                       BSP_LED_Off(LED_RED);
     }
 }
@@ -107,11 +107,11 @@ void HAL_SYSTEM_vSetSleepIndicatorLed(HalSystemSleepLed_e eLed)
     if (eSleepLed == HAL_SYSTEM_SLEEP_LED_RED)
     {
         BSP_LED_Off(LED_RED);
-        BSP_LED_On(LED_YELLOW);
+        BSP_LED_On(LED_GREEN);
     }
     else
     {
-        BSP_LED_Off(LED_YELLOW);
+        BSP_LED_Off(LED_GREEN);
         BSP_LED_On(LED_RED);
     }
     eSleepLed = eLed;
@@ -166,10 +166,14 @@ void SystemClock_Config(void)
 
 /* --------------------------------------------------------------------------
  * HAL_SYSTEM_vEnterStop2
- * Parks the core in STOP2 and restores clocks/peripherals on wake. Assumes
- * the caller already holds a critical section (interrupts masked) and has
- * decided that deep sleep is permitted. The pending wake interrupt (RTC
- * heartbeat, radio, UART, accel) fires once the caller re-enables interrupts.
+ * Parks the pins and the core in STOP2 and restores the clocks on wake; the
+ * SPI buses and the ADC are only flagged as parked and are restored lazily by
+ * their owners on first use. Assumes the caller already holds a critical
+ * section (interrupts masked) and has decided that deep sleep is permitted.
+ * The pending wake interrupt fires once the caller re-enables interrupts. The
+ * wake sources are the RTC heartbeat and the radio. No accelerometer EXTI is
+ * armed (ACC_INT, PC13, is unused), and USART1/USART2 cannot wake the core
+ * from STOP2 on this part - their pins are parked analog for it anyway.
  *
  * SystemClock_Config() runs here with interrupts masked; its oscillator-ready
  * polls exit on the ready flags (which set within microseconds), not on the
@@ -181,7 +185,7 @@ void HAL_SYSTEM_vEnterStop2(void)
      * the moment we wake — a direct visual indicator of the power mode:
      * off == STOP2, on == running in any other mode. The choice of which
      * LED plays that role is state (see HAL_SYSTEM_vSetSleepIndicatorLed):
-     * red normally, swapped to yellow during ProductionSleep so the bench
+     * red normally, swapped to green during ProductionSleep so the bench
      * can tell the two "asleep" modes apart at a glance.
      *
      * The other LED is NOT touched here (its retention across STOP2 is
@@ -192,24 +196,41 @@ void HAL_SYSTEM_vEnterStop2(void)
      * immediately after it was set). */
     HAL_SYSTEM_vSleepLedOff();
 
+    /* Pin parking, in this order and while the GPIO port clocks are still on:
+     * HAL_SPI_vOnSleep() parks each SPI bus that has been started (SCK, then
+     * MOSI, driven low; MISO analog) and flags it parked, then
+     * HAL_GPIO_vOnSleep() parks the UART pins and gates the port clocks. The
+     * SPI park writes MODER and BSRR, which would be lost if it ran after the
+     * clocks were gated. */
+    HAL_SPI_vOnSleep();
     HAL_GPIO_vOnSleep();
 
     HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
 
     SystemClock_Config();
 
-    /* Restore peripherals after STOP2.  Called with interrupts still masked
-     * (cpsid i in vPortSuppressTicksAndSleep) so there is no race with any task.
+    /* Restore after STOP2.  Called with interrupts still masked (cpsid i in
+     * vPortSuppressTicksAndSleep) so there is no race with any task.
      *
-     * Order matters: HAL_GPIO_OnWake() must run first so that GPIOA/B/C clocks
-     * are enabled before any later (lazy) HAL_SPI re-init calls HAL_GPIO_Init()
-     * for the SPI pins. HAL_GPIO_vOnSleep() parks the peripheral AF pins
-     * (SPI/UART) and PB12 as analog before gating the clocks; HAL_GPIO_OnWake()
-     * restores the debug UART (USART2) here, while the SPI1/SPI2 pins are
-     * restored later by the lazy SPI re-init (see below) and the ADC pins are
-     * already analog. USART1 (GPS/Farmranger) pins stay analog until those
-     * subsystems are next powered on. All other pins (driven outputs, role
-     * strap) keep their retained MODER/level across STOP2.
+     * Only the clocks come back on this path; no peripheral pin is re-armed
+     * here. HAL_GPIO_OnWake() re-enables the GPIO port clocks and nothing else.
+     * It must run before anything touches a pin - including a later lazy SPI
+     * re-init calling HAL_GPIO_Init() for the SPI pins - because pin register
+     * writes are lost with the port clock off. Everything parked at entry is
+     * restored by its owner on first use:
+     *   - SPI: HAL_SPI_vOnSleep() parked every bus that had been started and
+     *     flagged it parked at that point. The next chip-select on that bus
+     *     re-runs its init (HAL_SPI_*_vEnsureAwake), which puts the pins back
+     *     on their alternate function. A bus that was never started (SPI1 on
+     *     a primary) is never parked and never restored.
+     *   - UART: HAL_GPIO_vOnSleep() parked the debug UART (PA2/PA3) and USART1
+     *     (PB6/PB7) pins analog with their pulls cleared. They are re-armed by
+     *     HAL_UART_vEnable() when their owner next opens the UART (DEBUG_vInit
+     *     for the debug UART, GPS.c or Farmranger.c for USART1).
+     *   - ADC: flagged parked below; HAL_ADC_vLock() re-initialises and
+     *     recalibrates it on first use. Its input pins are analog throughout.
+     * All other pins (driven outputs such as the chip selects, enables, RF
+     * switch and LEDs) keep their retained MODER and level across STOP2.
      *
      * USART2 needs no explicit re-init: STOP2 retains both the APB1ENR clock-
      * enable bit and the full USART2 register state (BRR, CR1, CR2, CR3).
@@ -221,13 +242,13 @@ void HAL_SYSTEM_vEnterStop2(void)
      * SPI and ADC are NOT re-initialised here. Re-running their full init (the
      * ADC's includes a calibration) on every 1 Hz heartbeat wake was pure waste:
      * the ADC is sampled only every ~10 s and the flash bus only when something
-     * logs. Instead we just flag both as parked; each is restored lazily on its
-     * first use after the wake (HAL_ADC_vLock / the SPI chip-select chokepoints),
-     * so an idle wake that touches neither pays nothing. The GPIO clocks are
-     * re-enabled by HAL_GPIO_OnWake() above, so a later lazy re-init can restore
-     * the parked SPI pins. */
+     * logs. Instead both are only flagged as parked - the SPI buses already at
+     * entry by HAL_SPI_vOnSleep(), the ADC here - and each is restored lazily on
+     * its first use after the wake (HAL_ADC_vLock / the SPI chip-select
+     * chokepoints), so an idle wake that touches neither pays nothing. The GPIO
+     * clocks are re-enabled by HAL_GPIO_OnWake() below, so a later lazy re-init
+     * can restore the parked SPI pins. */
     HAL_GPIO_OnWake();
-    HAL_SPI_vMarkParked();   /* SPI1 (ACC) + SPI2 (flash): restore on first select */
     HAL_ADC_vMarkParked();   /* ADC: restore + recalibrate on first HAL_ADC_vLock  */
 
     /* Pulse the indicator only every Nth wake, not every wake: a brief on this

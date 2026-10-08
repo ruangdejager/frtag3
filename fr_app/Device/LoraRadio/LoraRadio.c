@@ -110,9 +110,10 @@ static volatile bool    bTxInProgress      = false;
  * other owners whose normal teardown would otherwise sleep it mid-test. */
 static volatile bool    bKeepAwake         = false;
 
-/* Tick at which the PA was last actually fired — i.e. when the shared supply
- * rail last took the SX126x TX current spike that OTA_LORA_CHUNK_GAP_MS
- * exists to wait out.
+/* Tick at which the PA last actually fired: the TX that OTA_LORA_CHUNK_GAP_MS
+ * and OTA_VERIFY_TX_SETTLE_MS wait out, because flash reads issued too close
+ * to a TX have been seen to come back corrupted (the mechanism is untested
+ * and is not a proven rail sag; see OTA_LORA_CHUNK_GAP_MS in Fota_Config.h).
  *
  * This is the one timestamp nothing in the codebase recorded. Every existing
  * log line marks when a packet was *queued*, and queue time says nothing
@@ -556,7 +557,9 @@ bool LORARADIO_bTxQuiet(uint32_t u32SettleMs)
      *    sense, which the queue count cannot see;
      *  - queue count covers packets not yet picked up;
      *  - the settle age covers a PA pulse that has just happened, which is the
-     *    whole point - the rail needs time to recover before a flash read. */
+     *    whole point - flash reads too soon after a TX have been seen to come
+     *    back corrupted (see OTA_LORA_CHUNK_GAP_MS; the cause is untested and
+     *    more likely noise on the long SPI traces than rail sag). */
     if (bTxInFlight) return false;
 
     if ((xLoRaTxQueue != NULL) && (osMessageQueueGetCount(xLoRaTxQueue) != 0U))

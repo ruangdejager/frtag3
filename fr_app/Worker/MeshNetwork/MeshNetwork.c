@@ -2107,11 +2107,11 @@ void MESHNETWORK_vParserTask(void *pvParameters)
         /* FOTA takes priority: while a distribute or receive session is
          * active, ordinary mesh traffic (beacons, DReq/DAck, TimeSync,
          * FrKernel) adds nothing but radio/CPU contention right when a
-         * chunk read/write is most vulnerable to it (a nearby TX/RX's
-         * supply-rail sag corrupting a flash access — see the findings in
-         * FOTA_bSendChunk). Drop it outright rather than processing or
-         * forwarding it; the OTA packet types below are never affected by
-         * this check. */
+         * chunk read/write is most vulnerable to it (radio activity close
+         * to a flash access has been seen to corrupt it; see the findings in
+         * FOTA_bSendChunk and OTA_LORA_CHUNK_GAP_MS, mechanism untested).
+         * Drop it outright rather than processing or forwarding it; the OTA
+         * packet types below are never affected by this check. */
         if (eType != MeshPktType_OtaPrep && eType != MeshPktType_OtaPrepAck &&
             eType != MeshPktType_OtaChunk && eType != MeshPktType_OtaPoll &&
             eType != MeshPktType_OtaReport && FOTA_bSessionActive())

@@ -293,10 +293,15 @@ static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
  *                           every read, with no radio activity at all.
  *
  * The second and third are the discriminating pair. The existing field
- * evidence (see OTA_LORA_CHUNK_GAP_MS in Fota_Config.h) is consistent with
- * either a PA current spike or an unhonoured flash recovery time, because in
- * production the two always happen close together - a DBG_LOG in a radio gap
- * parks the chip, and the next read wakes it. Separating them is the point.
+ * evidence, gathered on frtag2 (V2) hardware (see OTA_LORA_CHUNK_GAP_MS in
+ * Fota_Config.h), is consistent with either a TX-coupled disturbance or an
+ * unhonoured flash recovery time, because in production the two always happen
+ * close together - a DBG_LOG in a radio gap parks the chip, and the next read
+ * wakes it. Separating them is the point. "TX-coupled" deliberately names no
+ * path: the PA-current rail-sag explanation was never tested and TX was not
+ * shown to sag the rail, and noise on the very long MISO/MOSI runs over a
+ * non-continuous ground plane is the likelier one. A "tx" run that corrupts
+ * reads while "park" stays clean still says the radio is involved, not how.
  * -------------------------------------------------------------------------- */
 
 /* Key the PA and wait until it has actually fired, not merely been queued.
@@ -586,10 +591,10 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          * SELFTEST_vRunAndReport called from INIT_vInitialization); flash is
          * answered live from the driver gate, because that gate can close and
          * re-open after boot. "n/a" is reported for tests that don't apply on
-         * this role (GPS on primary). */
+         * this role (GPS and ACC on primary). */
         snprintf(resp, sizeof(resp), "selftest: gps=%s acc=%s flash=%s\r\n",
                  SELFTEST_bGpsApplicable()   ? (SELFTEST_bGpsOk()   ? "OK" : "FAIL") : "n/a",
-                 SELFTEST_bAccOk()           ? "OK" : "FAIL",
+                 SELFTEST_bAccApplicable()   ? (SELFTEST_bAccOk()   ? "OK" : "FAIL") : "n/a",
                  SELFTEST_bFlashApplicable() ? (SELFTEST_bFlashOk() ? "OK" : "FAIL") : "n/a");
         FRKERNEL_vRespond(eXport, resp);
     }
@@ -696,7 +701,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     else if (strcmp(p, "selftest acc") == 0)
     {
         snprintf(resp, sizeof(resp), "selftest acc: %s\r\n",
-                 SELFTEST_bAccOk() ? "OK" : "FAIL");
+                 SELFTEST_bAccApplicable() ? (SELFTEST_bAccOk() ? "OK" : "FAIL") : "n/a");
         FRKERNEL_vRespond(eXport, resp);
     }
     else if (strcmp(p, "selftest flash") == 0)

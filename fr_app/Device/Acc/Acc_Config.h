@@ -11,8 +11,10 @@
 #define ACC_WHO_AM_I_VALUE          LIS2DH_WHO_AM_I_VALUE
 
 /* WHO_AM_I read attempts before declaring the part absent/faulty. Mirrors
- * FLASH_JEDEC_READ_ATTEMPTS and for the same reason: one bad read on this
- * board is a rail transient, not a dead accelerometer. */
+ * FLASH_JEDEC_READ_ATTEMPTS and for the same reason: one bad read is treated
+ * as a transient, not a dead accelerometer. The cause of those transients is
+ * unproven - the frtag2-era rail-sag explanation was never tested, and noise
+ * on the long SPI runs is the likelier one (see ACC_bDeviceIdOkEx). */
 #define ACC_WHO_AM_I_READ_ATTEMPTS  5U
 
 #define ACC_WHO_AM_I                LIS2DH_WHO_AM_I

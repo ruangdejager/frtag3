@@ -1,25 +1,37 @@
 /*
  * Fota_Config.h
  *
- * SYNCED COPY — this file must be kept byte-identical to
- * frtag2_bootloader/fr_bootloader/inc/Fota_Config.h. It is the single
- * source of truth for the flash layout and handoff contract shared
- * between the application and the bootloader; update both copies
- * together.
+ * PARTLY SHARED with frtag2_bootloader/fr_bootloader/inc/Fota_Config.h.
+ * The flash layout and the application/bootloader handoff contract live in
+ * both copies and MUST stay identical in both: the internal flash split,
+ * the scratchpad and metadata addresses, the metadata record offsets, magic
+ * and markers, OTA_BOOT_MAGIC and the backup-register usage, OTA_FW_INFO_ADDR
+ * and FwVersion_t. Any change to one of those has to be made in both files
+ * together, because the bootloader is frozen in the field and reads them
+ * from its own copy. The two files are, however, no longer byte-identical:
+ * this copy carries application-only blocks (the fw_info identity offset, the
+ * install-failure counter, the pending-Prep expiry, the pre-send erase
+ * threshold, multi-primary coexistence and the verify quiet window), rewrites
+ * several comments, and describes the AT25XE041B flash part and the self-test
+ * sector, none of which the bootloader reads. Do not try to re-sync the files
+ * byte for byte; keep the contract constants equal.
  *
  * The OTA file is the raw application binary — the very same bytes that
  * get programmed into internal flash at OTA_APP_BASE_ADDR — hosted
- * publicly on GitHub Pages at
- *   https://ruangdejager.github.io/farmranger-firmware/frtag2-firmware/latest.bin
- * and pointed to by a sibling version.json. The fr9 fetches version.json,
- * decides based on the tag's own current version, then downloads
- * latest.bin to the modem filesystem and streams it byte-for-byte to the
- * primary over UART. On the primary each block is written straight into
- * the external scratchpad at the same offset (file offset N -> scratch
- * offset N); no encoding, no address remap. Validation is an 8-bit XOR
- * over the full image; a metadata record plus a backup-register boot
- * flag hand the image to the bootloader, which programs internal flash
- * and jumps to the application.
+ * publicly on GitHub Pages under
+ *   https://ruangdejager.github.io/farmranger-firmware/frtag3-firmware/
+ * as frtag3_<M>_<m>_<p>.bin, named by the "file" field of a sibling
+ * version.json (there is no latest.bin; see
+ * build_scripts/create_release_hex_files.ps1, which also publishes the same
+ * pair to an in-house mirror for bench units). The fr9 fetches version.json,
+ * decides based on the tag's own current version, then downloads the .bin
+ * that the manifest names to the modem filesystem and streams it
+ * byte-for-byte to the primary over UART. On the primary each block is
+ * written straight into the external scratchpad at the same offset (file
+ * offset N -> scratch offset N); no encoding, no address remap. Validation
+ * is an 8-bit XOR over the full image; a metadata record plus a
+ * backup-register boot flag hand the image to the bootloader, which
+ * programs internal flash and jumps to the application.
  *
  * ---- Internal flash map (STM32WLE5CC, 256 KB, 2 KB pages) ----
  *
@@ -187,22 +199,37 @@ typedef struct
 #define OTA_LORA_MAX_TARGETS      8U      /* secondaries served per session    */
 #define OTA_LORA_PREP_REPEATS     5U      /* OtaPrep announcements, 1 s apart  */
 #define OTA_LORA_PREP_GAP_MS      1000U
-#define OTA_LORA_CHUNK_GAP_MS     100U    /* pause after each chunk TX, before
-                                             the next chunk's flash read. Not
-                                             just radio pacing: the SX126x PA's
-                                             current spike during TX sags the
-                                             shared supply rail, and a flash
-                                             read issued too soon after reads
-                                             back corrupted bytes — confirmed
-                                             on hardware (isolated single-TX
-                                             test: a read right after TX was
-                                             wrong, a second back-to-back
-                                             re-read was ALSO wrong and
-                                             different again, but a third read
-                                             ~65 ms after TX matched the known-
-                                             good value exactly). 15 ms was
-                                             not enough settle time; 100 ms
-                                             gives comfortable margin. */
+
+/* Pause after each chunk TX, before the next chunk's flash read.
+ *
+ * This is the canonical write-up of the TX-correlated flash read problem;
+ * every other site in the codebase that guards against it points here.
+ *
+ * It is not just radio pacing. On the V2 (frtag2) board, before the frtag3
+ * fork, a flash read issued soon after a TX came back corrupted while the
+ * stored bytes were fine. In an isolated single-TX bench test the read right
+ * after the TX was wrong, a second back-to-back re-read was ALSO wrong and
+ * different again, and a third read ~65 ms after the TX matched the known-good
+ * value exactly. 15 ms of settle time was not enough; 100 ms gives comfortable
+ * margin. The field evidence of 2026-08-31 (see OTA_VERIFY_TX_SETTLE_MS below)
+ * and a chunk-for-chunk comparison of a full-image PRE scan against the
+ * FOTA_bSendChunk output (see that function) tie the corruption to TX timing in
+ * the same way. That correlation with TX timing is measured.
+ *
+ * The MECHANISM is not. This used to be written up as the SX126x PA's current
+ * spike during TX sagging the shared supply rail. That theory was never
+ * tested, and TX was never shown to sag the rail. The likelier cause is noise
+ * coupling onto the very long MISO/MOSI lines, which run over a non-continuous
+ * ground plane. None of that makes a TX harmless to a nearby flash read: the
+ * observed corruption is real whatever the coupling path turns out to be.
+ *
+ * This delay, and every other quiet window, settle delay and retry count that
+ * points here, is sized from the observed timing rather than from either
+ * mechanism, so all of them are kept unchanged. V3 RevA (frtag3) is a new
+ * layout running SPI2 at 12 MHz instead of V2's 750 kHz, and it has not yet
+ * been characterised for this problem; until it has been shown to be free of
+ * it, the guards stay. */
+#define OTA_LORA_CHUNK_GAP_MS     100U
 #define OTA_LORA_POLL_TIMEOUT_MS  6000U   /* wait for one OtaReport. Needs to
                                              cover the primary's own poll TX
                                              sitting behind remaining chunks
@@ -238,10 +265,11 @@ typedef struct
  * the primary gives up on its staged image and erases it to re-acquire.
  *
  * Deliberately not 1. The per-pass retry budget only rules out a glitch
- * within one verify; a supply-rail transient can spoil a whole pass while the
- * stored bytes are fine, and erasing on that evidence throws away a good
- * 100 kB image and re-downloads it. A field primary looped exactly that way
- * — verify-fail, erase, re-acquire, repeat every few minutes, never
+ * within one verify; a TX-correlated read disturbance (see
+ * OTA_LORA_CHUNK_GAP_MS; the mechanism is untested) can spoil a whole pass
+ * while the stored bytes are fine, and erasing on that evidence throws away a
+ * good 100 kB image and re-downloads it. A field primary looped exactly that
+ * way — verify-fail, erase, re-acquire, repeat every few minutes, never
  * distributing once. Requiring the failure to reproduce across campaigns
  * separates a real corruption from a transient, and costs only a delayed
  * re-acquire when it is real. */
@@ -269,18 +297,25 @@ typedef struct
 
 /* ---- Radio quiet window before a whole-image XOR verify pass ---------------
  *
- * The SX126x PA's current spike sags the shared supply rail, and a flash read
- * issued too soon after a TX reads back corrupted bytes while the stored bytes
- * are fine - hardware-confirmed, see OTA_LORA_CHUNK_GAP_MS above (15 ms of
- * settle was not enough, ~65 ms was, 100 ms was called comfortable). A
- * whole-image XOR pass is ~1.5 s of gap-free reads at the SPI2 rate this
- * device runs at, so a single TX landing anywhere inside it spoils the pass.
+ * A flash read issued too soon after a TX can read back corrupted bytes while
+ * the stored bytes are fine. That is observed on hardware, not explained: see
+ * OTA_LORA_CHUNK_GAP_MS above for the measurements (15 ms of settle was not
+ * enough, ~65 ms was, 100 ms was called comfortable) and for what is and is
+ * not known about the cause. The old "PA current spike sags the shared supply
+ * rail" explanation was never tested and TX was not shown to sag the rail;
+ * noise on the long MISO/MOSI traces over a non-continuous ground plane is the
+ * likelier cause. Neither changes the behaviour here. At the 750 kHz SPI2
+ * rate of the time, a whole-image XOR pass was ~1.5 s of gap-free reads
+ * (~95 ms at today's 12 MHz, see FLASH_SPI_CLOCK_HZ), so a single TX landing
+ * anywhere inside it spoiled the pass.
  *
- * CONFIRMED IN THE FIELD, 2026-08-31: two bad pre-send passes, both with every
- * chunk read reporting success (readOk=1 rdFails=0 hal=0 - so corrupted bytes,
- * not a transport failure) and the PA firing 270 ms and 336 ms into a ~1550 ms
- * pass. The one campaign in the same run whose random backoff happened to let
- * the TimeSync transmit before the pass started verified first time.
+ * SEEN IN THE FIELD, 2026-08-31 (V2 board): two bad pre-send passes, both with
+ * every chunk read reporting success (readOk=1 rdFails=0 hal=0 - so corrupted
+ * bytes, not a transport failure) and the PA firing 270 ms and 336 ms into a
+ * ~1550 ms pass. The one campaign in the same run whose random backoff
+ * happened to let the TimeSync transmit before the pass started verified first
+ * time. This ties the corruption to TX timing; it does not identify the
+ * mechanism.
  *
  * Note this cannot be fixed by reordering. The offending TX is not one the
  * FOTA code issues: DeviceDiscovery queues a TimeSync ~20 ms before calling

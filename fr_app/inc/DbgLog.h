@@ -55,9 +55,9 @@ void DBGLOG_vRequestDump(void);
  * LoRa interface, which has no UART session to read a UART-routed dump from. */
 void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len));
 
-/* Ask the consumer task to erase the whole text log (flash chip-erase / SD log
- * region reset). Done from the consumer so it never races the consumer's own
- * log writes on the shared storage device. */
+/* Ask the consumer task to erase the whole text log (the external-flash log
+ * region, via LOG_vErase). Done from the consumer so it never races the
+ * consumer's own log writes on the shared storage device. */
 void DBGLOG_vRequestErase(void);
 
 /* Flash backend only: ask the consumer task to erase the ENTIRE ext-flash

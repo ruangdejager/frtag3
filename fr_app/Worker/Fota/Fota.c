@@ -452,9 +452,10 @@ static void FOTA_vDumpImageHead(void)
  * expected one points at the stored bytes.
  *
  * Failure path only. It ran on every check while the 2026-08-31 transient was
- * being characterised — which is what produced the evidence that identified it
- * — but that question is answered, and two extra whole-image passes (~1.5 s
- * each at the SPI2 rate this device runs at) is not worth paying on every
+ * being characterised, which is what tied it to TX timing. That much is
+ * answered; the physical mechanism is not (see OTA_LORA_CHUNK_GAP_MS in
+ * Fota_Config.h). Two extra whole-image passes (~1.5 s each at the old 750 kHz
+ * SPI2 rate, ~95 ms at today's 12 MHz) are still not worth paying on every
  * campaign forever. FOTA_vDumpImageHead is the part cheap enough to keep
  * unconditional, and the call sites invoke it directly for that reason.
  *
@@ -481,10 +482,11 @@ static void FOTA_vProbeImage(uint32_t u32Len, uint8_t u8ExpectedXor)
 }
 
 /* Hold off a whole-image verify pass until the radio has been quiet for
- * OTA_VERIFY_TX_SETTLE_MS - see that constant for the confirmed mechanism and
- * the field evidence. Bounded by OTA_VERIFY_TX_QUIET_MAX_MS: a busy radio must
- * never stall a campaign, and a pass spoiled anyway is still covered by the
- * retry budget above.
+ * OTA_VERIFY_TX_SETTLE_MS - see that constant for the field evidence. The TX
+ * correlation is established; the mechanism is not (see OTA_LORA_CHUNK_GAP_MS).
+ * Bounded by OTA_VERIFY_TX_QUIET_MAX_MS: a busy radio must never stall a
+ * campaign, and a pass spoiled anyway is still covered by the retry budget
+ * above.
  *
  * Costs nothing in the common case - if the radio is already quiet
  * LORARADIO_bTxQuiet() returns true on the first test and this returns
@@ -517,13 +519,16 @@ static void FOTA_vWaitRadioQuiet(void)
  * need to agree with each other — any single match is proof the bytes are
  * correct and this pass's read was the fluke).
  *
- * THE CAUSE IS NOW KNOWN: an SX126x TX firing inside the pass sags the shared
- * rail and the flash reads back corrupted bytes. Confirmed in the field on
- * 2026-08-31 — see OTA_VERIFY_TX_SETTLE_MS for the evidence. Each attempt
- * therefore waits for the radio to go quiet first, which removes the cause
- * rather than just retrying past it; the retry budget stays as the backstop
- * for a TX that slips in anyway (the wait is bounded, and carrier sense means
- * the radio is never guaranteed quiet).
+ * WHAT IS KNOWN: corrupted passes coincide with an SX126x TX firing inside the
+ * pass, seen in the field on 2026-08-31 on the V2 (frtag2) board (see
+ * OTA_VERIFY_TX_SETTLE_MS for the evidence). WHAT IS NOT: why. The earlier
+ * "TX sags the shared rail" story was never measured, and TX was not shown to
+ * sag the rail; noise on the long MISO/MOSI traces over a non-continuous
+ * ground plane is the likelier cause (see OTA_LORA_CHUNK_GAP_MS). Each attempt
+ * therefore waits for the radio to go quiet first, which avoids the
+ * TX-correlated window rather than just retrying past it; the retry budget
+ * stays as the backstop for a TX that slips in anyway (the wait is bounded,
+ * and carrier sense means the radio is never guaranteed quiet).
  *
  * Earlier wording here asserted "a transient SPI/flash read glitch confirmed
  * on hardware". That was never established, and could not be: the old code
@@ -567,7 +572,7 @@ static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
 
     for (uint8_t u8Attempt = 0U; u8Attempt < FOTA_XOR_VERIFY_MAX_ATTEMPTS; u8Attempt++)
     {
-        /* Remove the known cause before reading, not after failing on it. */
+        /* Wait out the TX-correlated window before reading, not after failing in it. */
         FOTA_vWaitRadioQuiet();
 
         /* The continuous 224-byte read, matching the gap-free pattern the
@@ -610,8 +615,9 @@ static bool FOTA_bVerifyImageXorRetry(uint32_t u32Start, uint32_t u32Len,
 
             /* Signed so tick wrap is handled. Negative => the PA last fired
              * before this pass began (by that many ms); a value between 0 and
-             * u32FailPassMs => it fired INSIDE the pass, which is the rail-sag
-             * prediction. */
+             * u32FailPassMs => it fired INSIDE the pass, which is what the TX
+             * correlation predicts (it does not distinguish rail sag from
+             * noise on the SPI lines). */
             i32TxIntoPass = (int32_t)(LORARADIO_u32GetLastTxTick() - u32PassStart);
         }
     }
@@ -1502,14 +1508,15 @@ static bool FOTA_bSendChunk(uint16_t u16Chunk, uint32_t u32ImageSize)
      * 50 ms apart. A fixed delay after the PRECEDING chunk's TX cannot be
      * trusted: the radio task's CAD can back off for up to 5 s before the
      * actual RF pulse fires, completely decoupled from when FOTA_bRadioTx()
-     * returns to this caller — confirmed on hardware, the SX126x PA's
-     * current spike sags the shared supply rail and corrupts a flash read
-     * that lands too close to it. Confirmed on hardware (full-image PRE
+     * returns to this caller, and a flash read that lands too close to a
+     * TX has been seen to come back corrupted (observed on V2 hardware;
+     * the mechanism is untested and is not a proven rail sag, see
+     * OTA_LORA_CHUNK_GAP_MS). Confirmed on hardware (full-image PRE
      * scan vs. this loop's TXC output, chunk-for-chunk) that even a
      * 3-consecutive-match/40 ms check still lets one chunk in ~600 through
-     * with a stable-but-wrong value: a still-decaying transient can
-     * plateau on the wrong byte for longer than that check's ~120 ms
-     * window and pass every one of its checks. Five matches spread over a
+     * with a stable-but-wrong value: the disturbance can hold a stable
+     * wrong byte for longer than that check's ~120 ms window and pass
+     * every one of its checks. Five matches spread over a
      * longer window makes that coincidence far less likely; if it still
      * never converges within the attempt budget, log it so a residual
      * failure is visible instead of silently sending the last-read
@@ -1689,7 +1696,8 @@ void FOTA_vDistribute(void)
                 (unsigned)OTA_PRESEND_FAIL_ERASE_THRESHOLD);
 
         /* Two more whole-image passes at different chunk sizes. Only worth the
-         * ~3 s here, on the path that is about to start counting towards
+         * cost here (~3 s at the old 750 kHz SPI2 rate, ~0.2 s at today's
+         * 12 MHz), on the path that is about to start counting towards
          * erasing a staged image. */
         FOTA_vProbeImage(tMeta.u32SizeBytes, tMeta.u8Xor8);
 
@@ -1722,14 +1730,15 @@ void FOTA_vDistribute(void)
         FOTA_vScanBlankRuns(tMeta.u32SizeBytes);
 
         /* Do NOT erase on the first failures. The in-function retry budget
-         * only defends against a glitch WITHIN one verify pass; a supply-rail
-         * transient can just as easily spoil every attempt of a single pass
-         * while the stored bytes are perfectly fine — and this board has a
-         * documented rail-sag/flash-read interaction (see
-         * OTA_LORA_CHUNK_GAP_MS). Erasing on that evidence destroys a good
-         * image and forces a needless 100 kB re-download, which is exactly
-         * the loop one field primary got stuck in: verify-fail, erase,
-         * re-acquire, repeat, never distributing once.
+         * only defends against a glitch WITHIN one verify pass; a
+         * TX-correlated read disturbance can just as easily spoil every
+         * attempt of a single pass while the stored bytes are perfectly fine
+         * — and this codebase has a documented TX-correlated flash-read
+         * problem (see OTA_LORA_CHUNK_GAP_MS; the mechanism is untested).
+         * Erasing on that evidence destroys a good image and forces a
+         * needless 100 kB re-download, which is exactly the loop one field
+         * primary got stuck in: verify-fail, erase, re-acquire, repeat, never
+         * distributing once.
          *
          * So require the failure to repeat across SEPARATE campaigns before
          * wiping anything. Meanwhile the image stays put and simply isn't
@@ -2125,12 +2134,15 @@ void FOTA_vSecondaryReceive(void)
                  *
                  * NOT an immediate back-to-back read: this chunk's write
                  * happens right after the radio RX that delivered it, and
-                 * the SX126x's RX/TX current draw sags the same shared
-                 * supply rail that corrupts a same-window SPI flash access
-                 * (proven on the primary's TX side — see FOTA_bSendChunk).
-                 * A verify-read sampled from inside that same disturbed
-                 * window can plateau on the same wrong bytes the write
-                 * produced and falsely "confirm" a bad write. Delay past
+                 * radio activity close to an SPI flash access has been seen
+                 * to corrupt it (TX-correlated on the primary side, see
+                 * FOTA_bSendChunk and OTA_LORA_CHUNK_GAP_MS; never tested
+                 * for RX). The old "RX/TX current draw sags the shared
+                 * supply rail" explanation is untested; noise on the long
+                 * MISO/MOSI traces is the likelier cause. A verify-read
+                 * sampled from inside that same disturbed window can
+                 * plateau on the same wrong bytes the write produced and
+                 * falsely "confirm" a bad write. Delay past
                  * the settle window first, and if the read still disagrees,
                  * don't just log it — re-write and re-verify, since the
                  * data in flash may genuinely be wrong, not just misread. */
@@ -2225,8 +2237,9 @@ void FOTA_vSecondaryReceive(void)
     }
 
     /* Retried, and each attempt waits for the radio to go quiet first: a TX
-     * firing inside a pass sags the rail and corrupts the bytes read back
-     * while the stored image is fine (see OTA_VERIFY_TX_SETTLE_MS and
+     * firing inside a pass has been seen to corrupt the bytes read back while
+     * the stored image is fine (the mechanism is untested; see
+     * OTA_LORA_CHUNK_GAP_MS, OTA_VERIFY_TX_SETTLE_MS and
      * FOTA_bVerifyImageXorRetry). Only a mismatch that survives every attempt
      * is treated as a real failure. */
     uint8_t u8Xor;

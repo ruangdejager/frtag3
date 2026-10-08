@@ -307,6 +307,58 @@ void GPS_vInit(void)
 }
 
 /* --------------------------------------------------------------------------
+ * GPS_vHwPowerOn / GPS_vHwPowerOff — internal: the one place the GNSS rail
+ * and pin order lives. Used by the session cold start (GPS_vSessionArm), the
+ * runtime power-down (GPS_vPowerOff) and the boot self-test (GPS_bSelfTest).
+ *
+ * On V3 RevA the module's I/O is a 1.8 V domain (abs max 1.98 V) powered from
+ * GNSS_VCC, while the MCU runs at 2.0 V. The code inherited from frtag2
+ * attached the UART pins (AF push-pull with pull-ups, TX idling high) BEFORE
+ * raising GNSS_ON, and dropped GNSS_ON before parking the pins. At every
+ * session start and at every boot the MCU therefore drove 2.0 V into an
+ * unpowered module, and through R18 back into the GNSS_VCC rail, for the whole
+ * LDO turn-on. The order is now rail first, pins second on the way up, and
+ * pins first, rail second on the way down.
+ *
+ * GPS_vHwPowerOn() blocks for GPS_LDO_SETTLE_MS (osDelay), so it is task
+ * context only: never from an ISR, a timer callback or a critical section.
+ * Both of its callers are tasks (the dispatcher under xGpsLock, and the init
+ * task for the self-test). GPS_vHwPowerOff() does not block. Neither touches
+ * the sleep lock or bSessionActive; those stay with the callers, because the
+ * self-test never takes a lock and must not release one.
+ * -------------------------------------------------------------------------- */
+static void GPS_vHwPowerOn(void)
+{
+    /* Bind the ring buffer and enable RXNE. HAL_UART_vSetup() touches no
+     * pins, so PB6/PB7 stay analog (parked) through the rail ramp. */
+    GPS_DRIVER_vInitGPS(&gps.UartHandle);
+
+    /* Rail first: PA0 high enables the GNSS LDO. */
+    GPS_DRIVER_vPowerEnHigh();
+    bGpsPowered = true;
+    HAL_SYSTEM_vSetGpsActive(true);   /* both LEDs blink while GNSS is on */
+
+    osDelay(GPS_LDO_SETTLE_MS);
+
+    /* Pins second: PB6/PB7 to AF7 (PB6 open-drain, PB7 no pull on a
+     * secondary — see HAL_UART_vEnable). HAL_UART_vEnable() clears the ring
+     * as its last step, so no separate HAL_UART_vClearBuffer() is needed. */
+    GPS_DRIVER_vEnableUart(&gps.UartHandle);
+}
+
+static void GPS_vHwPowerOff(void)
+{
+    /* Pins first: PB6/PB7 back to analog with pulls and output type cleared
+     * (HAL_GPIO_DeInit), USART1 disabled and its clock gated. */
+    GPS_DRIVER_vDisableUart(&gps.UartHandle);
+
+    /* Rail second: PA0 low switches the GNSS LDO off. */
+    GPS_DRIVER_vPowerEnLow();
+    bGpsPowered = false;
+    HAL_SYSTEM_vSetGpsActive(false);  /* stop the companion-LED blink */
+}
+
+/* --------------------------------------------------------------------------
  * GPS_vSessionArm — internal: reset session state and power up GPS
  * Caller must hold xGpsLock.
  * -------------------------------------------------------------------------- */
@@ -324,21 +376,17 @@ static void GPS_vSessionArm(void)
 
     if (!bGpsPowered)
     {
-        /* Cold start — power the hardware and enable the UART */
-    	GPS_DRIVER_vInitGPS(&gps.UartHandle);
-        GPS_DRIVER_vEnableUart(&gps.UartHandle);
-        HAL_UART_vClearBuffer(&gps.UartHandle);
-        GPS_DRIVER_vPowerEnHigh();
-        bGpsPowered = true;
-        HAL_SYSTEM_vSetGpsActive(true);   /* both LEDs blink while GNSS is on */
+        /* Cold start — rail up, settle, then attach the UART pins. */
+        GPS_vHwPowerOn();
 
         /* Apply 1Hz/GPS-only/full-power config. The MAX-M10S emits its first
          * $GNTXT boot messages almost immediately, but its UART *receiver*
          * is not guaranteed to be live yet — frames sent at t=0 are silently
-         * lost. Wait briefly, send the VALSET sequence, then send it again
-         * after a further delay as a hedge against a slow boot. Idempotent
-         * (same keys both times); any UBX-ACK/NAK is logged by
-         * GPS_bOnRxByte for diagnostics. */
+         * lost. Here t=0 is the moment the pins are attached, which is
+         * GPS_LDO_SETTLE_MS after GNSS_ON went high. Wait briefly, send the
+         * VALSET sequence, then send it again after a further delay as a
+         * hedge against a slow boot. Idempotent (same keys both times); any
+         * UBX-ACK/NAK is logged by GPS_bOnRxByte for diagnostics. */
         osDelay(300);
         GPS_vConfigureModule();
         osDelay(700);
@@ -361,17 +409,16 @@ static void GPS_vSessionArm(void)
 }
 
 /* --------------------------------------------------------------------------
- * GPS_vPowerOff — internal: power down GPS and disable UART
+ * GPS_vPowerOff — internal: park the UART pins, then drop GNSS_ON
+ * (GPS_vHwPowerOff), and release the session's sleep lock.
  * Caller must hold xGpsLock.
  * -------------------------------------------------------------------------- */
 static void GPS_vPowerOff(void)
 {
+    /* Stop the RX task parsing before the UART is torn down. */
     bSessionActive = false;
-    bGpsPowered    = false;
-    GPS_DRIVER_vPowerEnLow();
-    GPS_DRIVER_vDisableUart(&gps.UartHandle);
+    GPS_vHwPowerOff();
     eState = GPS_STATE_IDLE;
-    HAL_SYSTEM_vSetGpsActive(false);   /* stop the companion-LED blink */
     DBG_LOG("gps: powered off\r\n");
 
     /* GPS is fully off — release the sleep lock taken by whoever requested
@@ -413,8 +460,8 @@ static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
  * -------------------------------------------------------------------------- */
 void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce)
 {
-    /* Safe no-op if GPS_vInit() was never called (e.g. PRIMARY device or
-     * ENABLE_GPS not defined). The wake-schedule task fires this
+    /* Safe no-op if GPS_vInit() was never called (PRIMARY role, or the
+     * FRKERNEL_INTERFACE_LORA_BRIDGE build). The wake-schedule task fires this
      * unconditionally on every cycle, so being defensive here is required. */
     if (xGpsLock == NULL || xGpsResultFlags == NULL) return;
 
@@ -587,57 +634,66 @@ void GPS_vShutdown(void)
  * GPS_bSelfTest — boot-time smoke test, side-steps the session state machine.
  *
  * Powers the receiver up, polls the UART for NMEA bytes, powers it down and
- * returns true iff enough bytes were seen to prove the module is present and
- * transmitting. Ignores the dispatcher and bSessionActive entirely (only the
- * init task is running against GPS at this point, so contention is
- * impossible), which is why this doesn't need xGpsLock either. Sole purpose
- * is a boot-time yellow-LED error indicator — the normal fix path is
- * unaffected regardless of the outcome.
+ * returns true iff enough bytes AND enough NMEA sentence starts ('$') were
+ * seen to prove the module is present and transmitting. Ignores the
+ * dispatcher and bSessionActive entirely (only the init task is running
+ * against GPS at this point, so contention is impossible), which is why this
+ * doesn't need xGpsLock either. Sole purpose is a boot-time green-LED error
+ * indicator — the normal fix path is unaffected regardless of the outcome.
  * -------------------------------------------------------------------------- */
 #define GPS_SELFTEST_MIN_BYTES      20U   /* one NMEA epoch is ~200+ B; 20 is a floor */
 #define GPS_SELFTEST_WARMUP_MS      200U  /* MAX-M10S emits $GNTXT boot lines quickly */
 
+/* Minimum number of '$' (NMEA sentence start) bytes for a pass. PB7 carries no
+ * MCU pull on V3 RevA (the GNSS I/O is 1.8 V against a 2.0 V MCU, see
+ * HAL_UART_vEnable), so with the module dead or unpowered the RX pin floats,
+ * and the USART can assemble bytes out of noise or break conditions. A raw
+ * byte count alone could then pass a missing receiver. Two '$' needs two
+ * sentence starts, which a live receiver delivers well inside the window (its
+ * boot $GNTXT lines plus 1 Hz NMEA) and line noise practically never does. */
+#define GPS_SELFTEST_MIN_SENTENCES  2U
+
 bool GPS_bSelfTest(uint32_t u32TimeoutMs)
 {
-    /* Not built for GPS (no xGpsLock created yet): treat as pass so the LED
-     * doesn't flag a hardware fault for a software-disabled build. */
+    /* GPS not initialised (no xGpsLock created): PRIMARY role, or the
+     * FRKERNEL_INTERFACE_LORA_BRIDGE build. Treat as pass so the LED doesn't
+     * flag a hardware fault for a receiver this build or role never uses. */
     if (xGpsLock == NULL) return true;
 
-    /* Cold power-on, mirroring GPS_vSessionArm's cold-start branch minus the
-     * VALSET config (self-test only cares about default-baud NMEA presence). */
-    GPS_DRIVER_vInitGPS(&gps.UartHandle);
-    GPS_DRIVER_vEnableUart(&gps.UartHandle);
-    HAL_UART_vClearBuffer(&gps.UartHandle);
-    GPS_DRIVER_vPowerEnHigh();
-    bGpsPowered = true;
-    HAL_SYSTEM_vSetGpsActive(true);
+    /* Cold power-on through the same helper as GPS_vSessionArm's cold-start
+     * branch (rail, settle, then pins), minus the VALSET config: the self-test
+     * only cares about default-baud NMEA presence. */
+    GPS_vHwPowerOn();
 
     osDelay(GPS_SELFTEST_WARMUP_MS);
 
-    uint32_t u32Start   = osKernelGetTickCount();
-    uint32_t u32ByteCnt = 0U;
+    uint32_t u32Start     = osKernelGetTickCount();
+    uint32_t u32ByteCnt   = 0U;
+    uint32_t u32Sentences = 0U;
     uint8_t  u8Byte;
     while ((osKernelGetTickCount() - u32Start) < u32TimeoutMs
-           && u32ByteCnt < GPS_SELFTEST_MIN_BYTES)
+           && (u32ByteCnt < GPS_SELFTEST_MIN_BYTES
+               || u32Sentences < GPS_SELFTEST_MIN_SENTENCES))
     {
         while (UART_bReadByte(&gps.UartHandle, &u8Byte))
         {
             u32ByteCnt++;
+            if (u8Byte == (uint8_t)'$')
+                u32Sentences++;
         }
         osDelay(10);
     }
 
-    /* Power-down: same order as GPS_vPowerOff minus the sleep-lock release
-     * (self-test never took one). */
-    GPS_DRIVER_vPowerEnLow();
-    GPS_DRIVER_vDisableUart(&gps.UartHandle);
-    bGpsPowered = false;
-    HAL_SYSTEM_vSetGpsActive(false);
+    /* Power-down: the same helper and order as GPS_vPowerOff (pins, then
+     * rail), minus the sleep-lock release (self-test never took one). */
+    GPS_vHwPowerOff();
 
-    bool bOk = (u32ByteCnt >= GPS_SELFTEST_MIN_BYTES);
-    DBG_LOG("gps: selftest %s (rx=%lu bytes in ~%lums)\r\n",
+    bool bOk = (u32ByteCnt   >= GPS_SELFTEST_MIN_BYTES)
+            && (u32Sentences >= GPS_SELFTEST_MIN_SENTENCES);
+    DBG_LOG("gps: selftest %s (rx=%lu bytes, %lu '$' in ~%lums)\r\n",
             bOk ? "OK" : "FAIL",
             (unsigned long)u32ByteCnt,
+            (unsigned long)u32Sentences,
             (unsigned long)(osKernelGetTickCount() - u32Start));
     return bOk;
 }

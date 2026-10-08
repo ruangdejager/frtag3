@@ -62,6 +62,29 @@
 #define GNSS_EXT_MODULE_DETECT_TIMEOUT      2000
 
 /*
+ * GNSS rail settle time [ms]: GNSS_ON (PA0) high -> USART1 pins attached.
+ *
+ * PA0 drives the enable of the LDO that makes GNSS_VCC. The GNSS I/O sits on
+ * that rail (1.8 V, abs max 1.98 V) while the MCU runs at 2.0 V, so the power
+ * order is rail first, pins second (GPS_vHwPowerOn in GPS.c). With PB6
+ * open-drain and PB7 unpulled the MCU can no longer back-feed the module even
+ * if this wait were too short; the wait keeps the pins off a module whose I/O
+ * rail is still ramping (no junk RX bytes at attach) and keeps the order right
+ * if the pin configuration ever changes again.
+ *
+ * The LDO part number is not known to the firmware, so the value is sized from
+ * the part class: small LDOs reach regulation within roughly 0.05-2 ms of EN,
+ * soft-start into a few uF included. osDelay(10) guarantees at least 9 ms on
+ * the 1 ms tick, more than 4x the slow end, and is negligible next to the
+ * 300 ms the cold start already waits for the receiver to boot. Re-measure
+ * (scope GNSS_VCC against PA0) once the LDO is identified.
+ *
+ * Used with osDelay(), so task context only. Both callers of GPS_vHwPowerOn()
+ * are tasks: the GPS dispatcher under xGpsLock, and the init-task self-test.
+ */
+#define GPS_LDO_SETTLE_MS                   10U
+
+/*
  * Minimum RTC error [s] required before a GPS-derived time is applied.
  * Differences smaller than this threshold are treated as within acceptable
  * oscillator drift and the RTC is left unchanged.

@@ -2,7 +2,8 @@
  * hal_uart.h
  *
  * Interrupt-driven UART driver with ring-buffer TX/RX.
- * Supports DEBUG_UART (USART1) and GPS_UART (USART2).
+ * Supports DEBUG_UART = USART2 (PA2/PA3) and GPS_UART = USART1 (PB6/PB7: the
+ * GNSS receiver on a secondary, the fr9 logger link on a primary).
  */
 
 #ifndef INC_HAL_UART_H_
@@ -60,8 +61,10 @@ typedef struct Usart_and_buffer
 
 void HAL_UART_vInit(void);
 /* Latch the device role (read once from the strap at boot) so HAL_UART_vInit()
- * can choose the USART1 baud/swap without re-reading PB12. Call before the
- * first HAL_UART_vInit(). */
+ * can choose the USART1 baud and HAL_UART_vEnable() the PB6/PB7 drive mode
+ * without re-reading PB12. Call before the first HAL_UART_vInit() and before
+ * any HAL_UART_vEnable() of GPS_UART; until then the default is the SECONDARY
+ * (GNSS-safe, open-drain) configuration. */
 void HAL_UART_vSetRole(bool bPrimary);
 void HAL_UART_vSetup(hal_uart_t *drv, hal_uart_id_t uart_id, hal_uart_fc_t flowcontrol);
 void HAL_UART_vClearBuffer(hal_uart_t *drv);
