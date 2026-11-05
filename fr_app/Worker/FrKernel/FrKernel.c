@@ -289,7 +289,7 @@ static void FRKERNEL_vLoraLogSink(const uint8_t *data, uint16_t len)
  *   flash stress <N>        quiet baseline. Anything that shows up here is a
  *                           property of the bus at 12 MHz, not of the radio.
  *   flash stress tx <N>     a real PA pulse between every read.
- *   flash stress park <N>   an ultra-deep-power-down park and wake between
+ *   flash stress park <N>   a deep-power-down park (B9h) and wake (ABh) between
  *                           every read, with no radio activity at all.
  *
  * The second and third are the discriminating pair. The existing field
@@ -609,7 +609,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         FLASH_vGetHealth(&tHealth);
         snprintf(resp, sizeof(resp),
                  "flash: %s id=%02X%02X%02X tries=%u absent=%u recov=%u "
-                 "probeFail=%u wprot=%u unprotFail=%u eraseVfy=%u epe=%u "
+                 "probeFail=%u wprot=%u unprotFail=%u eraseVfy=%u "
                  "crcRetry=%u crcFail=%u\r\n",
                  tHealth.bPresent ? "USABLE" : "GATED-OFF",
                  tHealth.au8LastId[0], tHealth.au8LastId[1], tHealth.au8LastId[2],
@@ -620,7 +620,6 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
                  (unsigned)tHealth.bWriteProtected,
                  (unsigned)tHealth.bUnprotectFailed,
                  (unsigned)tHealth.u16EraseVerifyFails,
-                 (unsigned)tHealth.u16EpeFails,
                  (unsigned)tHealth.u16ReadCrcRetries,
                  (unsigned)tHealth.u16ReadCrcFails);
         FRKERNEL_vRespond(eXport, resp);

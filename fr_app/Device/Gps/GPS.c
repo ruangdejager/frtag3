@@ -245,6 +245,33 @@ static const uint8_t aUbxCfgPmNav[] = {
 };
 
 /* --------------------------------------------------------------------------
+ * UBX-RXM-PMREQ — enter software standby before the supply is cut.
+ *
+ * VCC and V_IO are tied to the same switched rail, with V_BCKP held up
+ * separately. For that wiring the MIA-M10Q integration manual (UBX-21028173,
+ * section 4.1.4, Table 40, options 1-2) requires the receiver to be put into
+ * software standby with UBX-RXM-PMREQ *before* V_IO and VCC are switched off;
+ * only then does it hand the backup domain (BBR + RTC) over to V_BCKP cleanly
+ * and enter hardware backup mode. Cutting the rail on a running receiver does
+ * not do this, which defeats the hot start on the next power-up.
+ *
+ * Payload (16-byte version): duration=0 (indefinite), flags=BACKUP|FORCE
+ * (FORCE is mandatory to enter standby), wakeupSources=UARTRX so the receiver
+ * is never stranded in standby if the rail somehow stays up.
+ * -------------------------------------------------------------------------- */
+static const uint8_t aUbxRxmPmreqBackup[] = {
+    0xB5, 0x62, 0x02, 0x41, 0x10, 0x00,            /* hdr: RXM-PMREQ, len=16 */
+    0x00, 0x00, 0x00, 0x00,                        /* version=0, reserved */
+    0x00, 0x00, 0x00, 0x00,                        /* duration (ms) = 0 -> indefinite */
+    0x06, 0x00, 0x00, 0x00,                        /* flags = BACKUP (bit1) | FORCE (bit2) */
+    0x08, 0x00, 0x00, 0x00,                        /* wakeupSources = UARTRX (bit3) */
+    0x00, 0x00,                                    /* checksum placeholder */
+};
+
+#define GPS_PMREQ_TX_TIMEOUT_MS     100U  /* 24 B frame; ~25 ms even at 9600 baud */
+#define GPS_PMREQ_SETTLE_MS         50U   /* let the receiver act on PMREQ before rail drop */
+
+/* --------------------------------------------------------------------------
  * GPS_vSendUbxValset — finalize checksum and transmit one UBX-CFG-VALSET frame.
  * Copies the const template to a scratch buffer (bAddUbxChecksum writes the
  * last two bytes in place) and pushes it out via the TX ring buffer.
@@ -273,6 +300,34 @@ static void GPS_vConfigureModule(void)
     GPS_vSendUbxValset(aUbxCfgPmNav,         sizeof(aUbxCfgPmNav));
 
     DBG_LOG("gps: ubx config sent (1Hz, GPS-only, full power, pedestrian)\r\n");
+}
+
+/* --------------------------------------------------------------------------
+ * GPS_vEnterBackup — send UBX-RXM-PMREQ and wait for it to leave the wire.
+ * Must be called while the GPS rail and UART are still up; its only caller is
+ * GPS_vHwPowerOff(), ahead of the pin park and rail drop. PMREQ is not ACKed,
+ * so after the TX line
+ * drains we just give the receiver a short settle time before the rail drops.
+ * -------------------------------------------------------------------------- */
+static void GPS_vEnterBackup(void)
+{
+    uint8_t acFrame[sizeof(aUbxRxmPmreqBackup)];
+
+    memcpy(acFrame, aUbxRxmPmreqBackup, sizeof(acFrame));
+    bAddUbxChecksum(acFrame, sizeof(acFrame));
+    HAL_UART_vTxPutBuffer(&gps.UartHandle, acFrame, sizeof(acFrame));
+
+    uint32_t u32TxStart = osKernelGetTickCount();
+    while (!HAL_UART_bTxIdle(&gps.UartHandle))
+    {
+        if ((osKernelGetTickCount() - u32TxStart) >= GPS_PMREQ_TX_TIMEOUT_MS)
+        {
+            DBG_LOG("gps: pmreq tx timeout\r\n");
+            break;
+        }
+        osDelay(1);
+    }
+    osDelay(GPS_PMREQ_SETTLE_MS);
 }
 
 /* --------------------------------------------------------------------------
@@ -311,19 +366,23 @@ void GPS_vInit(void)
  * and pin order lives. Used by the session cold start (GPS_vSessionArm), the
  * runtime power-down (GPS_vPowerOff) and the boot self-test (GPS_bSelfTest).
  *
- * On V3 RevA the module's I/O is a 1.8 V domain (abs max 1.98 V) powered from
- * GNSS_VCC, while the MCU runs at 2.0 V. The code inherited from frtag2
- * attached the UART pins (AF push-pull with pull-ups, TX idling high) BEFORE
- * raising GNSS_ON, and dropped GNSS_ON before parking the pins. At every
- * session start and at every boot the MCU therefore drove 2.0 V into an
- * unpowered module, and through R18 back into the GNSS_VCC rail, for the whole
- * LDO turn-on. The order is now rail first, pins second on the way up, and
- * pins first, rail second on the way down.
+ * The module's I/O is a 1.8 V domain (abs max 1.98 V) powered from GNSS_VCC,
+ * which only exists while GNSS_ON is high, while the MCU's own rail is always
+ * on. The code inherited from frtag2 attached the UART pins (AF push-pull
+ * with pull-ups, TX idling high) BEFORE raising GNSS_ON, and dropped GNSS_ON
+ * before parking the pins, so at every session start and every boot the MCU
+ * drove its rail into an unpowered module for the whole LDO turn-on. The
+ * order is now rail first, pins second on the way up, and pins first, rail
+ * second on the way down. On the final secondary (1.8 V rail, R21 not fitted)
+ * PB6 is push-pull, so this order is now the ONLY thing keeping the MCU from
+ * back-feeding the module - keep it.
  *
  * GPS_vHwPowerOn() blocks for GPS_LDO_SETTLE_MS (osDelay), so it is task
  * context only: never from an ISR, a timer callback or a critical section.
  * Both of its callers are tasks (the dispatcher under xGpsLock, and the init
- * task for the self-test). GPS_vHwPowerOff() does not block. Neither touches
+ * task for the self-test). GPS_vHwPowerOff() blocks too, for up to
+ * GPS_PMREQ_TX_TIMEOUT_MS + GPS_PMREQ_SETTLE_MS while UBX-RXM-PMREQ drains,
+ * so the same task-context-only rule applies to it. Neither touches
  * the sleep lock or bSessionActive; those stay with the callers, because the
  * self-test never takes a lock and must not release one.
  * -------------------------------------------------------------------------- */
@@ -340,7 +399,7 @@ static void GPS_vHwPowerOn(void)
 
     osDelay(GPS_LDO_SETTLE_MS);
 
-    /* Pins second: PB6/PB7 to AF7 (PB6 open-drain, PB7 no pull on a
+    /* Pins second: PB6/PB7 to AF7 (PB6 push-pull, PB7 no pull on a
      * secondary — see HAL_UART_vEnable). HAL_UART_vEnable() clears the ring
      * as its last step, so no separate HAL_UART_vClearBuffer() is needed. */
     GPS_DRIVER_vEnableUart(&gps.UartHandle);
@@ -348,6 +407,16 @@ static void GPS_vHwPowerOn(void)
 
 static void GPS_vHwPowerOff(void)
 {
+    /* PMREQ before anything is torn down: the receiver must be told to enter
+     * software standby while its rail and the UART are both still up, so it
+     * hands BBR/RTC over to V_BCKP cleanly (see aUbxRxmPmreqBackup). Skipped
+     * when the rail is already off - there is nobody to tell, and the TX wait
+     * would only run out its timeout against a disabled USART. */
+    if (bGpsPowered)
+    {
+        GPS_vEnterBackup();
+    }
+
     /* Pins first: PB6/PB7 back to analog with pulls and output type cleared
      * (HAL_GPIO_DeInit), USART1 disabled and its clock gated. */
     GPS_DRIVER_vDisableUart(&gps.UartHandle);
@@ -645,7 +714,7 @@ void GPS_vShutdown(void)
 #define GPS_SELFTEST_WARMUP_MS      200U  /* MAX-M10S emits $GNTXT boot lines quickly */
 
 /* Minimum number of '$' (NMEA sentence start) bytes for a pass. PB7 carries no
- * MCU pull on V3 RevA (the GNSS I/O is 1.8 V against a 2.0 V MCU, see
+ * MCU pull on V3 RevA (a pull-up would back-feed an unpowered module, see
  * HAL_UART_vEnable), so with the module dead or unpowered the RX pin floats,
  * and the USART can assemble bytes out of noise or break conditions. A raw
  * byte count alone could then pass a missing receiver. Two '$' needs two

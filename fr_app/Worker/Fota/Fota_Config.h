@@ -12,7 +12,7 @@
  * this copy carries application-only blocks (the fw_info identity offset, the
  * install-failure counter, the pending-Prep expiry, the pre-send erase
  * threshold, multi-primary coexistence and the verify quiet window), rewrites
- * several comments, and describes the AT25XE041B flash part and the self-test
+ * several comments, and describes the AT25EU0041A flash part and the self-test
  * sector, none of which the bootloader reads. Do not try to re-sync the files
  * byte for byte; keep the contract constants equal.
  *
@@ -38,7 +38,7 @@
  *   0x08000000 - 0x08004FFF   bootloader (20 KB, frtag2_bootloader project)
  *   0x08005000 - 0x0803FFFF   application (236 KB)
  *
- * ---- External NOR map (AT25XE041B, 512 KB, 4 KB sectors) ----
+ * ---- External NOR map (AT25EU0041A, 512 KB, 4 KB sectors) ----
  *
  *   0x00000 - 0x3AFFF   OTA image scratchpad (sectors 0-58, 236 KB;
  *                       scratch offset N maps to OTA_APP_BASE_ADDR + N)

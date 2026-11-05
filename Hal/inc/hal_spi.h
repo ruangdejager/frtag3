@@ -4,7 +4,7 @@
  * SPI drivers for:
  *   SPI1 — accelerometer (LIS2DH or compatible), PA1/PA6/PA7/PA11
  *          (SECONDARY only; no accelerometer is fitted on a V3 RevA primary)
- *   SPI2 — external NOR flash (AT25XE041B),     PA5/PA8/PA10/PA15
+ *   SPI2 — external NOR flash (AT25EU0041A),    PA5/PA8/PA10/PA15
  *          (both roles)
  *
  * Each bus has its own init, called once at boot by init.c:
@@ -61,24 +61,28 @@ void HAL_SPI_ACC_vEnsureAwake(void);
 #define HAL_SPI_ACC_vDeselect()                        HAL_GPIO_WritePin(BSP_ACC_CS_PORT, BSP_ACC_CS_PIN, GPIO_PIN_SET)
 
 /* -----------------------------------------------------------------------
- * SPI2 — External NOR Flash (AT25XE041B, 512 KB)
+ * SPI2 — External NOR Flash (AT25EU0041A, 512 KB)
  * PA5 MISO = AF3, PA8 SCK = AF5, PA10 MOSI = AF5  (mixed AFs, set in MspInit)
  * ----------------------------------------------------------------------- */
 extern SPI_HandleTypeDef hFlashSpi;
 
 /* SCK rate for the flash bus, in one place.
  *
- * The binding limit is NOT the 85 MHz fCLK headline in the AT25XE041B
- * datasheet: that figure is for all operations "including 0Bh opcode". This
- * driver reads with 03h (Read Array, low frequency), whose ceiling is
- * fRDLF = 25 MHz at 1.65-3.6 V and 33 MHz only at 2.3-3.6 V
- * (DS-AT25XE041B-062 Rev. I, Table 18). This board (Tagskaap V3 RevA) runs
- * VDD = 2.0 V, below the 2.3 V needed for the 33 MHz figure, so the 25 MHz
- * figure is the one that has to hold.
+ * The binding limit is NOT the headline frequency in the AT25EU0041A
+ * datasheet (108 MHz, and only at 2.3-3.6 V). The flash driver reads with
+ * 03h (Normal Read Data), whose ceiling is fR = 50 MHz; every other opcode it
+ * uses is bounded by fC = 80 MHz at 1.65-3.6 V (DS-AT25EU0041A-212 Rev. E,
+ * Table 23). VCC is 1.8 V on the secondary and 3.0 V on the primary; 1.8 V
+ * is below the 2.3 V floor of Table 24, so Table 23 is the one that has to
+ * hold, and it covers 3.0 V as well - one clock setting serves both roles.
  *
  * PCLK1 is 48 MHz (SystemClock_Config in hal_system.c), so /4 gives 12 MHz -
- * comfortably inside fRDLF, and the highest standard prescaler at or below
- * the 16 MHz ceiling this bring-up is working to.
+ * a quarter of fR, and the highest standard prescaler at or below the 16 MHz
+ * ceiling this bring-up is working to. The headroom is deliberate rather than
+ * forced by the part: the open question on this board is signal integrity on
+ * long traces (see HAL_SPI_MspInit in hal_spi.c), not the flash's limit.
+ * (The AT25XE041B briefly targeted during V3 bring-up had a 25 MHz 03h
+ * ceiling at this voltage; 12 MHz satisfied both parts.)
  *
  * It was 750 kHz before (prescaler /64), behind a comment claiming "~0.5 MHz
  * at 32 MHz PCLK" that had been wrong since the clock tree moved to 48 MHz.

@@ -43,9 +43,9 @@ static hal_uart_t *uart2_buffer = NULL;
  * USART1 baud (HAL_UART_vInit) and PB6/PB7 drive mode (HAL_UART_vEnable) can
  * be chosen without re-reading PB12 — the strap pin is parked analog right
  * after that single read. The default (false, i.e. SECONDARY) deliberately
- * selects the GNSS-safe pin configuration (PB6 open-drain, PB7 no pull), so
- * if USART1 were ever enabled before the role is latched it could still not
- * drive or pull the 1.8 V GNSS I/O above its rail. */
+ * selects the GNSS pin configuration (PB7 no pull), so if USART1 were ever
+ * enabled before the role is latched it would still not pull the GNSS TXD
+ * line. */
 static bool s_bPrimaryRole = false;
 
 /* Set once HAL_UART_vInit() has configured USART1, at its first (boot) call.
@@ -146,8 +146,9 @@ void HAL_UART_vInit(void)
      * frtag2 primaries set CR2.SWAP because the harness to the fr9 crossed
      * TX/RX the opposite way to the GNSS wiring. On frtag3 that crossing is
      * being fixed on the fr9 side, so the tag leaves SWAP at its reset value
-     * and the only per-role difference left is electrical (PB6 open-drain or
-     * push-pull, PB7 pull), applied in HAL_UART_vEnable(). This is a
+     * and the only per-role difference left is electrical (the PB7 pull, plus
+     * the PB6 output type, which is push-pull on both roles on the final
+     * boards), applied in HAL_UART_vEnable(). This is a
      * deployment-order dependency and a hardware-compatibility requirement: a
      * frtag3 primary paired with an fr9 (or a harness) that still crosses
      * TX/RX never receives RDY, so every logger session — upload, timestamp
@@ -251,31 +252,33 @@ void HAL_UART_vSetFlowControlFunctions(hal_uart_t *drv,
  * Every GPIO_InitTypeDef field is set inside each case rather than once at
  * the top of the function. The two UARTs need different electricals. frtag2
  * applied one shared default (AF push-pull with pull-up) to PB6/PB7 and the
- * debug pins alike, and on a frtag3 secondary that is exactly the setting
- * that drives 2.0 V into the 1.8 V GNSS I/O. Setting each case in full keeps
+ * debug pins alike, and on a frtag3 secondary that pull-up on PB7 would
+ * back-feed an unpowered GNSS module's TXD. Setting each case in full keeps
  * one UART's choice from leaking into the other's.
  *
  * USART1 (GPS_UART) electricals follow the role latched by
  * HAL_UART_vSetRole(); the values live in hal_bsp.h (BSP_GPS_UART_TX_MODE_*,
  * BSP_GPS_UART_RX_PULL_*):
- *   SECONDARY (GNSS)  PB6 open-drain, no pull; PB7 no pull. The GNSS I/O is a
- *                     1.8 V domain (abs max 1.98 V) against the MCU's 2.0 V
- *                     VDD, and R18 (4.7k) pulls PB6 up to GNSS_VCC, so the
- *                     MCU may only ever pull PB6 low and must not pull PB7 up
- *                     to its own rail. The caller (GPS_vHwPowerOn in GPS.c)
+ *   SECONDARY (GNSS)  PB6 push-pull, no pull; PB7 no pull. The secondary's
+ *                     rail is 1.8 V, the same as the GNSS I/O domain, and the
+ *                     final layout leaves the GNSS_RX pull-up (R21) unfitted,
+ *                     so PB6 must drive both levels itself (an open-drain TX,
+ *                     as on the 2.0 V prototype, would hold the module's RX
+ *                     low forever). PB7 must not be pulled up into an
+ *                     unpowered module. The caller (GPS_vHwPowerOn in GPS.c)
  *                     raises GNSS_ON and waits for the rail before this runs.
- *   PRIMARY (fr9)     PB6 push-pull, no pull; PB7 pull-up. No GNSS is fitted,
- *                     so a driven TX keeps the link independent of whether R18
- *                     and the GNSS LDO are populated, and the pull-up holds RX
- *                     idle-high while the fr9 is not driving it.
+ *   PRIMARY (fr9)     PB6 push-pull, no pull; PB7 pull-up. No GNSS is fitted;
+ *                     the pull-up holds RX idle-high while the fr9 is not
+ *                     driving it.
  * The s_bPrimaryRole default (false) selects the SECONDARY set, the one that
  * cannot harm the GNSS I/O.
  *
  * PB7 (RX) is attached before PB6 (TX), in two separate HAL_GPIO_Init calls,
  * so the receive side is already in its final state when the transmit pin
  * starts presenting an idle level to the far end. The vendor HAL_GPIO_Init
- * writes OTYPER before MODER, so switching PB6 from analog to AF open-drain
- * never passes through push-pull on the way. HAL_UART_vDisable() puts both
+ * writes OTYPER before MODER, so if BSP_GPS_UART_TX_MODE_GNSS is ever set
+ * back to open-drain, switching PB6 from analog to AF never passes through
+ * push-pull on the way. HAL_UART_vDisable() puts both
  * pins back to analog through HAL_GPIO_DeInit(), which also clears OTYPER
  * and PUPDR, so nothing from one session carries into the next.
  * -------------------------------------------------------------------------- */

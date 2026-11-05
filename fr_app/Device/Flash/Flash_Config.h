@@ -1,31 +1,81 @@
 /*
  * Flash_Config.h
  *
- * AT25XE041B-MAHN-T — 4 Mbit (512 KB) SPI NOR flash, 8-pad UDFN 2x3.
- * Manufacturer: Renesas (formerly Adesto/Dialog/Atmel), JEDEC mfr ID 0x1F.
+ * AT25EU0041A — 4 Mbit (512 KB) ultra-low-energy SPI NOR flash, 1.65-3.6 V.
+ * Manufacturer: Renesas (formerly Adesto/Dialog), JEDEC mfr ID 0x1F.
+ * Fitted as U1 on SPI2 on BOTH the Tagskaap V3 RevA primary and secondary.
  *
  * EVERY constant in this file is traceable to
- *   DS-AT25XE041B-062 Rev. I, Mar 15 2023
- * and carries the section or table it came from. Nothing here is inherited
- * from the AT25EU0041A this board's predecessor carried, and nothing is
- * "what SPI NOR usually does". Three values that could not be read
- * unambiguously out of that document are marked TODO rather than guessed —
- * see the bottom of this file.
+ *   DS-AT25EU0041A-212 Rev. E, Jul 10 2025
+ * and carries the section or table it came from. Values that could not be
+ * read unambiguously out of that document are listed at the bottom of this
+ * file rather than guessed.
  *
- * Why that matters here specifically: the V2 board carried an AT25EU0041A and
- * the driver was written against a Winbond-style two-register protection model
- * that this part does not have. Several of those assumptions happened to still
- * work on this part for the wrong reasons (see the Status Register block
- * below), which is a worse state than failing outright — it would have held
- * until the first time something was genuinely protected.
+ * ---- Part history: why this file has been rewritten twice ----
  *
- * Board notes (V3):
- *   WP#   (pin 3) — tied to GND. Asserted. See the SPRL discussion below:
- *                   this makes SPRL a one-way latch.
- *   HOLD# (pin 7) — tied to VCC. Deasserted, never used.
- *   Neither has an MCU GPIO, so neither can be driven out of a bad state.
+ * frtag2 (V2) carried an AT25EU0041A, and the inherited driver was written
+ * against its Winbond-style two-register protection model. Early V3 bring-up
+ * assumed an AT25XE041B and commit 55b85be retargeted the driver to that
+ * part's completely different register set (SPRL/SWP/EPE, protected-by-
+ * default, Ultra-Deep Power-Down). The FINAL V3 RevA schematics fit the
+ * AT25EU0041A again, so this file returns to that part — but sourced from the
+ * current datasheet revision, not copied back from the frtag2 driver, and with
+ * the XE041B lessons kept where they still apply (3-byte JEDEC compare, EPE-
+ * free erase verify, bounded waits).
  *
- * Pinout (datasheet Figure 3, 8-UDFN, top view) — matches the board:
+ * The XE041B assumptions that MUST NOT survive on this part, each of which
+ * would be wrong in the dangerous direction:
+ *   - Bits 6:2 of SR1 are BP4..BP0 here, not read-only status. Bit 5 is BP3,
+ *     not EPE, so testing "EPE" after an erase would read a protection bit.
+ *   - There is no Ultra-Deep Power-Down (no 79h) and no CS-pulse exit. A
+ *     CS pulse does NOT wake this part; only ABh does (§6.3.7).
+ *   - Protection is NOT the power-on default. Table 3: "on power-up the
+ *     device is unprotected", and deep power-down does not touch the SR. So
+ *     the XE041B's "unprotect on the first write after every wake" would here
+ *     be a NON-VOLATILE status-register write (tW up to 12 ms, and SR wear)
+ *     on nearly every wake, for nothing.
+ *   - 35h IS a command here (Read Status Register 2), and WRSR takes one OR
+ *     two data bytes (§6.1.6) — exactly 8 or 16 bits, anything else is not
+ *     executed.
+ *
+ * ---- Board notes (V3 RevA, both roles) ----
+ *
+ *   CS#   (pin 1) — PA15, with R1 = 10k pull-up to VCC. That is exactly what
+ *                   Table 1 recommends "to ensure CS ramps together with VCC
+ *                   during power-up", and it keeps the part deselected if PA15
+ *                   is ever left undriven.
+ *   SO    (pin 2) — PA5 (MISO). SI (pin 5) — PA10 (MOSI). SCK (pin 6) — PA8.
+ *   WP#   (pin 3) — NOT CONNECTED on the PCB (no-connect marker).
+ *   HOLD# (pin 7) — NOT CONNECTED on the PCB (no-connect marker).
+ *
+ *   Table 1: "The WP pin is internally pulled high and can be left floating
+ *   if not used", and the same sentence for HOLD. So with QE = 0 (factory
+ *   default) both pins read as DEASSERTED. That makes the floating pins safe
+ *   provided firmware guarantees three things, all enforced or relied on by
+ *   Flash.c:
+ *     1. SRP1:SRP0 stays 0:0 ("Software Protected", Table 5). WP# is only
+ *        consulted in the 0:1 mode; at 0:0 a noise pulse on the floating
+ *        WP# pad cannot lock the status register. Global Unprotect writes
+ *        both SRP bits to 0, and bring-up treats either SRP bit set as a
+ *        protection fault to clear (FLASH_STATUS_PROTECTED / _STATUS2_).
+ *     2. No quad command is ever issued (6Bh, EBh, 32h, 94h). With QE = 1
+ *        pins 3 and 7 become IO2/IO3, and on this board they are wired to
+ *        nothing, so a quad transfer would read the internal pull-ups.
+ *     3. QE stays 0, i.e. pins 3/7 stay WP#/HOLD# held high internally. QE
+ *        does not protect the array, so a QE = 1 seen at bring-up is
+ *        REPORTED but does not on its own trigger a non-volatile SR write;
+ *        any Global Unprotect clears it as a side effect (SR2 data 00h).
+ *   HOLD# floating with only an internal pull-up is the one residual
+ *   exposure: a HOLD# pulse low with SCK low pauses the transfer (§4.5),
+ *   which from the host looks like a shifted read. The pull-up strength is not
+ *   specified; see the open items at the bottom of this file.
+ *
+ *   VCC is 1.8 V on the secondary board and 3.0 V on the primary. Every
+ *   voltage-dependent figure below is taken from the 1.65-3.6 V tables
+ *   (Table 20, Table 23), which bind at 1.8 V and are also valid at 3.0 V.
+ *
+ * Pinout (datasheet Figure 2, 8-pad DFN 2x3, top view; SOIC Figure 1 is the
+ * same) — matches the board:
  *   1 CS#   2 SO   3 WP#   4 GND   5 SI   6 SCK   7 HOLD#   8 VCC
  */
 
@@ -33,12 +83,13 @@
 #define DEVICE_FLASH_FLASH_CONFIG_H_
 
 /* --------------------------------------------------------------------------
- * Geometry — §4 Memory Array, Figure 6
+ * Geometry — §3, Table 2 "Block Addresses"
  *
- * Unchanged from the previous part, which is the one thing that did carry
- * over: 512 KB in 128 uniform 4 KB blocks (B0..B127), also addressable as
- * 32 KB and 64 KB blocks, 256-byte pages. Three address bytes; A23-A19 are
- * ignored because the array tops out at 07FFFFh (§6).
+ * Identical to the AT25XE041B, which is why no caller (Log, Fota, flashLog,
+ * the self-test sector) needed to change: 512 KB in 128 uniform 4 KB blocks
+ * (0..127), also addressable as 16 x 32 KB and 8 x 64 KB blocks, with a
+ * 256-byte page for program and for Page Erase (§6.4.4). Three address
+ * bytes; the array tops out at 07FFFFh.
  * -------------------------------------------------------------------------- */
 #define FLASH_CAPACITY_BYTES        (512U * 1024U)
 #define FLASH_PAGE_SIZE_BYTES       256U
@@ -49,224 +100,251 @@
 #define FLASH_NUM_PAGES             2048U
 
 /* --------------------------------------------------------------------------
- * Command set — §6, Table 2 "Command Listing"
+ * Command set — §6, Table 8 "Command Set Table 1"
  *
- * The full set is listed, including the commands this driver does not issue,
- * so that "what can this part do" is answerable from one file instead of from
- * a PDF. Unsupported opcodes are ignored by the device and start no operation
- * (§6), which is exactly why the old 35h Read-Status-Register-2 read returned
- * nothing useful rather than failing loudly.
+ * The single-I/O set is listed in full, including the commands this driver
+ * does not issue, so that "what can this part do" is answerable from one file.
+ * Dual/quad opcodes are deliberately NOT listed: quad needs WP#/HOLD# as
+ * IO2/IO3 and those pads are not connected on this board (see above).
+ *
+ * §6: for Page Program, Page Erase, Block Erase, Chip Erase, WRSR, WREN,
+ * WRDI and Deep Power-Down, CS# must rise exactly on a byte boundary or the
+ * command is rejected. Every transaction in Flash.c is whole bytes.
  * -------------------------------------------------------------------------- */
 
-/* Read — §7. Note the three different clock ceilings; see FLASH_SPI_CLOCK_HZ
- * in hal_spi.h for which one actually binds this driver. */
-#define FLASH_CMD_READ              0x03U   /* Read Array, low frequency (fRDLF) */
-#define FLASH_CMD_FAST_READ         0x0BU   /* Read Array + 1 dummy byte (fCLK)  */
-#define FLASH_CMD_DUAL_READ         0x3BU   /* Dual-Output Read Array (fRDDO)    */
+/* Read — §6.2. See FLASH_FR_MAX_HZ / FLASH_FC_MAX_HZ below and hal_spi.h for
+ * which clock ceiling binds this driver. */
+#define FLASH_CMD_READ              0x03U   /* Normal Read Data (fR), §6.2.1     */
+#define FLASH_CMD_FAST_READ         0x0BU   /* Fast Read + 8 dummy clocks (fC), §6.2.2 */
 
-/* Program and erase — §8 */
-#define FLASH_CMD_PAGE_PROGRAM      0x02U   /* Byte/Page Program, 1-256 B, §8.1 */
-#define FLASH_CMD_PAGE_ERASE        0x81U   /* 256-byte page erase, §8.4        */
-#define FLASH_CMD_SECTOR_ERASE      0x20U   /* Block Erase, 4 KB,  §8.5         */
-#define FLASH_CMD_BLOCK_ERASE_32K   0x52U   /* Block Erase, 32 KB, §8.5         */
-#define FLASH_CMD_BLOCK_ERASE       0xD8U   /* Block Erase, 64 KB, §8.5         */
-#define FLASH_CMD_CHIP_ERASE        0x60U   /* Chip Erase, §8.6 (C7h is an alias) */
-#define FLASH_CMD_CHIP_ERASE_ALT    0xC7U
+/* Program and erase — §6.4 */
+#define FLASH_CMD_PAGE_PROGRAM      0x02U   /* Page Program, 1-256 B, §6.4.1    */
+#define FLASH_CMD_PAGE_ERASE        0x81U   /* 256-byte Page Erase, §6.4.4      */
+#define FLASH_CMD_PAGE_ERASE_ALT    0xDBU   /*   (alias, §6.4.4)                */
+#define FLASH_CMD_SECTOR_ERASE      0x20U   /* Block Erase, 4 KB,  §6.4.5       */
+#define FLASH_CMD_BLOCK_ERASE_32K   0x52U   /* Block Erase, 32 KB, §6.4.6       */
+#define FLASH_CMD_BLOCK_ERASE       0xD8U   /* Block Erase, 64 KB, §6.4.7       */
+#define FLASH_CMD_CHIP_ERASE        0x60U   /* Chip Erase, §6.4.8               */
+#define FLASH_CMD_CHIP_ERASE_ALT    0xC7U   /*   (alias, §6.4.8)                */
+#define FLASH_CMD_PE_SUSPEND        0x75U   /* §6.4.9 — not used                */
+#define FLASH_CMD_PE_RESUME         0x7AU   /* §6.4.10 — not used               */
 
-/* Protection — §9 */
-#define FLASH_CMD_WRITE_ENABLE      0x06U   /* §9.1 */
-#define FLASH_CMD_WRITE_DISABLE     0x04U   /* §9.2 */
-#define FLASH_CMD_PROTECT_SECTOR    0x36U   /* §9.3 — not used, see TODO 2     */
-#define FLASH_CMD_UNPROTECT_SECTOR  0x39U   /* §9.4 — not used, see TODO 2     */
-#define FLASH_CMD_READ_SECTOR_PROT  0x3CU   /* §9.6 — returns FFh or 00h       */
+/* Configuration and status — §6.1 */
+#define FLASH_CMD_WRITE_ENABLE      0x06U   /* §6.1.1                           */
+#define FLASH_CMD_VOLATILE_SR_WREN  0x50U   /* §6.1.2 — not used, see below     */
+#define FLASH_CMD_WRITE_DISABLE     0x04U   /* §6.1.3                           */
+#define FLASH_CMD_READ_STATUS       0x05U   /* §6.1.4 — Status Register 1       */
+#define FLASH_CMD_READ_STATUS2      0x35U   /* §6.1.4 — Status Register 2       */
+#define FLASH_CMD_ACTIVE_STATUS_INT 0x25U   /* §6.1.5 — not used                */
+#define FLASH_CMD_WRITE_STATUS      0x01U   /* §6.1.6 — SR1, or SR1 then SR2    */
 
-/* Status register — §11 */
-#define FLASH_CMD_READ_STATUS       0x05U   /* §11.1 — byte 1 then byte 2, repeating */
-#define FLASH_CMD_ACTIVE_STATUS_INT 0x25U   /* §11.2 — not used                */
-#define FLASH_CMD_WRITE_STATUS      0x01U   /* §11.3 — SPRL + global protect/unprotect */
-#define FLASH_CMD_WRITE_STATUS2     0x31U   /* §11.4 — RSTE only               */
+/* ID and power — §6.3 */
+#define FLASH_CMD_JEDEC_ID          0x9FU   /* §6.3.5                           */
+#define FLASH_CMD_MFR_DEVICE_ID     0x90U   /* §6.3.2 — not used (returns 1F 14) */
+#define FLASH_CMD_DEEP_PWR_DOWN     0xB9U   /* §6.3.7                           */
+#define FLASH_CMD_RESUME            0xABU   /* §6.3.1 — Release Power-down / ID */
 
-/* Miscellaneous — §12 */
-#define FLASH_CMD_JEDEC_ID          0x9FU   /* §12.1 */
-#define FLASH_CMD_DEEP_PWR_DOWN     0xB9U   /* §12.2 */
-#define FLASH_CMD_RESUME            0xABU   /* §12.3 — Resume from Deep Power-Down */
-#define FLASH_CMD_ULTRA_DEEP_PWR_DN 0x79U   /* §12.4 — exit is a CS pulse, no opcode */
-#define FLASH_CMD_RESET             0xF0U   /* §12.7 — needs RSTE set via 31h first */
-#define FLASH_RESET_CONFIRM_BYTE    0xD0U   /* §12.7 — mandatory second byte    */
+/* Other — §6.4.14. Not used: see the open items at the bottom. */
+#define FLASH_CMD_ENABLE_RESET      0x66U
+#define FLASH_CMD_RESET             0x99U
 
 /* --------------------------------------------------------------------------
- * JEDEC identification — §12.1, Table 14
+ * JEDEC identification — §6.3, Table 10 "AT25EU0041A ID Definition Table"
  *
- * 9Fh returns FOUR bytes: mfr, device ID part 1, device ID part 2, then the
- * Extended Device Information String Length, which is 00h (no EDI follows).
+ * 9Fh returns THREE bytes: 1Fh 14h 01h. Unlike the AT25XE041B there is no
+ * fourth "EDI length" byte; Table 8 note 9 says the ID simply repeats while
+ * CS# stays low, so clocking a fourth byte would read back a repeat, not a
+ * field. Exactly three are read.
  *
- *   1Fh  Manufacturer — JEDEC code for Renesas
- *   44h  Family 010 (AT25F/AT25XExxx) + density 00100 (4 Mbit)
- *   02h  Sub code 000 (standard series) + product version 00010
- *   00h  EDI string length — none
+ * All three are checked. Comparing the manufacturer byte alone (what the
+ * frtag2 driver did) passes ANY 0x1F part of any density — including the
+ * AT25XE041B (1F 44 02) this board was briefly drawn with — so a mis-stuffed
+ * reel would be accepted here and fail much later, at an address or a
+ * register bit the fitted part does not have.
  *
- * All three meaningful bytes are checked. The previous driver compared the
- * manufacturer byte alone, which passed ANY 0x1F part of any density — so a
- * mis-stuffed reel of a different Renesas flash would have been accepted and
- * then failed much later, at an address the wrong part does not have.
+ * 90h returns 1F 14 and ABh (with three dummy bytes) returns 14; neither is
+ * used for identification, but the ABh value is why a release-from-DPD that
+ * is accidentally clocked further reads back 14h.
  * -------------------------------------------------------------------------- */
 #define FLASH_MANUFACTURER_ID       0x1FU
-#define FLASH_DEVICE_ID1            0x44U
-#define FLASH_DEVICE_ID2            0x02U
-#define FLASH_EDI_LENGTH            0x00U
-#define FLASH_JEDEC_ID_BYTES        4U      /* read all four, report all four  */
+#define FLASH_DEVICE_ID1            0x14U
+#define FLASH_DEVICE_ID2            0x01U
+#define FLASH_JEDEC_ID_BYTES        3U
 
 /* --------------------------------------------------------------------------
- * Status Register Byte 1 — §11.1, Table 10
+ * Status Register 1 — §5.1, Table 3 (read 05h)
  *
- *   bit7  SPRL     R/W  Sector Protection Registers Locked
- *   bit6  SPM      R    1 = Sequential Program Mode entered
- *   bit5  EPE      R    1 = the last erase or program FAILED
- *   bit4  WPP      R    WP# pin status; 0 = WP# ASSERTED (low)
- *   bit3:2 SWP     R    00 none / 01 some / 11 ALL sectors protected
- *   bit1  WEL      R    Write Enable Latch
- *   bit0  RDY/BSY  R    1 = busy with an internal operation
+ *   bit7    SRP0     R/W  NV  Status Register Protect 0 (with SRP1, Table 5)
+ *   bit6:2  BP4..BP0 R/W  NV  Block Protect size (Tables 6/7)
+ *   bit1    WEL      R        Write Enable Latch
+ *   bit0    RDY/BSY  R        1 = program / erase / WRSR in progress
  *
- * Three things here are different from the part this driver was written for,
- * and all three matter:
+ * Defaults (Table 3): SRP0 = 0, BP = 0 — "on power-up the device is
+ * unprotected". The bits are NON-VOLATILE: a value written stays across power
+ * cycles and across deep power-down, which is why a protection state, once
+ * seen, is a real finding on this part rather than the boot-time norm it was
+ * on the AT25XE041B.
  *
- * 1. There are no BP0..BP4 bits and no SRP0. Bits 6:2 are read-only STATUS on
- *    this part. The old FLASH_STATUS_PROTECTED mask (BP|SRP0) therefore read
- *    as clean on a healthy chip purely by coincidence — every bit it tested
- *    happens to sit at 0 after a successful unprotect with WP# grounded. It
- *    was testing the right thing for the wrong reason.
- *
- * 2. EPE is new and free. The device itself reports a failed erase or program
- *    (§11.1.3). The driver previously had to infer that from a read-back
- *    sample, which cannot distinguish "the erase did nothing" from "the erase
- *    worked and the read-back was corrupted".
- *
- * 3. WPP lets the firmware REPORT the WP# strap instead of assuming it. On
- *    this board WP# is grounded, so a healthy part must read WPP = 0. A WPP
- *    of 1 means the strap is not what this file says it is.
- *
- * WEL and RDY/BSY did land in the same bit positions as the old part, so the
- * busy-poll and write-enable logic was correct — again, by coincidence.
+ * WEL and RDY/BSY sit in the same positions on both parts, which is the one
+ * reason the busy-poll and WREN logic carried across the part changes
+ * untouched.
  * -------------------------------------------------------------------------- */
 #define FLASH_SR1_RDY_BSY          (1U << 0)
 #define FLASH_SR1_WEL              (1U << 1)
-#define FLASH_SR1_SWP_MASK         (0x03U << 2)
-#define FLASH_SR1_SWP_NONE         (0x00U << 2)   /* no sector protected      */
-#define FLASH_SR1_SWP_SOME         (0x01U << 2)
-#define FLASH_SR1_SWP_ALL          (0x03U << 2)   /* power-on default         */
-#define FLASH_SR1_WPP              (1U << 4)      /* 0 = WP# asserted (low)   */
-#define FLASH_SR1_EPE              (1U << 5)
-#define FLASH_SR1_SPM              (1U << 6)
-#define FLASH_SR1_SPRL             (1U << 7)
-
-/* "The array is not writable as it stands." SWP non-zero means at least one
- * sector is protected; SPRL means the protection registers are locked and a
- * Global Unprotect will be refused. Either one blocks a program or erase while
- * leaving reads working perfectly, which is the failure mode that presents as
- * "the log just froze". */
-#define FLASH_STATUS_PROTECTED     (FLASH_SR1_SWP_MASK | FLASH_SR1_SPRL)
+#define FLASH_SR1_BP_SHIFT         2U
+#define FLASH_SR1_BP_MASK          (0x1FU << FLASH_SR1_BP_SHIFT)
+#define FLASH_SR1_SRP0             (1U << 7)
 
 /* --------------------------------------------------------------------------
- * Status Register Byte 2 — §11.1.8, Table 11
+ * Status Register 2 — §5.2, Table 4 (read 35h — a separate opcode on this
+ * part; NOT reached by clocking past SR1, which just repeats SR1, §6.1.4)
  *
- * Reached by CONTINUING to clock after byte 1 of a single 05h command — the
- * device emits byte 1, byte 2, byte 1, ... for as long as CS stays asserted
- * (§11.1). There is no separate opcode. 35h, which the previous driver used,
- * is not a command on this part at all and is silently ignored (§6).
+ *   bit7    SUS      R        1 = a program/erase is SUSPENDED (75h)
+ *   bit6    CMP      R/W  NV  Complement Protect (inverts the BP map)
+ *   bit5:3  LB3..LB1 R    OTP Security-register lock bits — ONE-TIME
+ *   bit2    —        R        reserved
+ *   bit1    QE       NV       Quad Enable; 0 = pins 3/7 are WP#/HOLD#
+ *   bit0    SRP1     R/W  NV  Status Register Protect 1
  *
- *   bit4  RSTE     R/W  Reset command enabled (default 0 = disabled)
- *   bit0  RDY/BSY  R    mirror of byte 1 bit 0
- *   all others reserved, read 0
+ * CMP matters to "is the array protected" as much as BP does: Table 7, with
+ * CMP = 1 and BP2:0 = 000 the protected portion is the WHOLE array. A check
+ * that looked at SR1 alone would call that chip clean.
+ *
+ * SUS is reported at bring-up because this driver never issues 75h: a set SUS
+ * means a stray command did, the page/block it was working on is half-done,
+ * and RDY/BSY reads 0 regardless (§6.4.9).
  * -------------------------------------------------------------------------- */
-#define FLASH_SR2_RDY_BSY          (1U << 0)
-#define FLASH_SR2_RSTE             (1U << 4)
+#define FLASH_SR2_SRP1             (1U << 0)
+#define FLASH_SR2_QE               (1U << 1)
+#define FLASH_SR2_LB_SHIFT         3U
+#define FLASH_SR2_LB_MASK          (0x07U << FLASH_SR2_LB_SHIFT)
+#define FLASH_SR2_CMP              (1U << 6)
+#define FLASH_SR2_SUS              (1U << 7)
+
+/* "The status registers are not in the state this driver requires."
+ *
+ * SR1: any BP bit protects some portion of the array against program and
+ * erase while leaving reads working perfectly — the failure mode that
+ * presents as "the log just froze". SRP0 alone does not protect the array,
+ * but it hands write-control of the status register to the floating WP# pad
+ * (Table 5, row 0:1), which is the one thing the board notes above say must
+ * never matter.
+ *
+ * SR2: CMP inverts the BP map (CMP = 1 with BP = 0 protects everything);
+ * SRP1 = 1 is Power Supply Lock-Down (with SRP0 = 0) or One-Time-Program
+ * (with SRP0 = 1), in both of which a WRSR is refused. QE, SUS and the OTP LB
+ * bits are deliberately NOT here: none of them stops a program or erase of
+ * the main array, and an NV status-register write is not free (tW, wear). */
+#define FLASH_STATUS_PROTECTED     (FLASH_SR1_BP_MASK | FLASH_SR1_SRP0)
+#define FLASH_STATUS2_PROTECTED    (FLASH_SR2_CMP | FLASH_SR2_SRP1)
 
 /* --------------------------------------------------------------------------
- * Protection model — §9.5, Table 4, and §11.3
+ * Protection model — §5.3 Table 5, §5.4 Tables 6/7, §6.1.6
  *
- * THE DEFAULT IS PROTECTED. Table 3: a Sector Protection Register's default
- * value is 1, "Sector is protected and cannot be programmed or erased". That
- * applies to a virgin part, to a part after a power cycle, AND — see
- * FLASH_TXUDPD_US below — to a part that has just exited Ultra-Deep
- * Power-Down. A Global Unprotect is not a recovery step on this part, it is
- * part of normal bring-up.
+ * Global Unprotect = WREN (06h), then WRSR (01h) with TWO data bytes:
+ *   SR1 = 00h  -> SRP0 = 0, BP4..BP0 = 0
+ *   SR2 = 00h  -> SRP1 = 0, QE = 0, CMP = 0 (LB/SUS/reserved are read-only)
+ * §6.1.6: one data byte writes SR1 only; two write SR1 then SR2; any other
+ * bit count is NOT executed. Both bytes are needed: an SR1-only write leaves
+ * CMP, and CMP = 1 with BP = 0 is "everything protected".
  *
- * Global Unprotect = WREN, then WRSR (01h) with ONE data byte of 00h.
- * Global Protect   = the same with 7Fh.
- * Table 4, row WP#=0 / current SPRL=0 / data 0x0000xx:
- *     "Global Unprotect - all Sector Protection Registers reset to 0",
- *     new SPRL = 0.
- * So the unprotect works with WP# grounded, provided SPRL is currently 0.
+ * This works whenever SRP1 = 0. With SRP1:SRP0 = 0:1 it needs WP# high,
+ * which the internal pull-up provides on this board. With SRP1 = 1 it is
+ * refused:
+ *   1:0 Power Supply Lock-Down — until the next power-down/power-up cycle
+ *       (Table 5 note 1). A battery tag effectively never gets one.
+ *   1:1 One-Time Program — permanent ("available upon special order").
  *
- * SPRL IS A ONE-WAY LATCH ON THIS BOARD. §11.3: while WP# is asserted, SPRL
- * can only be set to 1; an attempt to clear it is ignored. WP# is grounded
- * here and has no MCU GPIO, so a single WRSR data byte with bit 7 set
- * permanently locks the protection registers of that unit — reads keep
- * working, every write and erase is refused forever, and the part cannot be
- * recovered without physically lifting the WP# pin. This is why the driver
- * never writes a WRSR byte with bit 7 set, and why FLASH_vWriteDisable() on
- * every error path (keeping WEL=0 at idle, so a stray WRSR is refused) is
- * load-bearing rather than tidiness.
+ * WHAT MUST NEVER BE WRITTEN AS 1 — checked at compile time below:
+ *   SR2 bit 0 (SRP1): the two lock modes above.
+ *   SR2 bits 5:3 (LB3..LB1): OTP; once 1, the security registers are
+ *   read-only for ever (Table 4). Harmless to the main array, but
+ *   irreversible, and nothing in this firmware has any reason to set them.
+ * Everything else a stray WRSR could set (BP, CMP, SRP0, QE) is recoverable
+ * by the next Global Unprotect, which is the point of the WP# analysis above:
+ * with WP# floating high, SRP0 is no longer the one-way latch that SPRL was on
+ * the AT25XE041B with WP# grounded.
+ *
+ * The SR bits are written NON-VOLATILE (tW = 6.5 ms typ / 12 ms max, Table
+ * 23), so the driver only issues Global Unprotect when bring-up or an erase
+ * verify actually finds protection set — never as a reflex on wake.
+ *
+ * 50h (Volatile SR Write Enable) is listed for completeness and not used:
+ * a volatile clear would be undone by the next power cycle while the NV bits
+ * stayed set. Note that 50h does NOT set WEL (§6.1.2), so WEL = 0 at idle
+ * does not by itself refuse a 50h+01h pair; two specific commands in sequence
+ * is a much smaller stray-command target than one, and a volatile write is
+ * undone by a power cycle or a 66h/99h reset (§6.4.14).
  * -------------------------------------------------------------------------- */
-#define FLASH_WRSR_GLOBAL_UNPROTECT 0x00U   /* SPRL=0, bits 5:2 = 0000        */
-#define FLASH_WRSR_GLOBAL_PROTECT   0x7FU   /* SPRL=0, bits 5:2 = 1111        */
-#define FLASH_WRSR_SPRL_MASK        0x80U   /* must never be set — see above  */
+#define FLASH_WRSR_SR1_UNPROTECT    0x00U   /* SRP0 = 0, BP = 00000             */
+#define FLASH_WRSR_SR2_UNPROTECT    0x00U   /* SRP1 = 0, QE = 0, CMP = 0        */
+#define FLASH_WRSR_SR2_NEVER_SET    (FLASH_SR2_SRP1 | FLASH_SR2_LB_MASK)
 
-/* Back-compat name for the unprotect data byte. */
-#define FLASH_STATUS_UNPROTECT      FLASH_WRSR_GLOBAL_UNPROTECT
+/* Back-compat name for the SR1 unprotect data byte. */
+#define FLASH_STATUS_UNPROTECT      FLASH_WRSR_SR1_UNPROTECT
+
+#if (FLASH_WRSR_SR2_UNPROTECT & FLASH_WRSR_SR2_NEVER_SET) != 0
+#error "Flash_Config.h: the SR2 unprotect byte sets SRP1 or an OTP LB bit"
+#endif
 
 /* --------------------------------------------------------------------------
- * AC timing — §13.3, Table 18 (1.65-3.6 V, -40 to +85 C)
+ * AC timing — §7.6, Table 23 "AC Electrical Characteristics for 1.65 V to
+ * 3.6 V"
  *
- * This board (Tagskaap V3 RevA) runs VDD = 2.0 V; frtag2 ran at 1.8 V. Every
- * constant below is taken from the 1.65-3.6 V column, the worst case, so the
- * numbers hold anywhere in that range rather than only at one board's rail.
- * Where Table 19 (-40 to +125 C) is worse still, the timeout is sized off
- * Table 19 instead and says so.
+ * VCC is 1.8 V on the secondary and 3.0 V on the primary. 1.8 V is below the
+ * 2.3 V floor of Table 24, so every figure here is from Table 23, which also
+ * covers 3.0 V; one set of numbers holds on both roles. Where Table 24
+ * (2.3-3.6 V) differs it is noted, but never used.
  * -------------------------------------------------------------------------- */
 
-/* Clock ceilings. fCLK is the headline number and does NOT apply to the
- * opcode this driver uses. See hal_spi.h. */
-#define FLASH_FCLK_MAX_HZ           85000000UL  /* all ops incl. 0Bh          */
-#define FLASH_FRDLF_MAX_HZ          25000000UL  /* 03h Read Array @1.65-3.6 V */
-#define FLASH_FRDDO_MAX_HZ          40000000UL  /* 3Bh Dual-Output Read       */
+/* Clock ceilings. fR is the one that binds: this driver reads with 03h. The
+ * 12 MHz SPI2 clock (hal_spi.h) is a quarter of it. */
+#define FLASH_FC_MAX_HZ             80000000UL  /* all ops except 03h/6Bh/EBh;
+                                                 * 108 MHz only at >= 2.3 V   */
+#define FLASH_FR_MAX_HZ             50000000UL  /* 03h Normal Read, both ranges */
 
-/* Bus timing worth naming. tCSH is the only one the software can violate:
- * a back-to-back deselect/select at 12 MHz leaves far more than 35 ns, but
- * it is the constraint that exists, so it is recorded. */
-#define FLASH_TCSH_NS               35U     /* min CS# high between commands  */
+/* tSHSL, CS# deselect time. The only bus timing software could violate; a
+ * back-to-back deselect/select at 12 MHz leaves far more than this. The
+ * larger of the two is recorded: 15 ns read-to-read, 30 ns after a write,
+ * program or erase before the next status read. */
+#define FLASH_TCSH_NS               30U
 
-/* Power-down entry/exit. These are the numbers the driver actually waits on;
- * see FLASH_vPark / FLASH_vEnsureAwake in Flash.c. */
-#define FLASH_TEDPD_US              3U      /* CS# high -> Deep Power-Down    */
-#define FLASH_TRDPD_US              8U      /* ABh -> standby (DPD exit)      */
-#define FLASH_TEUDPD_US             3U      /* CS# high -> Ultra-Deep PD      */
-#define FLASH_TCSLU_US              1U      /* spec is tCSLU = 20 ns MIN; the
-                                             * busy-wait cannot resolve below
-                                             * 1 us and erring long is the safe
-                                             * direction for a settle          */
-#define FLASH_TXUDPD_US             70U     /* CS# pulse -> standby (UDPD exit) */
-#define FLASH_TSWRST_US             60U     /* F0h+D0h -> idle (unused)       */
+/* Deep power-down entry/exit. These are the numbers the driver actually
+ * waits on; see FLASH_vDeepPowerDown / FLASH_vEnsureAwake in Flash.c.
+ * Both are maxima ("guaranteed by design", Table 23 note 2). */
+#define FLASH_TDP_US                3U      /* B9h, CS# high -> deep PD        */
+#define FLASH_TRES1_US              8U      /* ABh, CS# high -> standby        */
+#define FLASH_TRST_US               300U    /* 66h+99h -> next command (unused) */
 
-/* Program and erase times, Table 18 typ/max. Present so the timeouts below
- * can be read as "spec x margin" instead of as round numbers somebody liked. */
-#define FLASH_TPP_TYP_MS            2U      /* 1.85 ms typ, 2.75 ms max       */
-#define FLASH_TPP_MAX_MS            3U      /* 3.75 ms max on the 125 C part  */
-#define FLASH_TBP_US                8U      /* single byte program            */
-#define FLASH_TPE_MAX_MS            20U     /* 256-byte page erase, 81h       */
-#define FLASH_TBLKE_4K_MAX_MS       60U     /* 75 ms on the 125 C part        */
-#define FLASH_TBLKE_32K_MAX_MS      500U    /* 550 ms on the 125 C part       */
-#define FLASH_TBLKE_64K_MAX_MS      900U    /* 1100 ms on the 125 C part      */
-#define FLASH_TCHPE_MAX_MS          7200U   /* 7600 ms on the 125 C part      */
+/* Program, erase and WRSR times, Table 23 typ/max. Present so the timeouts
+ * below can be read as "spec x margin" instead of as round numbers somebody
+ * liked.
+ *
+ * Note what this part does that the AT25XE041B did not: §1, "the short erase
+ * times are constant and independent of the size of memory block being
+ * erased". A 4 KB erase, a 64 KB erase and a CHIP erase are all 8 ms typ /
+ * 12 ms max. */
+#define FLASH_TPP_TYP_MS            2U      /* page program, 1-256 B           */
+#define FLASH_TPP_MAX_MS            3U
+#define FLASH_TPE_MAX_MS            12U     /* 256-byte page erase, 81h        */
+#define FLASH_TBLKE_4K_MAX_MS       12U
+#define FLASH_TBLKE_32K_MAX_MS      12U
+#define FLASH_TBLKE_64K_MAX_MS      12U
+#define FLASH_TCE_MAX_MS            12U     /* chip erase, 60h/C7h             */
+#define FLASH_TW_MAX_MS             12U     /* WRSR, non-volatile SR write     */
 
-/* Power-up — §14.1, Table 20. Not enforced in software: FLASH_vInit runs
- * milliseconds into boot, well past tVCSL, and the first operation is a read
- * rather than a program, so tPUW is satisfied long before anything writes.
- * Recorded because "the first read at boot is the most exposed one" is a
- * claim this project makes repeatedly (see FLASH_BOOT_PROBE_ROUNDS) and these
- * are the numbers behind it. */
-#define FLASH_TVCSL_US              70U     /* VCC valid -> CS# low for a read */
-#define FLASH_TPUW_MS               3U      /* VCC valid -> program/erase OK   */
+/* Power-up — §7.3, Table 19 (characterised only). Not enforced in software:
+ * FLASH_vInit runs tens of milliseconds into boot, far past tVSL, and the
+ * datasheet gives no separate "power-up to first write" figure (the AT25XE041B
+ * had tPUW; this part's Table 19 has only tVSL). Recorded because "the first
+ * read at boot is the most exposed one" is a claim this project makes
+ * repeatedly (see FLASH_BOOT_PROBE_ROUNDS). §4.3.2: the device also ignores
+ * CS# until it has seen a FALLING edge after power-up, which R1 (10k to VCC)
+ * guarantees by holding CS# high while VCC ramps. */
+#define FLASH_TVSL_US               300U    /* VCC(min) -> CS# low, MIN        */
+#define FLASH_VWI_MAX_MV            1400U   /* write-inhibit threshold, max;
+                                             * 400 mV below the secondary's
+                                             * 1.8 V rail                      */
 
 /* --------------------------------------------------------------------------
  * Driver timeouts
@@ -275,28 +353,35 @@
  * "how long the operation takes" — the driver polls RDY/BSY for that — they
  * are "how long before we declare the bus wedged and give up", and the thing
  * that actually consumes them is a stalled SPI transfer, not a slow flash.
- * FLASH_bDeviceBusy() issues two transfers, each bounded by SPI_TIMEOUT
- * (1000 ms in hal_spi.h), so one poll iteration can itself cost ~2 s.
+ * FLASH_bDeviceBusy() issues two transfers (opcode, then SR1), each bounded by
+ * SPI_TIMEOUT (1000 ms in hal_spi.h), so one poll iteration can itself cost
+ * ~2 s.
+ *
+ * On this part every program, erase (of any size) and WRSR completes within
+ * 12 ms worst case, so the three are kept distinct only so the call sites do
+ * not churn and a future part with genuinely size-dependent erase times slots
+ * back in. They were sized against the AT25XE041B (1.1 s 64 KB erase, 7.6 s
+ * chip erase) and are deliberately NOT shrunk: §1's "constant erase time"
+ * claim is unusual enough that it has not earned a tight timeout until a
+ * bench has timed a real chip erase (see the open items below).
  * -------------------------------------------------------------------------- */
 
-/* Covers a page program (tPP 3.75 ms worst case) and a 4 KB erase (tBLKE 4K,
- * 75 ms worst case) with ~40x margin, and is the general pre-command wait.
- * Bounded at all because the old unbounded `while busy` loop is what turned a
- * single bad SPI transaction into "logging just stopped". */
+/* General pre-command wait and the 4 KB erase budget. 3 s against a 12 ms
+ * worst case. Bounded at all because the old unbounded `while busy` loop is
+ * what turned a single bad SPI transaction into "logging just stopped". */
 #define FLASH_WAIT_READY_TIMEOUT_MS   3000U
 
-/* 64 KB block erase: tBLKE 64K is 1100 ms worst case, so ~9x margin. */
+/* 64 KB block erase: tBLKE-64kB is 12 ms max on this part. */
 #define FLASH_BLOCK_ERASE_TIMEOUT_MS  10000U
 
-/* Chip erase: tCHPE is 7.6 s worst case, so ~4x margin. This one is genuinely
- * close to the spec number rather than orders above it — a chip erase really
- * does take seconds. */
+/* Chip erase: tCE is 12 ms max on this part (Table 23) — the same as a 4 KB
+ * erase. Kept long; see the block comment above. */
 #define FLASH_CHIP_ERASE_TIMEOUT_MS   30000U
 
 /* --------------------------------------------------------------------------
  * Probe and recovery policy
  *
- * Unchanged from the previous part. The reasoning is about the BOARD, not
+ * Unchanged across both part changes. The reasoning is about the BOARD, not
  * about the flash: a single read was not trustworthy on frtag2, V3 RevA has
  * not yet been shown to be any different, and the driver has to survive that
  * without declaring a healthy chip dead.
@@ -341,15 +426,16 @@
 #define FLASH_BOOT_PROBE_SETTLE_MS  50U
 
 /* Bytes sampled per erased region to confirm an erase actually took effect.
- * A protected device ACCEPTS the erase command, never sets RDY/BSY and
- * returns to ready - so FLASH_bWaitReady() succeeds and the erase silently
- * does nothing. Without a read-back the driver reports success and the old
+ * §6.4.5-6.4.8: an erase whose region is protected by BP/CMP "is not
+ * executed" - the device accepts the command, never raises RDY/BSY and
+ * returns to ready, so FLASH_bWaitReady() succeeds and the erase silently does
+ * nothing. Without a read-back the driver reports success and the old
  * contents survive; FOTA would then stage an image over stale bytes and only
  * discover it at the whole-image XOR check, or not at all.
  *
- * On this part EPE (SR1 bit 5) also reports a failed erase directly, and the
- * driver now checks both: EPE catches the case where the erase was attempted
- * and failed, the read-back catches the case where it was never attempted. */
+ * This read-back is the ONLY erase-failure signal on this part. The
+ * AT25XE041B's EPE bit (device-reported erase/program failure) does not exist
+ * here - SR1 bit 5 is BP3 - so the driver no longer checks it. */
 #define FLASH_ERASE_VERIFY_BYTES    32U
 
 /* Erased NOR reads back all-ones. */
@@ -368,10 +454,12 @@
  * bootloader contract is untouched — it only ever reads the scratchpad and
  * the metadata sector.
  *
- * One 4 KB erase per boot against a 100,000-cycle endurance rating (Features,
- * -40 to +85 C) is ~270 years of daily reboots, but the destructive half of
- * the test is still compile-time optional; see ENABLE_FLASH_SELFTEST_DESTRUCTIVE
- * in build_config.h.
+ * ENDURANCE IS 10,000 CYCLES on this part (Features; Rev. E of the datasheet
+ * corrected an earlier "100k" to "10k"), a tenth of the AT25XE041B's. One
+ * 4 KB erase per boot is still ~27 years of daily reboots, but a boot loop
+ * would burn through it in hours, which is one more reason the destructive
+ * half of the test is compile-time optional; see
+ * ENABLE_FLASH_SELFTEST_DESTRUCTIVE in build_config.h.
  * -------------------------------------------------------------------------- */
 #define FLASH_SELFTEST_ADDR         0x07F000UL
 #define FLASH_SELFTEST_LEN          FLASH_SECTOR_SIZE_BYTES
@@ -399,40 +487,56 @@
  * the casualty, the log cannot be where the fault is recorded. BKP0R..BKP2R
  * belong to the bootloader handshake (see Fota_Config.h); BKP4R is free.
  *
- * Layout: [31:16] magic  [15:8] last JEDEC mfr byte  [7:0] status bits. */
+ * Layout: [31:16] magic  [15:8] last JEDEC mfr byte  [7:0] status bits.
+ * Bit 5 was the AT25XE041B's EPE flag; that part is gone and the bit is now
+ * unused, left reserved rather than reassigned so a word written by an
+ * XE041B-era image is never misread as something else. */
 #define FLASH_HEALTH_BKP_MAGIC      0xF1A50000UL
 #define FLASH_HEALTH_BKP_MAGIC_MASK 0xFFFF0000UL
 #define FLASH_HEALTH_BIT_PRESENT     (1UL << 0)  /* gate open              */
 #define FLASH_HEALTH_BIT_EVERABSENT  (1UL << 1)  /* gate has been shut     */
-#define FLASH_HEALTH_BIT_PROTECTED   (1UL << 2)  /* SWP/SPRL seen set      */
+#define FLASH_HEALTH_BIT_PROTECTED   (1UL << 2)  /* BP/SRP0/CMP/SRP1 seen  */
 #define FLASH_HEALTH_BIT_UNPROT_FAIL (1UL << 3)  /* unprotect did not take */
 #define FLASH_HEALTH_BIT_ERASEVFAIL  (1UL << 4)  /* erase did not blank    */
-#define FLASH_HEALTH_BIT_EPE         (1UL << 5)  /* device reported EPE    */
+/*      bit 5 reserved (was AT25XE041B EPE)                                */
 
 /* --------------------------------------------------------------------------
- * Values NOT confirmed from DS-AT25XE041B-062 Rev. I
+ * Open items — not confirmed from DS-AT25EU0041A-212 Rev. E
  *
- * 1. tWRSR ("Write Status Register Time", §13.3 Table 18) reads as 200 with
- *    the units column aligning to ns, which is implausibly short for an
- *    operation the same document describes as self-timed. Immaterial here —
- *    the driver waits on RDY/BSY, never on a fixed delay — so no constant is
- *    published for it rather than publishing one that may be a
- *    column-alignment artefact.
- *    TODO: confirm from datasheet §13.3 Table 18.
+ * 1. Table 23's min/typ/max columns are read from a text extraction; single-
+ *    value entries (tDP 3 us, tRES1 8 us, tRST 300 us, fR 50 MHz, fC 80 MHz)
+ *    are taken as maxima and tVSL 300 us as a minimum, which is how every
+ *    other Winbond-style datasheet lays out those rows. Immaterial in the
+ *    direction that matters: the driver's waits are at or above them and the
+ *    bus runs at a quarter of fR.
+ *    TODO: confirm against the PDF table.
  *
- * 2. The span of a protection "sector" for 36h / 39h / 3Ch (§9.3-9.6) is not
- *    stated in a form that could be read back reliably. Per-sector
- *    protect/unprotect is therefore declared above but deliberately never
- *    issued; only Global Unprotect is used, whose behaviour is fully
- *    specified in Table 4.
- *    TODO: confirm from datasheet §9.3.
+ * 2. Whether deep power-down (B9h) is refused while RDY/BSY = 1. §6.3.1 says
+ *    ABh is ignored while busy; §6.3.7 says nothing for B9h. frtag2 field
+ *    history on this same part number is that B9h issued mid-program ABORTED
+ *    the program and left the page half-written, so FLASH_vDeepPowerDown
+ *    checks busy first regardless.
  *
- * 3. Whether RSTE survives an Ultra-Deep Power-Down exit. §12.7 says the
- *    Reset command does not change RSTE; §12.5.3 says all internal registers
- *    return to the power-on default on UDPD exit. The two are not reconciled
- *    for RSTE specifically. Immaterial because the Reset command is never
- *    issued, but noted rather than assumed.
- *    TODO: confirm from datasheet §12.5.3.
+ * 3. The strength of the internal WP#/HOLD# pull-ups (Table 1 says only
+ *    "internally pulled high"). A weak pull-up on the unconnected HOLD# pad
+ *    is a plausible coupling path for the TX-correlated read corruption this
+ *    project is still chasing: HOLD# low pauses the transfer (§4.5) and the
+ *    result would classify as "shifted" in Flash_SelfTest.
+ *    TODO: bench - scope pin 7 during a LoRa TX burst.
+ *
+ * 4. Whether a 66h/99h software reset clears Power Supply Lock-Down
+ *    (SRP1:SRP0 = 1:0). Table 5 note 1 names only a power cycle; §6.4.14 says
+ *    reset returns the device to "its default power-on state" and drops
+ *    VOLATILE settings. If it did, it would be a field recovery path for a
+ *    locked SR on a battery unit that never power-cycles. Not used until
+ *    confirmed.
+ *    TODO: confirm with Renesas or on a bench part.
+ *
+ * 5. §1's constant erase time (8 ms typ / 12 ms max for page, 4/32/64 KB and
+ *    chip erase alike). The timeouts above do not depend on it, but the
+ *    self-test and OTA erase durations in field logs will look very different
+ *    from XE041B-era bench notes.
+ *    TODO: bench - time a 4 KB, 64 KB and chip erase on a real unit.
  * -------------------------------------------------------------------------- */
 
 #endif /* DEVICE_FLASH_FLASH_CONFIG_H_ */

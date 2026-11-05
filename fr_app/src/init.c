@@ -5,10 +5,10 @@
  * Runs once immediately after the scheduler starts, initialises all
  * hardware and software subsystems in the correct order, then exits.
  *
- * The board GPIO safe state (LEDs, enables, chip-selects, RF switch, unused
- * pins) is NOT set here. HAL_GPIO_vInit() runs in main(), right after
- * HAL_Init() and before SystemClock_Config(): when the image runs without the
- * bootloader, the LSE start there can take seconds, and PA0/PA4/PB2/PA9/PA11 have no external pulls, so the pins
+ * The board GPIO safe state (LEDs, enables, chip-selects, unused pins) is NOT
+ * set here. HAL_GPIO_vInit() runs in main(), right after HAL_Init() and
+ * before SystemClock_Config(): when the image runs without the bootloader,
+ * the LSE start there can take seconds, and PA0/PA4/PA11 have no external pulls, so the pins
  * have to reach a safe state before it rather than after it.
  *
  * Order matters:
@@ -46,6 +46,7 @@
 
 #include "Movement.h"
 #include "LoraRadio.h"
+#include "radio_board_if.h"   /* RBI_vSetPrimaryRole - per-role TCXO supply */
 #include "MeshNetwork.h"
 #include "DeviceDiscovery.h"
 #include "Farmranger.h"
@@ -84,6 +85,11 @@ void INIT_vInitialization(void *parameters)
      * strap on every (re-)init. */
     DEVICE_DISCOVERY_vConfigDeviceRole();
     HAL_UART_vSetRole(DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
+
+    /* The two roles also run from different rails (secondary 1.8 V, primary
+     * 3.0 V), which sets how high the radio may drive its TCXO supply. Latch
+     * that too, before LORARADIO_vInit() below first starts the TCXO. */
+    RBI_vSetPrimaryRole(DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
     HAL_UART_vInit();
 
@@ -283,7 +289,18 @@ void INIT_vInitialization(void *parameters)
 #endif /* FRKERNEL_INTERFACE_LORA_BRIDGE */
 
     TIME_vInit();
-    BAT_vInit();
+
+    /* Battery measurement exists on a SECONDARY only. The final primary
+     * daughter board (Tagskaap3RevA_DB) takes its VBAT from the fr9 and has no
+     * divider, no bias switch and nothing on PA4/PA12, so sampling there would
+     * report a floating ADC pin as a battery voltage in every DBG_LOG prefix
+     * and every beacon. Without BAT_vInit() BAT_u16GetVoltage() reads 0 and
+     * BAT_bHasValidSample() stays false; the only consumer that acts on the
+     * value (POWER_vInit's state manager) already runs on a secondary only. */
+    if (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY)
+    {
+        BAT_vInit();
+    }
     POWER_vInit();
 
     /* Peripheral smoke test — checks GPS UART and ACC WHO_AM_I on a secondary,

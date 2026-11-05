@@ -7,7 +7,7 @@
  *
  * HAL_GPIO_vInit() is called from main(), right after HAL_Init() and before
  * SystemClock_Config(). Several board pins have no external pull (PA0, PA4,
- * PB2, PA9, PA11) and float from reset until firmware drives them. When the
+ * PA11) and float from reset until firmware drives them. When the
  * image starts without the bootloader (a debugger launch), the LSE start
  * inside SystemClock_Config() can take up to LSE_STARTUP_TIMEOUT (5 s) - or
  * end in Error_Handler() if the crystal never starts - so the safe state goes
@@ -26,7 +26,6 @@
 
 #include "hal_gpio.h"
 #include "hal_bsp.h"
-#include "hal_subghz.h"
 
 #include "stm32wlxx.h"
 
@@ -42,13 +41,16 @@ void HAL_GPIO_vInit(void)
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    /* LEDs: both come up lit, as the boot indicator. Done first so that an
-     * image started without the bootloader that then hangs in the LSE start
-     * (SystemClock_Config, which main() calls right after this function)
+    /* LEDs: red and green come up lit, as the boot indicator. Done first so
+     * that an image started without the bootloader that then hangs in the LSE
+     * start (SystemClock_Config, which main() calls right after this function)
      * shows two solid LEDs rather than looking dead. Behind the bootloader an
-     * LSE failure hangs before the application runs at all. */
+     * LSE failure hangs before the application runs at all. The third LED
+     * (PB4: blue on a secondary, yellow on a primary) is driven OFF here and
+     * is not part of the boot indicator - see LED_AUX in hal_bsp.h. */
     BSP_LED_Init(LED_RED);
     BSP_LED_Init(LED_GREEN);
+    BSP_LED_Init(LED_AUX);
 
     /* PA0, low. Role-dependent and initialised here only: the GNSS LDO enable
      * on a SECONDARY, the fr9 wake line on a PRIMARY (see hal_bsp.h). Low means
@@ -89,12 +91,12 @@ void HAL_GPIO_vInit(void)
      * hal_adc. */
     HAL_GPIO_vInitOutput(BSP_BAT_BIAS_ENABLE_PORT, BSP_BAT_BIAS_ENABLE_PIN, GPIO_PIN_RESET);
 
-    /* RF switch — supply rail off, path select LOW (RX/OFF).
-     * VDD last of the two, and both low: the radio is asleep at this point, and
-     * CTRL must never be high while VDD is at 0 V (see
-     * HAL_SUBGHZ_vRfSwitchPowerOff). hal_subghz owns both pins from here on. */
-    HAL_GPIO_vInitOutput(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_vInitOutput(BSP_RF_SW_VDD_PORT,  BSP_RF_SW_VDD_PIN,  GPIO_PIN_RESET);
+    /* PB2 and PA9, unconnected on both final boards. They drove a GPIO-powered
+     * RF switch on the pre-production board; the final layout has no switch
+     * (see the RF front-end note in hal_bsp.h). Both reset analog already, so
+     * this only makes the state explicit and clears any pull. */
+    HAL_GPIO_vInitAnalogNoPull(BSP_UNUSED_PB2_PORT, BSP_UNUSED_PB2_PIN);
+    HAL_GPIO_vInitAnalogNoPull(BSP_UNUSED_PA9_PORT, BSP_UNUSED_PA9_PIN);
 
     /* VSOLAR_MEAS (PB3) resets as AF0 JTDO/TRACESWO, which leaves a digital
      * input stage sitting on the solar divider voltage until hal_adc takes the
@@ -106,10 +108,6 @@ void HAL_GPIO_vInit(void)
      * pull could only fight the strap. DEVICE_DISCOVERY_vConfigDeviceRole()
      * reads it once and then parks it analog with the pull cleared. */
     HAL_GPIO_vInitInput(BSP_ROLE_BIT0_PORT, BSP_ROLE_BIT0_PIN, GPIO_NOPULL);
-
-    /* PB4, unused. It resets as AF0 NJTRST with the internal pull-up on; park
-     * it analog and clear that pull. */
-    HAL_GPIO_vInitAnalogNoPull(BSP_UNUSED_PB4_PORT, BSP_UNUSED_PB4_PIN);
 
     /* PC13 = ACC_INT, routed from the LIS2DH INT1 but unused (and undriven on a
      * primary, where no accelerometer is fitted). Parked analog with no pull on
@@ -142,11 +140,11 @@ void HAL_GPIO_vInit(void)
  * NOT parked, and intentionally held across STOP2 to keep externals in a known
  * state (GPIO state is retained in STOP2, so driven pins keep their level):
  * PA0 (GNSS_ON on a secondary / fr9 wake on a primary) at whatever level its
- * owner drives, PA4 BAT_BIAS low, PA9 RF_SW_CTRL, PB2 RF_SW_VDD, PA11 ACC_CS
- * high, PA15 FLASH_CS high, and the PB5/PB8 LEDs.
+ * owner drives, PA4 BAT_BIAS low, PA11 ACC_CS high, PA15 FLASH_CS high, and
+ * the PB4/PB5/PB8 LEDs.
  *
  * Parked once and never re-parked: PB12 (ROLE_BIT0, parked analog by the role
- * read at boot), PB4 and PC13 (parked by HAL_GPIO_vInit), and the ADC inputs
+ * read at boot), PB2, PA9 and PC13 (parked by HAL_GPIO_vInit), and the ADC inputs
  * PA12/PB3 (analog). Nothing re-drives any of them, so they need no entry
  * here. PC13 in particular must stay out of these masks if ACC_INT is ever used
  * as an EXTI wake source: re-parking it at every STOP2 entry would silently
@@ -154,38 +152,12 @@ void HAL_GPIO_vInit(void)
  *
  * PA13/PA14 (SWD) are deliberately absent: they stay in their reset debug
  * function at all times, STOP2 included.
- *
- * The two RF switch pins are deliberately NOT parked: this MCU does enter STOP2
- * with the radio still awake. LORARADIO_vRadioTask leaves the chip in
- * continuous RX and then blocks, holding no sleep lock, so an idle tag sleeps
- * with an RX window open — and a "tag radiotest" secondary does the same via
- * bKeepAwake. Parking RF_SW_VDD analog there would drop the switch mid-receive
- * and the unit would go deaf without any code saying it had. The radio's own
- * sleep state is what gates the rail, not the MCU's: see
- * HAL_SUBGHZ_vRfSwitchPowerOn / _vRfSwitchPowerOff, called from the radio wake
- * and sleep paths. HAL_GPIO_vOnSleep below drives both pins low explicitly when
- * the radio IS asleep rather than assuming they are already low. */
+ */
 #define HAL_GPIO_SLEEP_ANALOG_GPIOA  (BSP_DEBUG_UART_TX_PIN | BSP_DEBUG_UART_RX_PIN)
 #define HAL_GPIO_SLEEP_ANALOG_GPIOB  (BSP_GPS_UART_TX_PIN | BSP_GPS_UART_RX_PIN)
 
 void HAL_GPIO_vOnSleep(void)
 {
-    /* RF switch. If the radio is asleep the switch rail must be down for the
-     * duration, and driven low rather than assumed low — and driven low here,
-     * before any pin is reconfigured to analog below. CTRL first, then VDD:
-     * CTRL high with VDD at 0 V forward-biases the CTRL ESD diode and
-     * parasitically powers the switch die (see HAL_SUBGHZ_vRfSwitchPowerOff).
-     *
-     * If the radio is AWAKE, both pins are left exactly as the radio set them.
-     * This MCU does enter STOP2 with an RX window open (see the note on the
-     * sleep mask above), and dropping the rail under a live receive would make
-     * the unit deaf with nothing in the log to say why. */
-    if (!HAL_SUBGHZ_bRfSwitchPowered())
-    {
-        HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(BSP_RF_SW_VDD_PORT,  BSP_RF_SW_VDD_PIN,  GPIO_PIN_RESET);
-    }
-
     /* Park the UART AF pins as analog BEFORE gating the port clocks (register
      * writes need the clock on). The SPI pins were already parked by
      * HAL_SPI_vOnSleep(), which the caller runs just before this function. */

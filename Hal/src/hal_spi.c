@@ -5,7 +5,7 @@
  *   SPI1 — accelerometer (LIS2DH or compatible), PA1/PA6/PA7/PA11.
  *          Fitted on a SECONDARY only: a Tagskaap V3 RevA primary has no
  *          accelerometer, so SPI1 is never started there.
- *   SPI2 — external NOR flash (AT25XE041B),     PA5/PA8/PA10/PA15.
+ *   SPI2 — external NOR flash (AT25EU0041A),    PA5/PA8/PA10/PA15.
  *          Fitted on both roles.
  *
  * Each bus has its own init. HAL_SPI_FLASH_vInit() runs on both roles, once at
@@ -326,8 +326,9 @@ static void HAL_SPI_vInitAfPin(GPIO_TypeDef *pPort, uint32_t u32Pin, uint32_t u3
  * what this does. On the flash bus it also fixes a real wrinkle: SCK used to
  * inherit the MISO pin's pull-up, so the first command after every STOP2 wake
  * began with SCK HIGH at the CS falling edge (mode-3 framing) followed by an
- * extra SCK falling edge when SPE came on. The AT25XE041B accepts mode 3, so it
- * worked, but an extra SCK edge is exactly the transport fault Flash_SelfTest's
+ * extra SCK falling edge when SPE came on. The AT25EU0041A accepts mode 3 (its
+ * datasheet §4: modes 0 and 3), so it worked, but an extra SCK edge is
+ * exactly the transport fault Flash_SelfTest's
  * "shifted" classification exists to catch. The vendor HAL_GPIO_Init writes
  * the pull before it switches the mode, so the pull is in place before the pin
  * becomes AF.
@@ -379,10 +380,11 @@ void HAL_SPI_MspInit(SPI_HandleTypeDef *spiHandle)
          *
          * GPIO_SPEED_FREQ_HIGH on all three signal pins, raised from LOW when
          * the bus went from 750 kHz to 12 MHz. A LOW-speed pad's slew is
-         * specified for far slower edges than a 12 MHz clock needs, and on a
-         * 2.0 V rail the margin between a slow edge and a missed setup time is
-         * not somewhere to economise - this driver is being asked to prove
-         * that reads are trustworthy, so the pads must not be the reason they
+         * specified for far slower edges than a 12 MHz clock needs, and on the
+         * secondary's 1.8 V rail (the flash's VIH is 0.8 x VCC, Table 20 of
+         * its datasheet) the margin between a slow edge and a missed setup
+         * time is not somewhere to economise - this driver is being asked to
+         * prove that reads are trustworthy, so the pads must not be the reason they
          * are not.
          *
          * The other side of that trade is not settled, though. The likelier

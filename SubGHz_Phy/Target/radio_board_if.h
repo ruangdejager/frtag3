@@ -29,6 +29,8 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "platform.h"
 /* USER CODE BEGIN include */
+#include <stdbool.h>
+#include <stdint.h>
 
 /* USER CODE END include */
 
@@ -155,6 +157,19 @@ typedef enum
 
 /* Exported macro ------------------------------------------------------------*/
 /* USER CODE BEGIN EM */
+
+/* Per-role TCXO supply (frtag3). The two Tagskaap V3 RevA boards run the MCU
+ * from different rails - 1.8 V on the secondary, 3.0 V on the primary
+ * daughter board - and the radio's TCXO regulator (PB0, VDD_TCXO) can only
+ * produce a voltage some way below its own supply, so one fixed
+ * TCXO_CTRL_VOLTAGE cannot suit both. RBI_vSetPrimaryRole() is called once at
+ * boot, right after the role strap is read (init.c) and before the first
+ * radio init; RBI_u8GetTcxoVoltage() is what TCXO_CTRL_VOLTAGE in
+ * radio_conf.h expands to. The value is a RadioTcxoCtrlVoltage_t
+ * (radio_driver.h), carried as uint8_t so this header does not need the
+ * driver's types. See radio_conf.h for the choice of each value. */
+void    RBI_vSetPrimaryRole(bool bPrimary);
+uint8_t RBI_u8GetTcxoVoltage(void);
 
 /* USER CODE END EM */
 

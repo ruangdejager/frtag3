@@ -78,9 +78,11 @@ static uint8_t au8Actual[FLASH_SELFTEST_PATTERN_LEN];
  * The four outcomes point at four different physical causes, which is the
  * whole reason for classifying rather than counting:
  *
- *   all FFh   the device is not driving MISO. Still in ultra-deep-power-down
- *             (an unhonoured tXUDPD), still busy, absent, or CS never went low
- *             - the pull-up on PA5 is what makes an undriven line read as FFh.
+ *   all FFh   the device is not driving MISO. Still in deep power-down (a
+ *             missed ABh or an unhonoured tRES1 - parked, the part ignores
+ *             every command but ABh, §6.3.7), still busy, absent, or CS never
+ *             went low - the pull-up on PA5 is what makes an undriven line
+ *             read as FFh.
  *   all 00h   MISO is being held low: a short, a pin still parked from STOP2
  *             and never restored to its alternate function, or CS stuck
  *             asserted so the device never started the transaction.
@@ -269,31 +271,45 @@ Flash_SelfTestResult_t FLASH_eSelfTest(void)
         return FLASH_ST_FAIL_WRONG_PART;
     }
 
-    /* ---- 2. Status register ------------------------------------------------
+    /* ---- 2. Status registers -----------------------------------------------
      *
-     * Reported by name, not as a hex byte to be decoded by hand. WEL set while
-     * idle is a finding in itself: it means a previous command sequence was
-     * interrupted after its WREN, and on this board - WP# grounded, SPRL a
-     * one-way latch - an armed device is one stray WRSR away from being
-     * permanently write-locked. */
+     * Reported by name, not as hex bytes to be decoded by hand. Both
+     * registers: on this part SR2 carries CMP and SRP1, and CMP alone can
+     * protect the whole array (Table 7). WEL set while idle is a finding in
+     * itself: it means a previous command sequence was interrupted after its
+     * WREN, and an armed device is one stray WRSR away from SRP1 = 1 - Power
+     * Supply Lock-Down, which only a power cycle clears (Table 5). */
     uint8_t u8Sr1 = FLASH_u8ReadStatusReg();
+    uint8_t u8Sr2 = FLASH_u8ReadStatusReg2();
 
-    _DBG_LOG_("FlashTest: SR1=%02X SPRL=%u SPM=%u EPE=%u WPP=%u(WP#%s) SWP=%u "
-              "WEL=%u BSY=%u\r\n",
+    _DBG_LOG_("FlashTest: SR1=%02X SRP0=%u BP=%02X WEL=%u BSY=%u | "
+              "SR2=%02X SUS=%u CMP=%u LB=%u QE=%u SRP1=%u\r\n",
               u8Sr1,
-              (unsigned)((u8Sr1 & FLASH_SR1_SPRL)    ? 1U : 0U),
-              (unsigned)((u8Sr1 & FLASH_SR1_SPM)     ? 1U : 0U),
-              (unsigned)((u8Sr1 & FLASH_SR1_EPE)     ? 1U : 0U),
-              (unsigned)((u8Sr1 & FLASH_SR1_WPP)     ? 1U : 0U),
-              (u8Sr1 & FLASH_SR1_WPP) ? "=high" : "=GND",
-              (unsigned)((u8Sr1 & FLASH_SR1_SWP_MASK) >> 2),
+              (unsigned)((u8Sr1 & FLASH_SR1_SRP0)    ? 1U : 0U),
+              (unsigned)((u8Sr1 & FLASH_SR1_BP_MASK) >> FLASH_SR1_BP_SHIFT),
               (unsigned)((u8Sr1 & FLASH_SR1_WEL)     ? 1U : 0U),
-              (unsigned)((u8Sr1 & FLASH_SR1_RDY_BSY) ? 1U : 0U));
+              (unsigned)((u8Sr1 & FLASH_SR1_RDY_BSY) ? 1U : 0U),
+              u8Sr2,
+              (unsigned)((u8Sr2 & FLASH_SR2_SUS)     ? 1U : 0U),
+              (unsigned)((u8Sr2 & FLASH_SR2_CMP)     ? 1U : 0U),
+              (unsigned)((u8Sr2 & FLASH_SR2_LB_MASK) >> FLASH_SR2_LB_SHIFT),
+              (unsigned)((u8Sr2 & FLASH_SR2_QE)      ? 1U : 0U),
+              (unsigned)((u8Sr2 & FLASH_SR2_SRP1)    ? 1U : 0U));
 
     if (u8Sr1 & FLASH_SR1_WEL)
         DBG_LOG("FlashTest: WEL is SET at idle - a command sequence was "
-                "interrupted after its WREN. With WP# grounded an armed device "
-                "is one stray WRSR from a permanent write-lock\r\n");
+                "interrupted after its WREN. An armed device is one stray WRSR "
+                "from an SR lock-down that only a power cycle clears\r\n");
+
+    if (u8Sr2 & FLASH_SR2_SUS)
+        DBG_LOG("FlashTest: SUS is SET - a program/erase was suspended (75h), "
+                "which this firmware never issues. The page/block it was "
+                "working on is incomplete\r\n");
+
+    if (u8Sr2 & FLASH_SR2_QE)
+        DBG_LOG("FlashTest: QE is SET - pins 3/7 are IO2/IO3 instead of "
+                "WP#/HOLD#. Harmless for single-SPI, but not the factory state "
+                "and not what Flash_Config.h assumes\r\n");
 
     if (u8Sr1 & FLASH_SR1_RDY_BSY)
     {
@@ -305,15 +321,19 @@ Flash_SelfTestResult_t FLASH_eSelfTest(void)
         return FLASH_ST_FAIL_BUSY_STUCK;
     }
 
-    if (u8Sr1 & FLASH_STATUS_PROTECTED)
+    if ((u8Sr1 & FLASH_STATUS_PROTECTED) || (u8Sr2 & FLASH_STATUS2_PROTECTED))
     {
         /* FLASH_bRecoverDevice above has already run bring-up, which performs
-         * a Global Unprotect. Still protected here means the unprotect did not
-         * take - and with WP# grounded and SPRL latched, cannot. */
-        DBG_LOG("FlashTest: array still protected after bring-up (SWP=%u "
-                "SPRL=%u) - writes and erases will be silently refused\r\n",
-                (unsigned)((u8Sr1 & FLASH_SR1_SWP_MASK) >> 2),
-                (unsigned)((u8Sr1 & FLASH_SR1_SPRL) ? 1U : 0U));
+         * a Global Unprotect when it sees any of these. Still set here means
+         * the unprotect did not take - with SRP1 = 1 it cannot until a power
+         * cycle (lock-down) or ever (OTP), Table 5. */
+        DBG_LOG("FlashTest: still protected after bring-up (BP=%02X CMP=%u "
+                "SRP1:SRP0=%u:%u) - writes and erases will be silently "
+                "refused\r\n",
+                (unsigned)((u8Sr1 & FLASH_SR1_BP_MASK) >> FLASH_SR1_BP_SHIFT),
+                (unsigned)((u8Sr2 & FLASH_SR2_CMP)  ? 1U : 0U),
+                (unsigned)((u8Sr2 & FLASH_SR2_SRP1) ? 1U : 0U),
+                (unsigned)((u8Sr1 & FLASH_SR1_SRP0) ? 1U : 0U));
         return FLASH_ST_FAIL_PROTECTED;
     }
 

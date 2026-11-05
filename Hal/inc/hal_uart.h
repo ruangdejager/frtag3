@@ -64,7 +64,7 @@ void HAL_UART_vInit(void);
  * can choose the USART1 baud and HAL_UART_vEnable() the PB6/PB7 drive mode
  * without re-reading PB12. Call before the first HAL_UART_vInit() and before
  * any HAL_UART_vEnable() of GPS_UART; until then the default is the SECONDARY
- * (GNSS-safe, open-drain) configuration. */
+ * (GNSS) configuration. */
 void HAL_UART_vSetRole(bool bPrimary);
 void HAL_UART_vSetup(hal_uart_t *drv, hal_uart_id_t uart_id, hal_uart_fc_t flowcontrol);
 void HAL_UART_vClearBuffer(hal_uart_t *drv);

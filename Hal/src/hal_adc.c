@@ -3,8 +3,9 @@
  *
  * ADC driver — battery (PA12/IN8), VSOLAR (PB3/IN2), plus the internal
  * VREFINT channel. VREFINT is converted alongside every external sample to
- * measure the true VDDA (the ADC reference; 2.0 V nominal on Tagskaap V3
- * RevA), so no result depends on the rail being exactly nominal.
+ * measure the true VDDA (the ADC reference; 1.8 V nominal on the Tagskaap
+ * V3 RevA secondary, 3.0 V on the primary), so no result depends on the rail
+ * being exactly nominal.
  *
  * The peripheral is shared. Use HAL_ADC_vLock / HAL_ADC_vUnlock around
  * each full enable → convert → disable sequence.
@@ -292,8 +293,9 @@ uint16_t HAL_ADC_u16VddaFromVrefint(uint16_t u16VrefintRaw)
     /* __LL_ADC_CALC_VREFANALOG_VOLTAGE uses the factory VREFINT_CAL, acquired
      * at Vref+ = VDDA = 3.3 V (VREFINT_CAL_VREF in stm32wlxx_ll_adc.h), to
      * recover the true VDDA from a VREFINT conversion. The result does not
-     * depend on the nominal rail, which is 2.0 V on Tagskaap V3 RevA (raw
-     * around 2480 with a typical VREFINT_CAL).
+     * depend on the nominal rail, which is 1.8 V on the Tagskaap V3 RevA
+     * secondary (raw around 2760 with a typical VREFINT_CAL) and 3.0 V on the
+     * primary (raw around 1650).
      *
      * Range-check the full 32-bit quotient BEFORE narrowing it. A garbage raw
      * such as 73 gives ~68 V (67989 mV), which a (uint16_t) cast would wrap to

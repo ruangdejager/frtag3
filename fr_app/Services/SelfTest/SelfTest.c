@@ -140,18 +140,20 @@ void SELFTEST_vRunAndReport(void)
          * that was clean, and the distinction is invisible from "flash=OK". */
         Flash_Health_t tHealth;
         FLASH_vGetHealth(&tHealth);
-        /* bWriteProtected is deliberately NOT a trigger any more. On the
-         * AT25XE041B the array's power-on default is protected and every
-         * ultra-deep-power-down exit restores that default, so bring-up clears
-         * it on literally every boot - printing a health line for it would
-         * make the one line that means "something is wrong" fire every time
-         * and stop meaning anything. What still matters is an unprotect that
-         * did NOT take. */
-        if (tHealth.bEverAbsent || tHealth.bUnprotectFailed ||
-            tHealth.bEraseVerifyFail || tHealth.bEpeSeen ||
+        /* bWriteProtected IS a trigger again. On the AT25XE041B (briefly
+         * targeted during V3 bring-up) the array's power-on default was
+         * protected and every ultra-deep-power-down exit restored it, so it
+         * fired on every boot and had to be excluded. The AT25EU0041A that
+         * V3 RevA actually fits powers up unprotected (Table 3) with
+         * non-volatile protection bits, so a protected state seen at bring-up
+         * means something wrote the status register - worth the line even
+         * when the unprotect then succeeded. (The XE041B's EPE counter is
+         * gone: this part has no such bit.) */
+        if (tHealth.bEverAbsent || tHealth.bWriteProtected ||
+            tHealth.bUnprotectFailed || tHealth.bEraseVerifyFail ||
             (tHealth.u16ReadCrcFails > 0U))
             DBG_LOG("SelfTest: flash health - absent=%u recoveries=%u probeFails=%u "
-                    "wprot=%u unprotFail=%u eraseVfyFails=%u epe=%u "
+                    "wprot=%u unprotFail=%u eraseVfyFails=%u "
                     "crcRetries=%u crcFails=%u\r\n",
                     (unsigned)tHealth.bEverAbsent,
                     (unsigned)tHealth.u16Recoveries,
@@ -159,7 +161,6 @@ void SELFTEST_vRunAndReport(void)
                     (unsigned)tHealth.bWriteProtected,
                     (unsigned)tHealth.bUnprotectFailed,
                     (unsigned)tHealth.u16EraseVerifyFails,
-                    (unsigned)tHealth.u16EpeFails,
                     (unsigned)tHealth.u16ReadCrcRetries,
                     (unsigned)tHealth.u16ReadCrcFails);
     }

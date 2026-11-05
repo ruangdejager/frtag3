@@ -1,7 +1,7 @@
 /*
  * Log.h
  *
- * Circular FIFO text log on external NOR flash (AT25XE041B, 512 KB).
+ * Circular FIFO text log on external NOR flash (AT25EU0041A, 512 KB).
  *
  * FIFO semantics: u32WriteAddr is the head, u32StartAddr is the tail.
  * When the log wraps and a sector is erased, the tail advances past the

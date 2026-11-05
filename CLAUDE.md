@@ -3,9 +3,12 @@
 Firmware for the Farmranger LoRa tag (STM32WLE5CC, FreeRTOS, STM32CubeIDE).
 
 frtag3 is a fork of `../frtag2` created for new hardware with a slightly different pin
-configuration. It targets the Tagskaap V3 RevA board: VDD 2.0 V (frtag2 ran at 1.8 V); GNSS
-and accelerometer fitted on secondaries only; no USART1 TX/RX swap (the primary needs an fr9
-with the corrected TX/RX crossing). See `Hal/hal_bsp.h` for the pin map.
+configuration. It targets two Tagskaap V3 RevA boards, told apart by the ROLE_BIT0 strap:
+the secondary collar tag (`Tagskaap3RevA`, VDD 1.8 V) and the primary daughter board that
+plugs into the fr9 (`Tagskaap3RevA_DB`, VDD 3.0 V, powered and enabled by the fr9). GNSS,
+accelerometer and battery/solar measurement are fitted on secondaries only; no RF switch
+(RFO_LP direct tie); no USART1 TX/RX swap (the primary needs an fr9 with the corrected TX/RX
+crossing). See `Hal/hal_bsp.h` for the pin map.
 
 ## Working rules
 
@@ -134,9 +137,10 @@ image's true version from the bytes themselves rather than from a filename or ma
    mismatch. This gate exists because on 2026-09-01 three releases produced identical size
    and xor8, and an old image was served under a new version number.
 4. Publishes the app-only `.bin` plus `version.json` into
-   `C:\Code\farmranger-firmware\frtag3-firmware` and
-   `C:\Code\frtag-firmware-inhouse\frtag3-firmware`. It writes files only — it never commits
-   or pushes those repos.
+   `C:\Code\farmranger-firmware\frtag3-firmware`,
+   `C:\Code\frtag-firmware-inhouse\frtag3-firmware` and
+   `C:\Code\frtag-firmware-dev\frtag3-firmware` (creating the folder if missing). It writes
+   files only — it never commits or pushes those repos.
 
 frtag3 has no bootloader project of its own yet, so the script still reads the bootloader hex
 from `../frtag2_bootloader`.

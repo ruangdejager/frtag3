@@ -59,6 +59,8 @@ uint32_t u32GetCSR(void);
 /* Private defines -----------------------------------------------------------*/
 #define VSOLAR_MEAS_VOLT_Pin GPIO_PIN_3
 #define VSOLAR_MEAS_VOLT_GPIO_Port GPIOB
+#define LED_BLUE_Pin GPIO_PIN_4
+#define LED_BLUE_GPIO_Port GPIOB
 #define LED_RED_Pin GPIO_PIN_5
 #define LED_RED_GPIO_Port GPIOB
 #define GNSS_RX_Pin GPIO_PIN_6
@@ -85,10 +87,6 @@ uint32_t u32GetCSR(void);
 #define ACC_SI_GPIO_Port GPIOA
 #define FLASH_SCLK_Pin GPIO_PIN_8
 #define FLASH_SCLK_GPIO_Port GPIOA
-#define RF_SW_CTRL_Pin GPIO_PIN_9
-#define RF_SW_CTRL_GPIO_Port GPIOA
-#define RF_SWITCH_ON_Pin GPIO_PIN_2
-#define RF_SWITCH_ON_GPIO_Port GPIOB
 #define ROLE_BIT0_Pin GPIO_PIN_12
 #define ROLE_BIT0_GPIO_Port GPIOB
 #define FLASH_MOSI_Pin GPIO_PIN_10

@@ -4,11 +4,12 @@
  * Farmranger device layer — UART-based AT command interface to the
  * companion logger board.
  *
- * Uses CMSIS-RTOS v2 throughout.  The data-send path paces the upload one
- * row at a time: each row is copied into the interrupt-driven TX ring, then
- * the sender polls HAL_UART_bTxIdle() until that row has fully left the wire
- * and pauses FR_LOG_ROW_GAP_MS before the next, so at most one row is ever in
- * flight and the fr9's RX ring cannot overflow (see FR_LOG_ROW_GAP_MS in
+ * Uses CMSIS-RTOS v2 throughout.  The data-send path (AT+BLOG) paces the
+ * upload one chunk at a time: the header, then up to FR_BLOG_RECS_PER_CHUNK
+ * records per chunk, each copied into the interrupt-driven TX ring; the sender
+ * polls HAL_UART_bTxIdle() until that chunk has fully left the wire and pauses
+ * FR_LOG_ROW_GAP_MS before the next, so at most one chunk is ever in flight
+ * and the fr9's RX ring cannot overflow (see FR_LOG_ROW_GAP_MS in
  * Farmranger.c).
  *
  * Hardware (frtag3, Tagskaap V3 RevA, PRIMARY role only): the fr9 link is
@@ -52,14 +53,80 @@ uint64_t FARMRANGER_u64RequestTimestamp(void);
 bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
                                      bool    *pbBasicMode,
                                      bool    *pbGpsEnabled);
-bool     FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count);
+/* AT+LOG (CSV) upload removed — primary speaks AT+BLOG only now. */
 
-/* Basic-mode variant: uploads the primary's accumulated MeshBasicNeighbor_t
- * RAM store to fr9 (same AT+LOG framing, different per-row column set —
- * see FARMRANGER_iFormatBasicRow). Called at each WakeupInterval boundary
- * in basic mode. fr9 side treats the payload as opaque bytes so no
- * parser change is needed there. */
-bool     FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
+/* ---- Binary discovery upload (AT+BLOG) ----------------------------------
+ *
+ * The only upload path. Roughly half the bytes of the old CSV framing, and
+ * a CRC-16 so a corrupted transfer is detected rather than logged.
+ *
+ * The fr9 no longer merely counts records and streams the bytes into its log:
+ * it decodes them, keeps them, and POSTs the campaign to the server as CBOR.
+ * That is what makes this worth changing - discovery data used to reach the
+ * server only by being scraped back out of an uploaded syslog.
+ *
+ * Wire format, and it is a CONTRACT - the fr9's tag_disc.h documents the same
+ * layout and has to be changed in step:
+ *
+ *     tag: AT+BLOG=<payload_len>,<primaryVerMMmmpp>,<crc16hex>\r\n
+ *     fr9: Logger ready\r\n
+ *     tag: <payload_len> raw bytes
+ *     fr9: OK\r\n on a length and CRC match, ERR\r\n otherwise
+ *
+ * Payload header, FR_BLOG_HDR_BYTES bytes, little-endian, then <count> records:
+ *
+ *     u8   format version    (FR_BLOG_FORMAT_VER)
+ *     u8   record type       (FR_BLOG_TYPE_ADVANCED | FR_BLOG_TYPE_BASIC)
+ *     u16  record count
+ *     u32  this primary's own device id (LORARADIO_u32GetUniqueId())
+ *     u32  discovery duration, seconds — wall time from this wake's first
+ *          DBG_LOG to "Discovery complete" (see DeviceDiscovery.c's
+ *          u32CampaignStartMs). 0 on the basic-mode upload: a boundary flush
+ *          can carry several listen windows' worth of accumulated neighbours
+ *          from wakes long since finished, so there is no one campaign left
+ *          to time by the point it is sent — 0 means "not measured", the same
+ *          convention primaryVersion==0 and rssiSrc==0 already use elsewhere
+ *          on this wire.
+ *
+ * v1 (FR_BLOG_FORMAT_VER before this change) had no duration field and a
+ * 8-byte header; v2 appends it rather than inserting it, so v1's first 8
+ * bytes are unchanged. There is no fr9 firmware in the field that spoke v1,
+ * so no decode branch on the version byte was added for it — the fr9 simply
+ * rejects anything that isn't exactly the version it expects (see
+ * TAGDISC_bAcceptPayload), same as it always has. The two sides are paired
+ * hardware and must be flashed together regardless.
+ *
+ * Both record variants are FR_BLOG_RECORD_BYTES; the type selects the decode.
+ * Fields are written one at a time, little-endian, and NOT memcpy'd out of
+ * MeshDiscoveredNeighbor_t / MeshBasicNeighbor_t. Those layouts are
+ * hand-packed RAM optimisations with a _Static_assert on their size (see
+ * MeshNetwork.h); they must not quietly become a wire format that the next
+ * change to the RAM budget then breaks on both boards at once.
+ *
+ * Flags byte: bit0 = MoveState, bit1 = GpsValid.
+ * ------------------------------------------------------------------------- */
+#define FR_BLOG_FORMAT_VER      2U
+#define FR_BLOG_TYPE_ADVANCED   0U
+#define FR_BLOG_TYPE_BASIC      1U
+#define FR_BLOG_HDR_BYTES       12U
+#define FR_BLOG_RECORD_BYTES    22U
+
+/* True when the fr9's ready line advertised binary-upload support ("RDY,B").
+ * Meaningful only after a successful FARMRANGER_bDeviceOn(); false before
+ * that, and false against any fr9 on firmware older than 9.12.13. */
+bool     FARMRANGER_bLoggerSupportsBinary(void);
+
+/* Sole discovery upload path. Same retry policy, same pacing, same verdict
+ * handling the old CSV path used. Returns false when all FR_LOG_ATTEMPTS
+ * failed — there is no CSV fallback, so that campaign is lost.
+ *
+ * u32DurationS: whole-discovery wall time in seconds, the caller's own
+ * measurement (Farmranger.c has no notion of when a campaign started). The
+ * basic variant carries no such parameter — see the FR_BLOG_HDR_BYTES note
+ * above for why it always sends 0. */
+bool     FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
+                              uint32_t u32DurationS);
+bool     FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count);
 
 /* ---- Firmware-file pull (OTA acquire, see Worker/OtaUpdate) ----
  * Protocol (tag is master): AT+FWREQ queries what the logger holds, answered
@@ -131,11 +198,11 @@ typedef struct {
 
 /* Upload measured beacons to the fr9 for logging to its flash — in practice
  * one at a time, as each beacon is heard. Same handshake/pacing/verdict
- * contract as FARMRANGER_bLogData against the fr9's AT+RTLOG handler, but a
+ * contract as FARMRANGER_bBLogData against the fr9's AT+RTLOG handler, but a
  * SINGLE attempt: the caller is expected to be keeping up with a live 5 s
  * beacon stream, so recovery is its decision, not ours (see the note on the
  * implementation). The caller owns the connect/disconnect
- * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+LOG; the
+ * (FARMRANGER_bDeviceOn / FARMRANGER_vDeviceOff), exactly as for AT+BLOG; the
  * radio test opens and drops a session per beacon. */
 bool FARMRANGER_bLogRadioTestData(const FarmrangerRtBeacon_t *pBeacons,
                                   uint16_t u16Count);

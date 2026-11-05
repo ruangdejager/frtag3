@@ -1,7 +1,8 @@
 /*
  * Flash.h
  *
- * Public API for the AT25XE041B external NOR flash device driver.
+ * Public API for the AT25EU0041A external NOR flash device driver
+ * (U1 on SPI2, both roles; see Flash_Config.h for the part and board notes).
  */
 
 #ifndef DEVICE_FLASH_FLASH_H_
@@ -12,7 +13,10 @@
 
 void    FLASH_vInit(void);
 bool    FLASH_bDeviceBusy(void);
-uint8_t FLASH_u8ReadStatusReg(void);
+uint8_t FLASH_u8ReadStatusReg(void);       /* SR1 (05h): SRP0, BP4..0, WEL, BSY */
+uint8_t FLASH_u8ReadStatusReg2(void);      /* SR2 (35h): SUS, CMP, LB, QE, SRP1 -
+                                            * needed to judge protection, since
+                                            * CMP = 1 alone protects everything */
 bool    FLASH_bVerifyDevice(void);          /* reads JEDEC ID; DBG-warns on mismatch */
 
 /* As FLASH_bVerifyDevice, but retried (FLASH_JEDEC_READ_ATTEMPTS) and
@@ -51,7 +55,10 @@ typedef struct
 {
     bool     bPresent;          /* the gate above - writes/erases permitted   */
     bool     bEverAbsent;       /* gate has been closed at least once         */
-    bool     bWriteProtected;   /* last bring-up saw BP/SRP0 set in SR1       */
+    bool     bWriteProtected;   /* BP/SRP0 (SR1) or CMP/SRP1 (SR2) seen set -
+                                 * never the power-on default on this part,
+                                 * so any 1 here means something wrote the
+                                 * non-volatile SR                            */
     bool     bUnprotectFailed;  /* global unprotect ran and did not clear it  */
     bool     bEraseVerifyFail;  /* an erase reported success but did not blank */
     uint8_t  au8LastId[3];      /* JEDEC bytes from the most recent probe     */
@@ -59,12 +66,9 @@ typedef struct
     uint16_t u16ProbeFailures;  /* probes that never saw the right mfr ID     */
     uint16_t u16Recoveries;     /* times the gate re-opened after being shut  */
     uint16_t u16EraseVerifyFails;
-    bool     bEpeSeen;          /* device's own EPE bit reported a failed
-                                 * erase/program at least once (SR1 bit 5,
-                                 * new on the AT25XE041B - the previous part
-                                 * had no such bit and the driver had to
-                                 * infer a failed erase from a read-back)    */
-    uint16_t u16EpeFails;
+    /* (bEpeSeen / u16EpeFails removed: the AT25EU0041A has no EPE bit - SR1
+     *  bit 5 is BP3 - so the erase read-back above is the only erase-failure
+     *  signal there is.) */
     uint16_t u16ReadCrcRetries; /* reads that disagreed on the first compare
                                  * and were re-read (see FLASH_vRead)        */
     uint16_t u16ReadCrcFails;   /* reads that never converged within the
@@ -119,23 +123,20 @@ bool    FLASH_vSectorErase(uint32_t addr);  /* erases 4 KB sector containing add
 bool    FLASH_vBlockErase(uint32_t addr);   /* erases 64 KB block containing addr  */
 bool    FLASH_vChipErase(void);
 
-/* Park the device in ULTRA-Deep Power-Down (79h) and bring it back.
+/* Park the device in Deep Power-Down (B9h) and bring it back (ABh).
  *
- * The names are kept from the previous part so the ~25 call sites in Fota.c,
- * Log.c and DbgLog.c do not churn, but the mode underneath changed: the
- * AT25XE041B offers both Deep Power-Down (B9h, exit ABh, 4.5 uA typ) and
- * Ultra-Deep Power-Down (79h, exit by CS# pulse, 200 nA typ), and this driver
- * parks in the latter.
+ * AT25EU0041A §6.3.7 / §6.3.1: ~0.1 uA typ parked against ~10.5 uA standby
+ * (Table 20). This part has only the one power-down mode - no Ultra-Deep
+ * Power-Down as the briefly-fitted AT25XE041B had - and leaving it changes no
+ * register, so a wake owes nothing to the write path.
  *
- * TWO CONSEQUENCES CALLERS DO NOT SEE, both handled inside the driver:
- *
- *  - Exit is a CS# pulse of at least tCSLU followed by tXUDPD = 70 us, not an
- *    opcode. Nothing may be clocked at the device inside that window.
- *  - Datasheet §12.5.3: "Upon recovery from Ultra Deep Power Down, all
- *    internal registers are in the Power-On default state." The sector
- *    protection default is PROTECTED, so every wake leaves the whole array
- *    write-locked until a Global Unprotect. The driver re-runs that lazily
- *    on the first program or erase after a wake; reads never pay for it. */
+ * ONE CONSEQUENCE CALLERS DO NOT SEE, handled inside the driver: while
+ * parked the device ignores every command except ABh, status reads included,
+ * and after ABh it needs tRES1 (8 us max) with CS# high before the next
+ * command is accepted. Every entry point wakes the part on demand first
+ * (FLASH_vEnsureAwake), and FLASH_vReleaseDeepPowerDown wakes it
+ * unconditionally for the boot path, where a watchdog reset may have left it
+ * parked by the previous run. */
 void    FLASH_vDeepPowerDown(void);
 void    FLASH_vReleaseDeepPowerDown(void);
 

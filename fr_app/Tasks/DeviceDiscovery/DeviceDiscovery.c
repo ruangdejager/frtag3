@@ -193,6 +193,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         /* ---- Prepare for new campaign ---- */
         MESHNETWORK_vClearDiscoveredNeighbors();
         MESHNETWORK_vResetDreqWaveCnt();
+        /* Opened before the wake buffer below, so a DReq from a primary that
+         * woke a little ahead of us is still answered. */
+        MESHNETWORK_vSetCampaignOpen(true);
         /* R6: drop any TX left over from the previous campaign (e.g. a
          * late-jittered forward) so it can't fire at the start of this one. */
         MESHNETWORK_vFlushTxQueue(false);
@@ -206,6 +209,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
         osDelay(APP_WAKEUP_BUFFER_MS);
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
+
+        /* Wall time for the whole discovery, wake to "complete" below — not to
+         * be confused with either role branch's own internal u32CampaignStart
+         * (those exist purely to enforce that branch's own deadline). This one
+         * spans everything: wave loop or basic listen window, whichever role
+         * runs. Read again once we reach "Discovery complete" and handed to
+         * the fr9 in the AT+BLOG header, so the server finally knows how long
+         * a round actually took instead of estimating it from log arrival
+         * times. */
+        uint32_t u32CampaignStartMs = osKernelGetTickCount();
 
         /* The primary's discovery campaign always runs — a staged image
          * pending distribution used to skip it entirely (an "OTA distribution
@@ -608,8 +621,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 
             /* R3: end the campaign on the FIRST of:
              *   - TimeSync received (clean end),
-             *   - 10 s of mesh radio silence while NOT beaconing (UNKNOWN that
-             *     heard nothing, or FORWARDER once the mesh goes quiet),
+             *   - APP_SECONDARY_SILENCE_MS of mesh radio silence while NOT
+             *     beaconing (UNKNOWN that heard nothing, or FORWARDER once the
+             *     mesh goes quiet),
              *   - the 205 s hard cap.
              * While beaconing the silence rule is suppressed, and since the
              * beacon count cap was removed a node that is never acked keeps
@@ -722,6 +736,11 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 DBG_LOG("DeviceDiscovery: Secondary %04X: campaign end (silence/cap)\r\n",
                     LORARADIO_u32GetUniqueId());
 
+            /* Closed BEFORE the stop below, so a DReq that arrives in between
+             * cannot start a fresh episode behind it. From here until the next
+             * wake a DReq is ignored (see MESHNETWORK_vSetCampaignOpen). */
+            MESHNETWORK_vSetCampaignOpen(false);
+
             /* B4: stop OUR beacon dreq. The global u32DreqId is only ever
              * written on the primary — on a secondary it is stale/zero, so the
              * old exact-dreq stop was a silent no-op and the node kept
@@ -734,6 +753,12 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
          * ---------------------------------------------------------------- */
         DBG_LOG("DeviceDiscovery %X: Discovery complete.\r\n",
             LORARADIO_u32GetUniqueId());
+
+        /* Whole-discovery duration, wake to here — see u32CampaignStartMs
+         * above. Passed to the fr9 in the AT+BLOG header (advanced mode only;
+         * see the call site below for why basic mode sends 0 instead). */
+        uint32_t u32CampaignDurationS =
+            (osKernelGetTickCount() - u32CampaignStartMs) / 1000U;
 
         /* Drop whatever mesh traffic is still queued for TX. The campaign it
          * belonged to is over, so sending it is pointless — and on a
@@ -795,7 +820,16 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * TimeSync TX. */
                 (void)DEVICE_DISCOVERY_bBasicLogAndClear("boundary");
 
-                DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                /* Reconnect for the timestamp/settings round trip - the flush
+                 * above disconnects when it is done. Logged rather than acted
+                 * on: the two requests below already degrade gracefully (the
+                 * timestamp returns 0, the settings keep their previous
+                 * values), and this line is what distinguishes "the fr9 never
+                 * answered" from "it answered something unparseable". */
+                if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+                {
+                    DBG_LOG("DeviceDiscovery: boundary reconnect FAILED (no RDY)\r\n");
+                }
 
                 uint64_t now = DEVICE_DISCOVERY_DRIVER_u64RequestTS();
                 if (now > 0)
@@ -883,13 +917,38 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             }
             else
             {
-                /* ---- Logger connection + upload (fr9 Farmranger board) ---- */
-                DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                /* ---- Logger connection + upload (fr9 Farmranger board) ----
+                 *
+                 * The connect result is now checked. It used to be discarded,
+                 * and that was worth fixing while touching this: without "RDY"
+                 * the fr9 is not in a session at all, and the whole campaign
+                 * was streamed into a dead link before anything noticed - only
+                 * the upload's own timeouts eventually said so. The binary
+                 * path makes the check unavoidable anyway, because it needs
+                 * the CONTENT of the ready line, not just its arrival.
+                 *
+                 * Only the upload is skipped on failure. The requests below
+                 * are left to fail on their own timeouts exactly as they do
+                 * today; turning a dead link into an early exit from the whole
+                 * session is a bigger behavioural change than belongs here. */
+                bool bLoggerUp = DEVICE_DISCOVERY_DRIVER_bConnectLogger();
+                bool bLogOk    = false;
 
-                DBG_LOG("DeviceDiscovery %X: Logger connected.\r\n",
-                    LORARADIO_u32GetUniqueId());
+                if (!bLoggerUp)
+                {
+                    DBG_LOG("DeviceDiscovery %X: Logger connect FAILED (no RDY) - upload skipped.\r\n",
+                        LORARADIO_u32GetUniqueId());
+                }
+                else
+                {
+                    DBG_LOG("DeviceDiscovery %X: Logger connected (binary upload).\r\n",
+                        LORARADIO_u32GetUniqueId());
 
-                if (DEVICE_DISCOVERY_bSendDiscoveryData(tNeighbors, u16NeighborCount))
+                    bLogOk = DEVICE_DISCOVERY_bSendDiscoveryDataBin(tNeighbors, u16NeighborCount,
+                        u32CampaignDurationS);
+                }
+
+                if (bLogOk)
                     DBG_LOG("DeviceDiscovery %X: Log SUCCESS.\r\n", LORARADIO_u32GetUniqueId());
                 else
                 {
@@ -955,7 +1014,22 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                  * through that window for nothing. */
                 if (FOTA_bDistributePending())
                 {
+                    /* Release the fr9 for the distribute - it runs up to
+                     * OTA_LORA_SESSION_MAX_MS, past the fr9's own 10 min
+                     * session cap, and nothing on the link is needed until
+                     * the FW check below. Reconnect after: FWCHECK is
+                     * answered from the fr9's cached manifest, so the second
+                     * session costs no modem power-up. The low hold gives the
+                     * fr9 time to see the line drop and end its session
+                     * before the next rising edge; distribute can return in
+                     * milliseconds (deferral, nothing staged). */
+                    DEVICE_DISCOVERY_DRIVER_vDisconnectLogger();
                     FOTA_vDistribute();
+                    osDelay(DEVICE_DISCOVERY_LOGGER_RELINK_GAP_MS);
+                    if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+                    {
+                        DBG_LOG("DeviceDiscovery: post-distribute reconnect FAILED (no RDY)\r\n");
+                    }
                 }
                 else
                 {
@@ -1464,7 +1538,7 @@ static void DEVICE_DISCOVERY_vSendTS(void)
  * DEVICE_DISCOVERY_bBasicLogAndClear
  *
  * Snapshot the basic-mode RAM store, connect to Farmranger, upload via
- * FARMRANGER_bLogBasicData, clear the store, disconnect. Nothing else —
+ * FARMRANGER_bBLogBasicData, clear the store, disconnect. Nothing else —
  * no timestamp sync, no AT+SETREQ, no TimeSync TX. Shared by both:
  *   - the mid-cycle HWM auto-flush (fires whenever the store hits
  *     DEVICE_DISCOVERY_BASIC_HWM inside a listen window), and
@@ -1502,8 +1576,22 @@ static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
             tBasic[i].bGpsValid ? (unsigned long)tBasic[i].u32GpsAgeS : 0UL);
     }
 
-    DEVICE_DISCOVERY_DRIVER_bConnectLogger();
-    bool bOk = FARMRANGER_bLogBasicData(tBasic, u16Count);
+    bool bOk = false;
+
+    /* Connect result checked here too - see the note at the advanced-mode
+     * upload. Without "RDY" there is nothing on the other end to upload to,
+     * and the binary path needs the content of that line to know whether it
+     * can be used at all. */
+    if (!DEVICE_DISCOVERY_DRIVER_bConnectLogger())
+    {
+        DBG_LOG("DeviceDiscovery %X: basic-mode %s log skipped - no RDY.\r\n",
+                LORARADIO_u32GetUniqueId(), pacReason);
+    }
+    else
+    {
+        bOk = FARMRANGER_bBLogBasicData(tBasic, u16Count);
+    }
+
     DBG_LOG("DeviceDiscovery %X: basic-mode %s log %s.\r\n",
             LORARADIO_u32GetUniqueId(), pacReason, bOk ? "SUCCESS" : "FAILED");
 

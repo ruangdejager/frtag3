@@ -2,81 +2,72 @@
 /**
   ******************************************************************************
   * @file    radio_board_if.c
-  * @brief   Radio board interface for frtag3.
-  *          RF switch: PA9 (RF_SW_CTRL) — HIGH=TX(LP), LOW=RX/OFF
-  *                     PB2 (RF_SW_VDD)  — switch supply, owned by hal_subghz
-  *          Pins come from hal_bsp.h, not main.h's CubeMX labels, so a .ioc
-  *          regeneration cannot silently rename them out from under this file.
+  * @brief   Radio board interface for frtag3 (Tagskaap V3 RevA).
+  *
+  *          No RF switch. Both final boards (the secondary and the primary
+  *          daughter board) use the STM32WL "direct tie" front end: RFO_LP and
+  *          RFI_P/RFI_N share one matching network to one antenna port, and
+  *          RFO_HP is left open. The radio's own LP PA and LNA do the TX/RX
+  *          change-over internally, so there is nothing for RBI_ConfigRFSwitch
+  *          to drive. PB2 and PA9, which powered and steered a GPIO-supplied
+  *          switch on the pre-production board, are unconnected on the final
+  *          layout and are parked analog by HAL_GPIO_vInit (see hal_bsp.h).
+  *
+  *          The TX path is RFO_LP only (RBI_CONF_RFO in radio_board_if.h),
+  *          so the LP PA's +15 dBm ceiling is the board's ceiling too.
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 #include "radio_board_if.h"
-#include "main.h"
-#include "stm32wlxx_hal.h"
+#include "radio_driver.h"   /* TCXO_CTRL_* */
 
-#include "hal_bsp.h"
-#include "hal_system.h"
-#include "hal_subghz.h"
-#include "dbg_log.h"
+/* TCXO supply, chosen per role by RBI_vSetPrimaryRole(). Defaults to the
+ * secondary's 1.7 V: that value is valid on BOTH rails (it is the only
+ * in-spec choice on the 1.8 V secondary, and merely conservative on the
+ * 3.0 V primary), so a radio init that somehow ran before the role was known
+ * would still start the TCXO. See radio_conf.h. */
+static uint8_t s_u8TcxoVoltage = (uint8_t)TCXO_CTRL_1_7V;
 
+void RBI_vSetPrimaryRole(bool bPrimary)
+{
+    s_u8TcxoVoltage = bPrimary ? (uint8_t)TCXO_CTRL_2_2V
+                               : (uint8_t)TCXO_CTRL_1_7V;
+}
+
+uint8_t RBI_u8GetTcxoVoltage(void)
+{
+    return s_u8TcxoVoltage;
+}
+
+/* Nothing to initialise: no switch, no control pins (see the file header). */
 int32_t RBI_Init(void)
 {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-
-    HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
-
-    GPIO_InitStruct.Pin   = BSP_RF_SW_CTRL_PIN;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(BSP_RF_SW_CTRL_PORT, &GPIO_InitStruct);
-
     return 0;
 }
 
 int32_t RBI_DeInit(void)
 {
-    HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_DeInit(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN);
     return 0;
 }
 
-/* Path select for an RX<->TX turnaround. RF_SW_VDD must ALREADY be up: the
- * rail follows the radio's power state and is raised once at radio wake
- * (HAL_SUBGHZ_vRfSwitchPowerOn), not here. Powering the switch up inside a
- * path select would hide a sequencing bug behind a 350 us stall on a path that
- * is supposed to cost 50 us, so this reports the fault and refuses instead.
- *
- * The settle below is the switch's own CTRL network (100R x 101 nF); the
- * caller may enable the PA or enter RX once it returns. */
+/* Called by the vendor driver on every TX/RX/sleep transition. With the
+ * direct-tie front end there is no external path to select, so every request
+ * succeeds without touching a pin. RFO_HP is not connected on either board; it
+ * is accepted here only because RBI_GetTxConfig() never lets the driver ask
+ * for it. */
 int32_t RBI_ConfigRFSwitch(RBI_Switch_TypeDef Config)
 {
-    if (!HAL_SUBGHZ_bRfSwitchPowered())
-    {
-        DBG_LOG("RBI: path select (%d) with RF_SW_VDD down — radio not woken\r\n",
-                (int)Config);
-        return -1;
-    }
-
     switch (Config)
     {
         case RBI_SWITCH_OFF:
         case RBI_SWITCH_RX:
-            HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_RESET);
-            break;
         case RBI_SWITCH_RFO_LP:
         case RBI_SWITCH_RFO_HP:
-            HAL_GPIO_WritePin(BSP_RF_SW_CTRL_PORT, BSP_RF_SW_CTRL_PIN, GPIO_PIN_SET);
-            break;
+            return 0;
         default:
             return -1;
     }
-
-    HAL_SYSTEM_vBusyWaitUs(BSP_RF_SW_CTRL_SETTLE_US);
-    return 0;
 }
 
 int32_t RBI_GetTxConfig(void)

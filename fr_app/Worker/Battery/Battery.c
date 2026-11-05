@@ -202,7 +202,8 @@ static void BAT_vSampleTask(void *pvParameters)
 
         /* Read both the battery divider and VREFINT in the same enabled window.
          * VREFINT yields the true VDDA, making the battery result independent
-         * of the actual rail voltage (2.0 V nominal on Tagskaap V3 RevA). */
+         * of the actual rail voltage (1.8 V nominal on the V3 RevA secondary,
+         * the only role that samples the battery). */
         uint16_t u16BatRaw  = 0;
         uint16_t u16VrefRaw = 0;
         bool bConvOk = BAT_bConvert(BAT_VOLTAGE_CHANNEL, &u16BatRaw)

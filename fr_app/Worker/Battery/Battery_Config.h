@@ -46,9 +46,10 @@
  * 33k || 10k = ~7.7 kOhm. Battery voltage is reconstructed as:
  *   Vbatt = adc_bat * VDDA_measured / BAT_ADC_FULL_SCALE * BAT_DIVIDER_NUM/DEN
  * VDDA_measured comes from the calibrated VREFINT channel, so the result does
- * not depend on the rail being exactly its nominal 2.0 V (VDD = VDDA on
- * Tagskaap V3 RevA). Full scale is VDDA x 4.3 = 8.6 V at 2.0 V; a 4.2 V cell
- * puts ~0.98 V on PA12 (~2000 counts). The 4.300 ratio was confirmed on frtag2
+ * not depend on the rail being exactly its nominal 1.8 V (VDD = VDDA on the
+ * Tagskaap V3 RevA secondary; the primary has no battery divider at all).
+ * Full scale is VDDA x 4.3 = 7.7 V at 1.8 V; a 4.2 V cell puts ~0.98 V on
+ * PA12 (~2220 counts). The 4.300 ratio was confirmed on frtag2
  * hardware against a calibrated reference (true 4050 mV / measured pin
  * 941.9 mV = 4.300). */
 #define BAT_DIVIDER_NUM             4300U

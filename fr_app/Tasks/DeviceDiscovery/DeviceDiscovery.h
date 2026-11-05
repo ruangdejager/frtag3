@@ -22,8 +22,16 @@
 
 /* Secondary campaign-end (R3): once the mesh has been silent (no discovery
  * packet from any primary) for this long AND the node is not beaconing, end the
- * campaign instead of waiting out the 205 s hard cap. Polled at this cadence. */
-#define APP_SECONDARY_SILENCE_MS           (10 * 1000)   /* radio-silence end window    */
+ * campaign instead of waiting out the 205 s hard cap. Polled at this cadence.
+ *
+ * This window is also how early a secondary can wake and still hear wave 1:
+ * both roles wait APP_WAKEUP_BUFFER_MS before starting, so a node whose clock
+ * runs ahead of the primary's by more than this has given up before the first
+ * DReq goes out. Later waves only help nodes that wake late. 10 -> 20 s after
+ * a 14 s fr9/GPS clock split (bench, 2026-09-30) took two tags out of every
+ * campaign. The cost falls on out-of-range nodes, which now stay awake 10 s
+ * longer on every wake. */
+#define APP_SECONDARY_SILENCE_MS           (20 * 1000)   /* radio-silence end window    */
 #define APP_SECONDARY_POLL_MS              250U          /* secondary wait poll cadence */
 
 /* Ceiling on DReq waves per campaign. Each wave advances the discovery frontier
@@ -252,6 +260,13 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * "close this session" gate. */
 #define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (180 * 1000)  /* 3 min */
 
+/* Minimum time the fr9 attention line stays low when the primary drops the
+ * logger session and reopens it (around the LoRa firmware distribute). The
+ * fr9 polls the line from its main loop and debounces edges by 20 ms; a
+ * shorter low could be missed and the reconnect would wait out a RDY that
+ * never comes. */
+#define DEVICE_DISCOVERY_LOGGER_RELINK_GAP_MS     1000U
+
 /* osEventFlags bit — set by wakeup-schedule task to start a campaign */
 #define DISCOVERY_WAKEUP_BIT                (1UL << 0)
 
@@ -278,7 +293,16 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
 #define DEVICE_DISCOVERY_DRIVER_vDisconnectLogger()          FARMRANGER_vDeviceOff()
 #define DEVICE_DISCOVERY_DRIVER_u64RequestTS()               FARMRANGER_u64RequestTimestamp()
 #define DEVICE_DISCOVERY_DRIVER_bRequestSettings(pi, pm, pg) FARMRANGER_bRequestSettings((pi), (pm), (pg))
-#define DEVICE_DISCOVERY_bSendDiscoveryData(items, size)     FARMRANGER_bLogData(items, size)
+/* AT+LOG (CSV) removed — primary speaks AT+BLOG only now.
+ * Binary upload (AT+BLOG): same campaign, about half the bytes, CRC-checked -
+ * and on the fr9 side it is what gets POSTed to the server, rather than only
+ * scraped back out of an uploaded syslog. See the wire-format block in
+ * Farmranger.h.
+ * durationS: whole-discovery wall time in seconds, measured by the caller
+ * (DeviceDiscovery.c's u32CampaignStartMs) — not something Farmranger.c has
+ * any way to know on its own. */
+#define DEVICE_DISCOVERY_bSendDiscoveryDataBin(items, size, durationS) \
+    FARMRANGER_bBLogData(items, size, durationS)
 
 /* ---- Production sleep state ---- */
 typedef enum {

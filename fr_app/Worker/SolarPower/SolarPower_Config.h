@@ -24,8 +24,10 @@
  *   Vpin   = adc_vsolar * VDDA_measured / SOLAR_ADC_FULL_SCALE
  *   Vsolar = Vpin * SOLAR_VSOLAR_DIV_NUM / SOLAR_VSOLAR_DIV_DEN
  * VDDA comes from the calibrated VREFINT channel (same as the battery worker),
- * so the result does not assume the rail is exactly its nominal 2.0 V
- * (Tagskaap V3 RevA). Full scale is VDDA x 4.3 = 8.6 V at 2.0 V. */
+ * so the result does not assume the rail is exactly its nominal 1.8 V
+ * (Tagskaap V3 RevA secondary). Full scale is VDDA x 4.3 = 7.7 V at 1.8 V,
+ * which is the highest panel voltage the divider can report: an open-circuit
+ * panel above that reads as a clipped 7.7 V. */
 #define SOLAR_VSOLAR_DIV_NUM            43U
 #define SOLAR_VSOLAR_DIV_DEN            10U
 

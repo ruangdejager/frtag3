@@ -112,8 +112,8 @@ static void SOLAR_vSampleTask(void *pvParameters)
         SOLAR_DRIVER_vEnable();
 
         /* Read VSOLAR plus VREFINT in one enabled window. VREFINT gives the
-         * true VDDA so results are independent of the actual rail (2.0 V
-         * nominal on Tagskaap V3 RevA). */
+         * true VDDA so results are independent of the actual rail (1.8 V
+         * nominal on the Tagskaap V3 RevA secondary). */
         bool bConvOk = SOLAR_bConvert(VSOLAR_VOLTAGE_CHANNEL, &u16RawVsolar)
                     && SOLAR_bConvert(VREFINT_CHANNEL,        &u16RawVref);
 
@@ -141,7 +141,7 @@ static void SOLAR_vSampleTask(void *pvParameters)
              * pull a shelved tag out of ProductionSleep. This guard is the
              * silicon range (HAL_ADC_VDDA_MIN_MV..HAL_ADC_VDDA_MAX_MV,
              * 1.62-3.6 V), not a window for this board: a wrong VDDA that
-             * still falls inside it (say 3.0 V reported on the 2.0 V rail) is
+             * still falls inside it (say 3.0 V reported on the 1.8 V rail) is
              * not caught and scales Vsolar up in proportion. Until the first valid sample
              * u16VsolarLastMV stays 0, which is the safe direction (the tag
              * stays asleep), so no validity gate is needed here. This task has

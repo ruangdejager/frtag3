@@ -1,7 +1,7 @@
 /*
  * Flash_SelfTest.h
  *
- * Bring-up and diagnostic tests for the AT25XE041B external NOR flash.
+ * Bring-up and diagnostic tests for the AT25EU0041A external NOR flash.
  *
  * Two things live here, and they answer different questions:
  *
@@ -43,7 +43,7 @@ typedef enum
 {
     FLASH_ST_PASS = 0,
     FLASH_ST_FAIL_NO_COMMS,     /* ID all 00h or all FFh - nothing is talking  */
-    FLASH_ST_FAIL_WRONG_PART,   /* ID read cleanly and is not 1F 44 02         */
+    FLASH_ST_FAIL_WRONG_PART,   /* ID read cleanly and is not 1F 14 01         */
     FLASH_ST_FAIL_BUSY_STUCK,   /* RDY/BSY never cleared                       */
     FLASH_ST_FAIL_PROTECTED,    /* still protected after a Global Unprotect    */
     FLASH_ST_FAIL_ERASE,        /* scratch sector did not read back all FFh    */

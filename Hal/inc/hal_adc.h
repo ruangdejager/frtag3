@@ -55,8 +55,9 @@ void     HAL_ADC_vUnlock(void);
  * observe it. It means the VREFINT conversion itself was bad (a garbage or
  * stuck result, or an unprogrammed VREFINT_CAL that reads 0xFFFF), and the
  * paired external-channel result taken in the same window cannot be trusted
- * either. The nominal rail on Tagskaap V3 RevA is 2.0 V, well inside the
- * window. */
+ * either. The nominal rails on Tagskaap V3 RevA are 1.8 V (secondary) and
+ * 3.0 V (primary), both inside the window - though 1.8 V is only 180 mV above
+ * its floor, so a secondary whose rail sags hard could trip it. */
 #define HAL_ADC_VDDA_MIN_MV     1620U
 #define HAL_ADC_VDDA_MAX_MV     3600U
 

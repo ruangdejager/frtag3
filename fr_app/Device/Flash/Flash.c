@@ -1,29 +1,42 @@
 /*
  * Flash.c
  *
- * AT25XE041B SPI NOR flash device driver.
+ * AT25EU0041A SPI NOR flash device driver.
  *
  * All SPI transactions use the driver macros in Flash_Driver.h which
  * route through the HAL SPI2 layer in hal_spi.h. Every opcode, register bit
- * and timing constant lives in Flash_Config.h with its datasheet section;
- * nothing numeric should appear in this file without one.
+ * and timing constant lives in Flash_Config.h with its datasheet section
+ * (DS-AT25EU0041A-212 Rev. E); nothing numeric should appear in this file
+ * without one.
  *
- * ---- What changed when the board moved from the AT25EU0041A ----
+ * ---- What changed when the board moved back from the AT25XE041B ----
  *
- * The part is not a drop-in and three of the differences are load-bearing:
+ * Early V3 bring-up targeted an AT25XE041B; the final V3 RevA schematics fit
+ * the AT25EU0041A (frtag2's part) on both roles. The parts are not drop-in
+ * replacements for each other, and four differences are load-bearing here:
  *
- *  1. The status register is a different register. No BP bits, no SRP0, no
- *     separate SR2 opcode. The old FLASH_STATUS_PROTECTED mask read as clean
- *     on a healthy chip by pure coincidence - see Flash_Config.h.
- *  2. The array's default state is PROTECTED. A Global Unprotect is part of
- *     normal bring-up here, not a recovery step.
- *  3. The idle park is Ultra-Deep Power-Down (79h), and exiting it resets
- *     every internal register to its power-on default - which puts (2) back.
- *     So a wake re-arms the write protection and the driver has to undo it
- *     again before the next program or erase. That is what bNeedsUnprotect
- *     below exists for, and getting it wrong reproduces the exact historical
- *     failure this driver already carries scar tissue for: reads fine, every
- *     write and erase silently refused, log frozen.
+ *  1. The status register is a Winbond-style pair again: SR1 (05h) holds
+ *     BP4..BP0 and SRP0, SR2 (35h - a real opcode on this part) holds CMP,
+ *     QE and SRP1. Protection has to be judged from BOTH registers - CMP = 1
+ *     with BP = 0 protects the whole array (Table 7).
+ *  2. There is no EPE bit. SR1 bit 5 is BP3, so the XE041B's "did the device
+ *     report a failed erase/program" test would have been reading a
+ *     protection bit. The erase read-back verify is the only failure signal.
+ *  3. Protection is NOT the power-on default (Table 3: "on power-up the device
+ *     is unprotected"), and the BP/CMP/SRP bits are non-volatile. So a
+ *     protected state is a genuine anomaly to clear and report, not routine
+ *     bring-up, and there is nothing to "re-unprotect" after a wake.
+ *  4. The idle park is plain Deep Power-Down (B9h, ~0.1 uA typ at 1.8 V),
+ *     exited by the ABh opcode, not by a CS# pulse - this part has no
+ *     Ultra-Deep Power-Down. While parked it ignores EVERY other command,
+ *     status reads included (§6.3.7), so a missed wake leaves SO Hi-Z and
+ *     the PA5 pull-up turns every status read into FFh = "busy" (the safe
+ *     direction) and every data read into FFh.
+ *
+ * The XE041B lazy-unprotect machinery (bNeedsUnprotect) is gone with point 3:
+ * left in, it would have issued a NON-VOLATILE status-register write - up to
+ * 12 ms and a share of the SR's write endurance - on the first program or
+ * erase after nearly every wake, for no reason.
  */
 
 #include "Flash.h"
@@ -35,34 +48,17 @@
 #include "cmsis_os2.h"
 #include <string.h>
 
-/* Ultra-deep-power-down state. The flash is parked whenever idle (the DbgLog
+/* Deep-power-down state. The flash is parked whenever idle (the DbgLog
  * consumer issues FLASH_vDeepPowerDown() after draining its queue) so it draws
- * ~200 nA through the long STOP2 sleep periods instead of the ~25 µA standby
- * current. Any access transparently wakes it first via FLASH_vEnsureAwake(). */
+ * ~0.1 uA typ (1.8 uA max, ICC2, Table 20) through the long STOP2 sleep
+ * periods instead of the ~10.5 uA typ standby current (ICC1). Any access
+ * transparently wakes it first via FLASH_vEnsureAwake(). */
 static bool bInDpd = false;
 
 /* When true, FLASH_vDeepPowerDown() is suppressed and the chip is kept
  * awake. Set for the duration of an OTA session — see
  * FLASH_vInhibitDeepPowerDown() in Flash.h. */
 static bool bDpdInhibited = false;
-
-/* Set by every UDPD wake, cleared by a successful Global Unprotect.
- *
- * Datasheet §12.5.3: "Upon recovery from Ultra Deep Power Down, all internal
- * registers are in the Power-On default state." Table 3: the Sector Protection
- * Register power-on default is 1, protected. So a wake silently re-locks the
- * whole array for writes while leaving reads working perfectly - the exact
- * signature of the 2026-08-31 field failure, arriving through a completely
- * different door.
- *
- * Deliberately lazy rather than unprotecting inside the wake itself: the
- * overwhelming majority of wakes serve a read (the log consumer draining, a
- * FOTA verify pass), and reads are unaffected by protection. Paying a WREN +
- * WRSR + ready-wait on every one of them would put a self-timed
- * status-register write into the hottest path in the driver for no benefit.
- * The cost lands instead on the first program or erase after a wake, which is
- * already a self-timed operation measured in milliseconds. */
-static bool bNeedsUnprotect = false;
 
 /* This device is shared: Log.c (driven by DBGLOG_vConsumerTask, its own
  * thread) and OtaStore.c (driven by the AppTask) both call straight into
@@ -139,39 +135,48 @@ uint16_t FLASH_u16GetAndClearReadFails(Flash_ReadFailReason_t *ptReason,
  * Internal helpers
  * -------------------------------------------------------------------------- */
 
-/* Wake from ultra-deep-power-down on demand. No-op when already awake, so only
- * the first access after a park pays the exit sequence.
+/* Issue Release Power-down (ABh) and wait tRES1. Call with the mutex held.
  *
- * UDPD is exited by PULSING CS, not by an opcode (datasheet §12.5.1): assert
- * CS for at least tCSLU, deassert, then wait tXUDPD before clocking anything
- * at the device. A command issued inside tXUDPD is accepted onto the bus and
- * then discarded - "that operation is ignored and nothing is done" - which
- * from the host's side looks exactly like a read returning garbage.
+ * §6.3.1: opcode only, CS# high, and "the CS pin must remain high during the
+ * tRES1 time" before any other command is accepted. A command issued inside
+ * tRES1 is ignored, which from the host's side looks exactly like a read
+ * returning garbage - or, because the PA5 pull-up reads an undriven SO as
+ * FFh, like a status register stuck busy.
  *
- * Busy-wait, not osDelay, for two reasons: 70 us is below osDelay's 1 ms
+ * Busy-wait, not osDelay, for two reasons: 8 us is below osDelay's 1 ms
  * resolution, and this runs from the chip-select chokepoint where yielding the
  * scheduler could let another task open its own transaction on the same bus.
- * The previous part's resume paid a flat osDelay(1) against a tRDPD of 8 us -
- * 125x the requirement - so if the DPD-wake read corruption this driver
- * documents is real, an unhonoured recovery time was never the explanation
- * for it. Worth remembering when reading that history.
  *
- * The wake re-arms write protection; see bNeedsUnprotect. */
+ * History worth keeping: frtag2 ran this same part and woke it with ABh
+ * followed by a flat osDelay(1) - 125x tRES1 - and still saw corrupt reads
+ * "shortly after a DPD wake" (see FLASH_vInhibitDeepPowerDown in Flash.h). So
+ * an unhonoured recovery time was never the explanation for that; the
+ * busy-wait here is correctness, not a fix for it. */
+static void FLASH_vSendResumeLocked(void)
+{
+    uint8_t cmd = FLASH_CMD_RESUME;
+    FLASH_DRIVER_vSelect();
+    FLASH_DRIVER_vWrite(&cmd, 1);
+    FLASH_DRIVER_vDeselect();
+    HAL_SYSTEM_vBusyWaitUs(FLASH_TRES1_US);    /* tRES1 - device in standby */
+}
+
+/* Wake from deep-power-down on demand. No-op when already awake, so only the
+ * first access after a park pays the exit sequence.
+ *
+ * Unlike the AT25XE041B's Ultra-Deep Power-Down, leaving deep power-down on
+ * this part changes no register (the BP/CMP/SRP bits are non-volatile and
+ * §6.3.7 is a pure power state), so a wake owes nothing to the write path. */
 static void FLASH_vEnsureAwake(void)
 {
     if (!bInDpd) return;
 
-    FLASH_DRIVER_vSelect();
-    HAL_SYSTEM_vBusyWaitUs(FLASH_TCSLU_US);    /* >= tCSLU (20 ns spec min) */
-    FLASH_DRIVER_vDeselect();
-    HAL_SYSTEM_vBusyWaitUs(FLASH_TXUDPD_US);   /* tXUDPD - device in standby */
-
-    bInDpd          = false;
-    bNeedsUnprotect = true;
+    FLASH_vSendResumeLocked();
+    bInDpd = false;
 }
 
 /* FLASH_WAIT_READY_TIMEOUT_MS / _BLOCK_ERASE_ / _CHIP_ERASE_ now live in
- * Flash_Config.h alongside the datasheet tPP / tBLKE / tCHPE figures they are
+ * Flash_Config.h alongside the datasheet tPP / tBLKE / tCE figures they are
  * sized against, so the margin each one carries is visible at the point the
  * number is chosen rather than asserted here. */
 
@@ -211,12 +216,19 @@ static void FLASH_vWriteEnable(void)
 }
 
 /* Clear the Write Enable Latch (WRDI). Program, Erase and Write-Status-Register
- * are ONLY accepted while WEL=1, so the chip must never be left idle with WEL
- * set: a single failed/garbled command transaction otherwise leaves the device
- * armed, and any subsequent stray WRSR on a glitchy bus could latch SRP0/BP -
- * which, because WP# is grounded on this board, permanently bricks the part for
- * writes. Calling this on every write error path keeps the armed window down to
- * the few microseconds between our WREN and our own command. */
+ * are ONLY accepted while WEL=1 (§6.1.1), so the chip must never be left idle
+ * with WEL set: a single failed/garbled command transaction otherwise leaves
+ * the device armed, and any subsequent stray WRSR on a glitchy bus could set
+ * BP/CMP - silently write-protecting the array until the next Global
+ * Unprotect - or SRP1, which is Power Supply Lock-Down: the status register
+ * refuses every write until a power cycle (Table 5), and a battery tag in the
+ * field effectively never gets one. Calling this on every write error path
+ * keeps the armed window down to the few microseconds between our WREN and
+ * our own command.
+ *
+ * (On the AT25XE041B the stakes were higher still - WP# grounded made its SPRL
+ * bit a permanent latch. On V3 RevA WP# floats high on its internal pull-up,
+ * so SRP0 is recoverable; SRP1 is the bit that is not.) */
 static void FLASH_vWriteDisable(void)
 {
     uint8_t cmd = FLASH_CMD_WRITE_DISABLE;
@@ -225,40 +237,47 @@ static void FLASH_vWriteDisable(void)
     FLASH_DRIVER_vDeselect();
 }
 
-/* Clear all sector protection (Global Unprotect): WREN, then WRSR (01h) with a
- * SINGLE data byte of 00h. Datasheet §9.5 / Table 4, row WP#=0, current
- * SPRL=0, data 0x0000xx: "Global Unprotect - all Sector Protection Registers
- * reset to 0", leaving SPRL at 0.
+static void FLASH_vReadStatusLocked(uint8_t *pu8Sr1, uint8_t *pu8Sr2);
+
+/* Clear all block protection (Global Unprotect): WREN, then WRSR (01h) with
+ * TWO data bytes, SR1 = 00h and SR2 = 00h. Datasheet §6.1.6: one byte writes
+ * SR1 only, two bytes write SR1 then SR2, and any other bit count is not
+ * executed - so this is exactly 24 bits in one CS# bracket.
  *
- * This is bring-up, not just recovery. Table 3: a Sector Protection Register's
- * power-on default is 1 (protected), so a virgin part - and a part that has
- * just exited UDPD, see bNeedsUnprotect - refuses every program and erase
- * until this runs. Reads are unaffected throughout, which is what makes the
- * protected state so quiet: the log stops growing and nothing reports an error.
+ * Both bytes are required on this part. SR1 = 00h clears BP4..BP0 and SRP0;
+ * SR2 = 00h clears CMP, SRP1 and QE. An SR1-only write would leave CMP, and
+ * CMP = 1 with BP = 0 is "the whole array protected" (Table 7). The SR2
+ * read-only bits (SUS, LB3..LB1, reserved) ignore what is written; the LB
+ * bits are OTP and the byte written to them is 0, which can never set one
+ * (FLASH_WRSR_SR2_NEVER_SET is checked at compile time in Flash_Config.h).
  *
- * ONE data byte, not two. The previous part took SR1 and SR2 in one bracket;
- * here WRSR is a one-byte command and §11.3 says any further bytes are
- * ignored - so the old three-byte version happened to work, but only by luck.
+ * Unlike the AT25XE041B, this is RECOVERY, not bring-up: Table 3, "on
+ * power-up the device is unprotected", and the bits are non-volatile, so a
+ * protected state means something wrote it. Reads are unaffected throughout,
+ * which is what makes the protected state so quiet: the log stops growing and
+ * nothing reports an error.
  *
- * THE DATA BYTE'S BIT 7 MUST NEVER BE SET. WP# is grounded on this board with
- * no MCU GPIO, and §11.3 states that while WP# is asserted SPRL can only be
- * driven 0 -> 1, never back. One WRSR with bit 7 set therefore locks that
- * unit's protection registers permanently: reads keep working, writes and
- * erases are refused forever, and nothing short of physically lifting pin 3
- * recovers it. FLASH_WRSR_GLOBAL_UNPROTECT is 00h for exactly this reason, and
- * FLASH_vWriteDisable() on every error path (WEL=0 at idle, so a stray WRSR on
- * a glitchy bus is refused outright) is the second line of that defence.
+ * Refused (returns false) when SRP1 = 1: Power Supply Lock-Down or OTP,
+ * Table 5. With SRP1:SRP0 = 0:1 it depends on WP# being high, which on this
+ * board it is, by the internal pull-up on the unconnected pad.
  *
- * Returns true once the device reports SWP = none and SPRL clear. */
+ * The write is non-volatile and self-timed (tW, 12 ms max) - hence the
+ * ready-wait, and hence the driver only calls this when protection is
+ * actually seen.
+ *
+ * Returns true once the device reports no protection bit set in either
+ * register (FLASH_STATUS_PROTECTED / FLASH_STATUS2_PROTECTED). */
 static bool FLASH_bGlobalUnprotect(void)
 {
-    uint8_t cmd[2] = { FLASH_CMD_WRITE_STATUS, FLASH_WRSR_GLOBAL_UNPROTECT };
+    uint8_t cmd[3] = { FLASH_CMD_WRITE_STATUS,
+                       FLASH_WRSR_SR1_UNPROTECT,
+                       FLASH_WRSR_SR2_UNPROTECT };
 
     if (!FLASH_bWaitReady())
         return false;
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
-    bool bOk = (FLASH_DRIVER_vWrite(cmd, 2) == HAL_OK);
+    bool bOk = (FLASH_DRIVER_vWrite(cmd, 3) == HAL_OK);
     FLASH_DRIVER_vDeselect();
 
     if (!bOk)
@@ -270,10 +289,11 @@ static bool FLASH_bGlobalUnprotect(void)
     if (!FLASH_bWaitReady())      /* WRSR is itself a self-timed write */
         return false;
 
-    bool bClear = (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED) == 0U;
-    if (bClear)
-        bNeedsUnprotect = false;
-    return bClear;
+    uint8_t sr1 = 0U;
+    uint8_t sr2 = 0U;
+    FLASH_vReadStatusLocked(&sr1, &sr2);
+    return ((sr1 & FLASH_STATUS_PROTECTED)  == 0U) &&
+           ((sr2 & FLASH_STATUS2_PROTECTED) == 0U);
 }
 
 
@@ -304,8 +324,6 @@ static uint8_t  u8LastAttempts      = 0U;
 static uint16_t u16ProbeFailures    = 0U;
 static uint16_t u16Recoveries       = 0U;
 static uint16_t u16EraseVerifyFails = 0U;
-static bool     bEpeSeen            = false;
-static uint16_t u16EpeFails         = 0U;
 static uint16_t u16ReadCrcRetries   = 0U;
 static uint16_t u16ReadCrcFails     = 0U;
 
@@ -315,76 +333,62 @@ static uint16_t u16ReadCrcFails     = 0U;
 static uint32_t u32LastProbeTick    = 0U;
 static bool     bProbedOnce         = false;
 
-/* Undo the write protection a UDPD wake re-armed, at the last moment that can
- * still matter. Call with the mutex held, from every path that is about to
- * program or erase - and from nowhere else, because reads do not need it and
- * paying for it on the read path would put a self-timed status-register write
- * into the driver's hottest loop.
+/* Read the status registers. Call with the mutex held and the device awake.
  *
- * The flag is cleared before the attempt, not after, so a chip that cannot be
- * unprotected does not re-enter this on every single write; the erase-verify
- * path in FLASH_bEraseRegionLocked is what catches that case and reports it. */
-static void FLASH_vEnsureUnprotectedLocked(void)
-{
-    if (!bNeedsUnprotect)
-        return;
-
-    bNeedsUnprotect = false;
-
-    if (!FLASH_bGlobalUnprotect())
-    {
-        bUnprotectFailed = true;
-        DBG("FLASH: post-wake unprotect FAILED, SR1=%02X - the array is still "
-            "write-locked from the UDPD exit\r\n", FLASH_u8ReadStatusReg());
-    }
-}
-
-/* Read both status register bytes in one CS bracket. Call with the mutex held
- * and the device awake.
+ * Two opcodes, two CS# brackets: 05h for SR1 and 35h for SR2 (§6.1.4). On
+ * this part, continuing to clock after 05h just repeats SR1 (Table 8 note 9),
+ * so the AT25XE041B's "byte 2 follows byte 1" read would return SR1 twice and
+ * report it as SR2. SR2 is only read when asked for: the busy-poll needs SR1
+ * alone and is the hottest loop in the driver.
  *
- * There is no second opcode on this part. A single 05h makes the device emit
- * byte 1, byte 2, byte 1, ... for as long as CS stays asserted (datasheet
- * §11.1), so two bytes clocked after one opcode gets both. The previous part
- * used 35h for SR2; 35h is not a command here and unsupported opcodes are
- * simply ignored (§6), so the old code was reading whatever the bus happened
- * to idle at and reporting it as a register value.
- *
- * Fails safe to busy: a short or failed transfer must never be mistaken for
- * "ready", or FLASH_bWaitReady would issue the next command onto a device that
- * is still mid-program. */
+ * Fails safe to busy: a short or failed SR1 transfer must never be mistaken
+ * for "ready", or FLASH_bWaitReady would issue the next command onto a device
+ * that is still mid-program. A failed SR2 transfer reports 00h - deliberately
+ * NOT "protected", because the only thing a protected reading triggers is a
+ * non-volatile status-register write, and a bus fault is not a reason to
+ * spend one. An erase into a region that really is protected is still caught
+ * by the erase read-back. */
 static void FLASH_vReadStatusLocked(uint8_t *pu8Sr1, uint8_t *pu8Sr2)
 {
-    uint8_t cmd      = FLASH_CMD_READ_STATUS;
-    uint8_t au8Sr[2] = { FLASH_SR1_RDY_BSY, 0U };
+    uint8_t cmd;
+    uint8_t u8Sr1 = FLASH_SR1_RDY_BSY;
+    uint8_t u8Sr2 = 0U;
 
+    cmd = FLASH_CMD_READ_STATUS;
     FLASH_DRIVER_vSelect();
-    FLASH_DRIVER_vWrite(&cmd, 1);
-    if (FLASH_DRIVER_vRead(au8Sr, 2) != HAL_OK)
-    {
-        au8Sr[0] = FLASH_SR1_RDY_BSY;
-        au8Sr[1] = 0U;
-    }
+    if ((FLASH_DRIVER_vWrite(&cmd, 1) != HAL_OK) ||
+        (FLASH_DRIVER_vRead(&u8Sr1, 1) != HAL_OK))
+        u8Sr1 = FLASH_SR1_RDY_BSY;
     FLASH_DRIVER_vDeselect();
 
-    if (pu8Sr1 != NULL) *pu8Sr1 = au8Sr[0];
-    if (pu8Sr2 != NULL) *pu8Sr2 = au8Sr[1];
+    if (pu8Sr2 != NULL)
+    {
+        cmd = FLASH_CMD_READ_STATUS2;
+        FLASH_DRIVER_vSelect();
+        if ((FLASH_DRIVER_vWrite(&cmd, 1) != HAL_OK) ||
+            (FLASH_DRIVER_vRead(&u8Sr2, 1) != HAL_OK))
+            u8Sr2 = 0U;
+        FLASH_DRIVER_vDeselect();
+        *pu8Sr2 = u8Sr2;
+    }
+
+    if (pu8Sr1 != NULL) *pu8Sr1 = u8Sr1;
 }
 
-/* Did the device itself report that the last erase or program failed?
- *
- * EPE (SR1 bit 5) is new on this part and is the one fault signal that does
- * not depend on reading the array back. §11.1.3: it is set when at least one
- * byte did not erase or program properly, and is updated after every erase and
- * program. Note what it deliberately does NOT cover - an operation that never
- * started, because the region was protected or WEL was clear, leaves EPE at 0.
- * That case is caught by FLASH_bVerifyErasedLocked's read-back instead, so the
- * two checks are complementary rather than redundant: EPE catches "tried and
- * failed", the read-back catches "never tried". */
-static bool FLASH_bEraseProgramErrorLocked(void)
+/* "Is any protection bit set, in either register?" Call with the mutex held
+ * and the device awake. Optional out-params return the raw registers for the
+ * caller's log line. Single definition so that no path can drift back to
+ * judging protection from SR1 alone - which misses CMP, and CMP = 1 with
+ * BP = 0 protects the whole array. */
+static bool FLASH_bProtectedLocked(uint8_t *pu8Sr1, uint8_t *pu8Sr2)
 {
     uint8_t sr1 = 0U;
-    FLASH_vReadStatusLocked(&sr1, NULL);
-    return (sr1 & FLASH_SR1_EPE) != 0U;
+    uint8_t sr2 = 0U;
+    FLASH_vReadStatusLocked(&sr1, &sr2);
+    if (pu8Sr1 != NULL) *pu8Sr1 = sr1;
+    if (pu8Sr2 != NULL) *pu8Sr2 = sr2;
+    return ((sr1 & FLASH_STATUS_PROTECTED)  != 0U) ||
+           ((sr2 & FLASH_STATUS2_PROTECTED) != 0U);
 }
 
 /* Mirror the fault state into a TAMP backup register. Survives reset and
@@ -400,7 +404,6 @@ static void FLASH_vPersistHealth(void)
                      | (bWriteProtectedSeen ? FLASH_HEALTH_BIT_PROTECTED   : 0UL)
                      | (bUnprotectFailed    ? FLASH_HEALTH_BIT_UNPROT_FAIL : 0UL)
                      | (bEraseVerifyFail    ? FLASH_HEALTH_BIT_ERASEVFAIL  : 0UL)
-                     | (bEpeSeen            ? FLASH_HEALTH_BIT_EPE         : 0UL)
                      | ((uint32_t)au8LastId[0] << 8);
 
     HAL_PWR_EnableBkUpAccess();
@@ -434,14 +437,15 @@ static bool FLASH_bProbeLocked(uint8_t *pu8Id, uint8_t *pu8Attempts)
      *   1F xx xx -> a Renesas part, but not THIS one (see below)
      *   other    -> CPOL/CPHA, timing, or genuinely the wrong part
      *
-     * ALL THREE meaningful bytes are compared, not just the manufacturer.
-     * 1F alone passes any Renesas flash of any density, so a mis-stuffed reel
-     * would have been accepted here and failed much later, at an address the
-     * fitted part does not have - which presents as data corruption, not as an
-     * identification fault. Expected: 1F 44 02 (datasheet Table 14). A fourth
-     * byte, the Extended Device Information String Length, is clocked as well
-     * so the transaction matches the datasheet's Figure 29 exactly; it must be
-     * 00h and is reported but not gated on, since nothing depends on it. */
+     * ALL THREE bytes are compared, not just the manufacturer. 1F alone
+     * passes any Renesas flash of any density - including the AT25XE041B
+     * (1F 44 02) this board was briefly drawn with, whose status register
+     * this driver would then misread - so a mis-stuffed reel would have been
+     * accepted here and failed much later, presenting as data corruption or a
+     * silently refused write rather than as an identification fault.
+     * Expected: 1F 14 01 (datasheet Table 10). Exactly three bytes are
+     * clocked: this part has no fourth "EDI length" byte, and further clocks
+     * only repeat the ID (Table 8 note 9). */
     for (u8Try = 1U; u8Try <= FLASH_JEDEC_READ_ATTEMPTS; u8Try++)
     {
         uint8_t cmd = FLASH_CMD_JEDEC_ID;
@@ -484,77 +488,83 @@ static bool FLASH_bProbeLocked(uint8_t *pu8Id, uint8_t *pu8Attempts)
  * init and may never have had its protection bits cleared. */
 static void FLASH_vBringUpLocked(void)
 {
-    /* Sector protection blocks program and erase while leaving reads working
+    /* Block protection blocks program and erase while leaving reads working
      * perfectly, so a device left in that state freezes its log and ignores
      * chip-erase with nothing anywhere reporting an error. On this part that
-     * is not an exotic fault state - it is the POWER-ON DEFAULT (Table 3), and
-     * it is restored by every ultra-deep-power-down exit, so clearing it is
-     * routine bring-up rather than recovery.
+     * is NOT the power-on default (Table 3), but it is persistent: the bits
+     * are non-volatile, so if something ever wrote them they stay set across
+     * power cycles and deep power-down alike, until a Global Unprotect clears
+     * them.
      *
-     * Both status bytes come from one 05h bracket; there is no SR2 opcode. */
+     * Both registers are read: SR1 for BP/SRP0, SR2 (35h) for CMP/SRP1/QE. */
     uint8_t sr1 = 0U;
     uint8_t sr2 = 0U;
-    FLASH_vReadStatusLocked(&sr1, &sr2);
+    bool    bProtected = FLASH_bProtectedLocked(&sr1, &sr2);
 
-    /* WPP is reported rather than assumed. This board ties WP# to GND, so a
-     * healthy part must read WPP=0; a 1 here means the strap is not what
-     * Flash_Config.h says it is, and that changes what is recoverable - with
-     * WP# high SPRL can be cleared again, with WP# low it cannot. Worth one
-     * line at boot, because nothing else in the system can see that pin. */
-    DBG("FLASH: SR1=%02X (SPRL=%u SPM=%u EPE=%u WPP=%u[WP#=%s] SWP=%u WEL=%u BSY=%u) "
-        "SR2=%02X (RSTE=%u)\r\n",
+    /* Reported by name. Three of these are worth one line at boot because
+     * nothing else in the system can see them:
+     *  - QE: 0 keeps the unconnected pins 3/7 as WP#/HOLD#, held high by the
+     *    part's internal pull-ups. Not a protection fault, so it does not by
+     *    itself trigger a non-volatile SR write; see Flash_Config.h.
+     *  - SUS: this driver never issues 75h, so a 1 means a stray command
+     *    suspended an operation and left a page or block half-done.
+     *  - LB: OTP security-register locks. Should read 000 on every unit, for
+     *    ever; anything else means a stray WRSR reached SR2. */
+    DBG("FLASH: SR1=%02X (SRP0=%u BP=%02X WEL=%u BSY=%u) "
+        "SR2=%02X (SUS=%u CMP=%u LB=%u QE=%u SRP1=%u)\r\n",
         sr1,
-        (unsigned)((sr1 & FLASH_SR1_SPRL)    ? 1U : 0U),
-        (unsigned)((sr1 & FLASH_SR1_SPM)     ? 1U : 0U),
-        (unsigned)((sr1 & FLASH_SR1_EPE)     ? 1U : 0U),
-        (unsigned)((sr1 & FLASH_SR1_WPP)     ? 1U : 0U),
-        (sr1 & FLASH_SR1_WPP) ? "deasserted" : "asserted/GND",
-        (unsigned)((sr1 & FLASH_SR1_SWP_MASK) >> 2),
+        (unsigned)((sr1 & FLASH_SR1_SRP0)    ? 1U : 0U),
+        (unsigned)((sr1 & FLASH_SR1_BP_MASK) >> FLASH_SR1_BP_SHIFT),
         (unsigned)((sr1 & FLASH_SR1_WEL)     ? 1U : 0U),
         (unsigned)((sr1 & FLASH_SR1_RDY_BSY) ? 1U : 0U),
         sr2,
-        (unsigned)((sr2 & FLASH_SR2_RSTE)    ? 1U : 0U));
+        (unsigned)((sr2 & FLASH_SR2_SUS)     ? 1U : 0U),
+        (unsigned)((sr2 & FLASH_SR2_CMP)     ? 1U : 0U),
+        (unsigned)((sr2 & FLASH_SR2_LB_MASK) >> FLASH_SR2_LB_SHIFT),
+        (unsigned)((sr2 & FLASH_SR2_QE)      ? 1U : 0U),
+        (unsigned)((sr2 & FLASH_SR2_SRP1)    ? 1U : 0U));
 
-    if (sr1 & FLASH_STATUS_PROTECTED)
+    if (bProtected)
     {
-        /* Recorded, but NOT treated as a fault on its own: a part that has
-         * only ever been powered up, or that has just come out of UDPD, lands
-         * here every single time by design. The health flag distinguishes a
-         * unit that needed unprotecting from one that did not, which is still
-         * worth knowing - it should be every unit, every boot, and a unit that
-         * reports otherwise is telling us something about its wake path. */
+        /* A real finding on this part, unlike on the AT25XE041B where every
+         * boot landed here. A healthy unit should never set this flag; one
+         * that does has had its non-volatile SR written by something, and the
+         * health word keeps that visible even after the unprotect succeeds. */
         bWriteProtectedSeen = true;
-        DBG("FLASH: array protected (SWP=%u SPRL=%u) - performing global "
-            "unprotect\r\n",
-            (unsigned)((sr1 & FLASH_SR1_SWP_MASK) >> 2),
-            (unsigned)((sr1 & FLASH_SR1_SPRL) ? 1U : 0U));
+        DBG("FLASH: array/SR protected (BP=%02X CMP=%u SRP1:SRP0=%u:%u) - "
+            "performing global unprotect\r\n",
+            (unsigned)((sr1 & FLASH_SR1_BP_MASK) >> FLASH_SR1_BP_SHIFT),
+            (unsigned)((sr2 & FLASH_SR2_CMP)  ? 1U : 0U),
+            (unsigned)((sr2 & FLASH_SR2_SRP1) ? 1U : 0U),
+            (unsigned)((sr1 & FLASH_SR1_SRP0) ? 1U : 0U));
 
         if (FLASH_bGlobalUnprotect())
         {
             bUnprotectFailed = false;
-            DBG("FLASH: unprotected, SR1=%02X\r\n", FLASH_u8ReadStatusReg());
+            FLASH_vReadStatusLocked(&sr1, &sr2);
+            DBG("FLASH: unprotected, SR1=%02X SR2=%02X\r\n", sr1, sr2);
         }
         else
         {
             bUnprotectFailed = true;
-            /* With SPRL latched and WP# grounded this is terminal for writes
-             * on this unit: datasheet 11.3, SPRL cannot be cleared while WP#
-             * is asserted, and WP# has no MCU GPIO. Reads keep working, which
-             * is exactly what makes it easy to miss. */
-            DBG("FLASH: unprotect FAILED, SR1=%02X - SPRL latched with WP# "
-                "grounded; writes are locked until pin 3 is lifted\r\n",
-                FLASH_u8ReadStatusReg());
+            /* SRP1 = 1 is the expected cause (Table 5): with SRP0 = 0 it is
+             * Power Supply Lock-Down, cleared only by a power cycle; with
+             * SRP0 = 1 it is OTP, permanent. Reads keep working either way,
+             * which is exactly what makes it easy to miss. */
+            FLASH_vReadStatusLocked(&sr1, &sr2);
+            DBG("FLASH: unprotect FAILED, SR1=%02X SR2=%02X - %s\r\n",
+                sr1, sr2,
+                (sr2 & FLASH_SR2_SRP1)
+                    ? ((sr1 & FLASH_SR1_SRP0)
+                        ? "SR one-time-programmed (SRP1:SRP0=1:1); writes locked permanently"
+                        : "SR power-supply lock-down (SRP1:SRP0=1:0); writes locked until a power cycle")
+                    : "SR write did not take");
         }
     }
-    else
-    {
-        /* Already clear, so the wake path owes nothing. */
-        bNeedsUnprotect = false;
-    }
 
-    /* Start from a known-safe, disarmed state: with WP# grounded the only thing
-     * standing between us and a permanent write-lock is never accepting a stray
-     * WRSR, which requires WEL=0 at idle. */
+    /* Start from a known-safe, disarmed state: never accepting a stray WRSR,
+     * which requires WEL=0 at idle, is what keeps SRP1 from ever being set by
+     * a glitch on the bus. */
     FLASH_vWriteDisable();
 }
 
@@ -680,10 +690,6 @@ static bool FLASH_bIssueEraseLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
     if (!FLASH_bWaitReady())
         return false;
 
-    /* A UDPD wake re-armed the write protection; undo it before the WREN, or
-     * the device accepts this erase command and does nothing with it. */
-    FLASH_vEnsureUnprotectedLocked();
-
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
     bool bOk = (FLASH_DRIVER_vWrite((uint8_t *)pu8Cmd, u8CmdLen) == HAL_OK);
@@ -696,25 +702,12 @@ static bool FLASH_bIssueEraseLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
     }
 
     /* Commit before returning - see FLASH_vPageWrite for why a self-contained
-     * write matters. */
-    if (!FLASH_bWaitReadyTimeout(u32TimeoutMs))
-        return false;
-
-    /* Ask the device whether its own erase worked. EPE is the one fault signal
-     * that does not depend on reading the array back, so it survives the very
-     * transient this board is being investigated for: a corrupted read-back
-     * can make a good erase look bad, but it cannot fake EPE. */
-    if (FLASH_bEraseProgramErrorLocked())
-    {
-        bEpeSeen = true;
-        if (u16EpeFails < UINT16_MAX) u16EpeFails++;
-        DBG("FLASH: device reports EPE after erase - the erase was attempted "
-            "and FAILED\r\n");
-        FLASH_vPersistHealth();
-        return false;
-    }
-
-    return true;
+     * write matters.
+     *
+     * There is no device-side "erase failed" bit to ask afterwards on this
+     * part (the AT25XE041B's EPE; SR1 bit 5 is BP3 here), so whether the erase
+     * worked is established by FLASH_bEraseRegionLocked's read-back alone. */
+    return FLASH_bWaitReadyTimeout(u32TimeoutMs);
 }
 
 /* Erase a region and PROVE it happened, self-healing a protected chip.
@@ -740,13 +733,15 @@ static bool FLASH_bEraseRegionLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
     if (FLASH_bVerifyErasedLocked(u32Base, u32Len))
         return true;
 
-    uint8_t sr1 = FLASH_u8ReadStatusReg();
-    DBG("FLASH: erase @%06lX len %lu did NOT blank - SR1=%02X%s\r\n",
-        (unsigned long)u32Base, (unsigned long)u32Len, sr1,
-        (sr1 & FLASH_STATUS_PROTECTED) ? " (sector-protected)" : "");
+    uint8_t sr1 = 0U;
+    uint8_t sr2 = 0U;
+    bool    bProtected = FLASH_bProtectedLocked(&sr1, &sr2);
+    DBG("FLASH: erase @%06lX len %lu did NOT blank - SR1=%02X SR2=%02X%s\r\n",
+        (unsigned long)u32Base, (unsigned long)u32Len, sr1, sr2,
+        bProtected ? " (block-protected)" : "");
 
     bool bRetryWorthwhile = false;
-    if (sr1 & FLASH_STATUS_PROTECTED)
+    if (bProtected)
     {
         bWriteProtectedSeen = true;
         if (FLASH_bGlobalUnprotect())
@@ -758,8 +753,9 @@ static bool FLASH_bEraseRegionLocked(const uint8_t *pu8Cmd, uint8_t u8CmdLen,
         else
         {
             bUnprotectFailed = true;
-            DBG("FLASH: unprotect FAILED - SPRL latched with WP# grounded, "
-                "writes locked until pin 3 is lifted\r\n");
+            DBG("FLASH: unprotect FAILED - SR locked (SRP1=%u: power-supply "
+                "lock-down or OTP), writes refused\r\n",
+                (unsigned)((sr2 & FLASH_SR2_SRP1) ? 1U : 0U));
         }
     }
 
@@ -901,6 +897,17 @@ uint8_t FLASH_u8ReadStatusReg(void)
     return sr1;
 }
 
+uint8_t FLASH_u8ReadStatusReg2(void)
+{
+    FLASH_vLock();
+    FLASH_vEnsureAwake();   /* parked, the part ignores 35h too (§6.3.7) */
+    uint8_t sr1 = 0U;
+    uint8_t sr2 = 0U;
+    FLASH_vReadStatusLocked(&sr1, &sr2);
+    FLASH_vUnlock();
+    return sr2;
+}
+
 bool FLASH_bVerifyDevice(void)
 {
     return FLASH_bVerifyDeviceEx(NULL, NULL);
@@ -994,8 +1001,6 @@ void FLASH_vGetHealth(Flash_Health_t *ptHealth)
     ptHealth->u16ProbeFailures    = u16ProbeFailures;
     ptHealth->u16Recoveries       = u16Recoveries;
     ptHealth->u16EraseVerifyFails = u16EraseVerifyFails;
-    ptHealth->bEpeSeen            = bEpeSeen;
-    ptHealth->u16EpeFails         = u16EpeFails;
     ptHealth->u16ReadCrcRetries   = u16ReadCrcRetries;
     ptHealth->u16ReadCrcFails     = u16ReadCrcFails;
     FLASH_vUnlock();
@@ -1159,10 +1164,6 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
         return false;
     }
 
-    /* A UDPD wake re-armed the write protection; undo it before the WREN, or
-     * this page program is accepted and silently discarded. */
-    FLASH_vEnsureUnprotectedLocked();
-
     FLASH_vWriteEnable();
     FLASH_DRIVER_vSelect();
     bool bOk = (FLASH_DRIVER_vWrite(cmd, 4) == HAL_OK) &&
@@ -1180,18 +1181,11 @@ bool FLASH_vPageWrite(uint32_t addr, const uint8_t *buf, uint16_t len)
          * already paying, just accounted to the write that incurs it. */
         bOk = FLASH_bWaitReady();
 
-    /* The device's own verdict on the program it just did. Cheap (one status
-     * read) and it catches the case a read-back cannot distinguish from a bad
-     * read - see FLASH_bEraseProgramErrorLocked. */
-    if (bOk && FLASH_bEraseProgramErrorLocked())
-    {
-        bEpeSeen = true;
-        if (u16EpeFails < UINT16_MAX) u16EpeFails++;
-        DBG("FLASH: device reports EPE after page program @%06lX - bytes on "
-            "the device are NOT what was written\r\n", (unsigned long)addr);
-        FLASH_vPersistHealth();
-        bOk = false;
-    }
+    /* No device-reported program-failure check follows: this part has no EPE
+     * bit (SR1 bit 5 is BP3). A program into a BP/CMP-protected page "is not
+     * executed" (§6.4.1) and reads as ready straight away, exactly like a
+     * successful one; the callers that care (FOTA's whole-image XOR, the
+     * self-test pattern compare) catch that by reading back. */
 
     FLASH_vUnlock();
     return bOk;
@@ -1272,9 +1266,11 @@ bool FLASH_vChipErase(void)
 
     /* A chip erase is exactly the operation used to recover a stuck device, so
      * clear any latched block protection first - otherwise the erase is
-     * silently ignored and the old contents survive. Only touches the SR when
-     * protection is actually set, to avoid needless status-register wear. */
-    if (FLASH_u8ReadStatusReg() & FLASH_STATUS_PROTECTED)
+     * silently ignored and the old contents survive (§6.4.8: not executed if
+     * ANY region is protected). Only touches the SR when protection is
+     * actually set, to avoid needless non-volatile status-register wear. Both
+     * registers are checked: CMP alone protects the whole array. */
+    if (FLASH_bProtectedLocked(NULL, NULL))
         (void)FLASH_bGlobalUnprotect();
 
     /* Verified like the other two, and doubly worth it here: chip erase is the
@@ -1314,15 +1310,14 @@ void FLASH_vDeepPowerDown(void)
         return;     /* already parked — don't churn SPI */
     }
 
-    /* NEVER park the device over a live program/erase. The datasheet says the
-     * Ultra-Deep Power-Down command is ignored while an internally self-timed
-     * operation is in progress (12.4), so in principle the device defends
-     * itself here - but this guard predates that reading and stays anyway: it
-     * was written for the previous part, where 0xB9 issued while busy ABORTED
-     * the operation and left the page it was committing half-programmed, with
-     * nothing anywhere reporting an error. Trusting a datasheet sentence over
-     * a check that costs one status read, on the path that silently corrupts
-     * a firmware image when it is wrong, is not a trade worth making.
+    /* NEVER park the device over a live program/erase. On THIS part the guard
+     * is load-bearing, not belt-and-braces: §6.3.7 does not say Deep
+     * Power-Down is refused while busy (§6.3.1 says that only of ABh), and
+     * frtag2, which ran this same AT25EU0041A, saw 0xB9 issued while busy
+     * ABORT the operation and leave the page it was committing half-
+     * programmed, with nothing anywhere reporting an error. A check that costs
+     * one status read, on the path that silently corrupts a firmware image
+     * when it is wrong, is not a trade worth skipping.
      *
      * This is reachable because the write primitives used to return with the
      * program still in flight (see FLASH_vPageWrite) while this call comes
@@ -1339,15 +1334,17 @@ void FLASH_vDeepPowerDown(void)
         return;
     }
 
-    /* Ultra-deep, not deep: ~200 nA against ~4.5 uA, and this device spends
-     * almost all of its life parked between 1 Hz heartbeats. The cost is paid
-     * on the way out - see FLASH_vEnsureAwake for the CS-pulse exit, and
-     * bNeedsUnprotect for the write protection the exit re-arms. */
-    uint8_t cmd = FLASH_CMD_ULTRA_DEEP_PWR_DN;
+    /* Deep Power-Down (B9h, §6.3.7): ~0.1 uA typ against ~10.5 uA standby
+     * (Table 20), and this device spends almost all of its life parked
+     * between 1 Hz heartbeats. This part has no deeper mode - the AT25XE041B's
+     * Ultra-Deep Power-Down (79h) does not exist here, and its CS-pulse exit
+     * would NOT wake this part. One byte, CS# high on the byte boundary or the
+     * command is not executed; the device is parked within tDP. */
+    uint8_t cmd = FLASH_CMD_DEEP_PWR_DOWN;
     FLASH_DRIVER_vSelect();
     FLASH_DRIVER_vWrite(&cmd, 1);
     FLASH_DRIVER_vDeselect();
-    HAL_SYSTEM_vBusyWaitUs(FLASH_TEUDPD_US);   /* tEUDPD - CS high to UDPD */
+    HAL_SYSTEM_vBusyWaitUs(FLASH_TDP_US);      /* tDP - CS high to deep PD */
     bInDpd = true;
     FLASH_vUnlock();
 }
@@ -1356,27 +1353,22 @@ void FLASH_vDeepPowerDown(void)
  *
  * Called from FLASH_vInit, where the state of the part is genuinely unknown:
  * a watchdog or software reset restarts the MCU without power-cycling the
- * flash, so the device can still be sitting in the UDPD its previous life
- * parked it in. bInDpd, being RAM, comes back false and would have skipped
- * the wake entirely - so the exit sequence is issued unconditionally here.
+ * flash, so the device can still be sitting in the deep power-down its
+ * previous life parked it in - where it ignores every command but ABh,
+ * including the JEDEC read FLASH_vInit is about to make (§6.3.7). bInDpd,
+ * being RAM, comes back false and would have skipped the wake entirely - so
+ * ABh is issued unconditionally here.
  *
- * Harmless on an already-awake device: a CS pulse with no clock starts no
- * operation (6, "if the CS pin is deasserted before complete opcode and
- * address information is sent, no operation is done"). */
+ * Harmless on an already-awake device: ABh with no trailing dummy bytes is
+ * just Release Power-down, and a device that is not powered down has nothing
+ * to release (§6.3.1). If the device is mid-program (reset landed during a
+ * write) ABh is ignored, which is equally harmless - a busy device cannot
+ * have been parked - and FLASH_bWaitReady in front of every command covers
+ * the remainder of that operation. */
 void FLASH_vReleaseDeepPowerDown(void)
 {
     FLASH_vLock();
-
-    FLASH_DRIVER_vSelect();
-    HAL_SYSTEM_vBusyWaitUs(FLASH_TCSLU_US);    /* >= tCSLU */
-    FLASH_DRIVER_vDeselect();
-    HAL_SYSTEM_vBusyWaitUs(FLASH_TXUDPD_US);   /* tXUDPD */
-
+    FLASH_vSendResumeLocked();
     bInDpd = false;
-    /* Assume the worst about protection: if the device really was in UDPD,
-     * 12.5.3 has just reset its Sector Protection Registers to the protected
-     * default. Bring-up clears the flag again when it finds SWP already 00. */
-    bNeedsUnprotect = true;
-
     FLASH_vUnlock();
 }

@@ -27,7 +27,9 @@
 #include "flashLog.h"
 #include "str.h"
 #include "version_config.h"   /* VERSION_u32Get() — primary's own running version */
-#include "LoraRadio.h"        /* LORA_NOISE_FLOOR_INVALID — AT+RTLOG rows */
+#include "LoraRadio.h"        /* LORA_NOISE_FLOOR_INVALID — AT+RTLOG rows,
+                               * LORARADIO_u32GetUniqueId() — AT+BLOG header */
+#include "crc16.h"            /* AT+BLOG payload integrity */
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -108,6 +110,14 @@ static uint32_t u32FrWakeLowTick;
 
 /* ---- Device state ---- */
 bool bFRDeviceOn;
+
+/* Set from the fr9's ready line: true when it read "RDY,B", i.e. this logger
+ * accepts the binary discovery upload. Written on the AT handler task inside
+ * bParseRDY and read on the AppTask after bDeviceOn returns, which is a plain
+ * happens-before through the thread-flag handshake in bATSend - no barrier
+ * needed, but it is cleared before every wait so a failed handshake can never
+ * leave the previous session's answer standing. */
+static bool bFRLoggerBinary;
 
 /* ---- AT parser type ---- */
 typedef bool (*ATParserFn)(const char *line, void *context);
@@ -301,6 +311,11 @@ bool FARMRANGER_bDeviceOn(void)
     FR_DRIVER_vIntEnable();
     bFrWakeHigh = true;
 
+    /* Assume no binary support until the ready line says otherwise, so a
+     * handshake that fails or an fr9 that is swapped out between sessions can
+     * never leave a stale "yes" behind. */
+    bFRLoggerBinary = false;
+
     char respBuf[32] = {0};
     DBG_LOG("Wait for RDY...\r\n");
     if (!FARMRANGER_bATSend(NULL,
@@ -315,8 +330,14 @@ bool FARMRANGER_bDeviceOn(void)
     }
 
     bFRDeviceOn = true;
-    DBG_LOG("Farmranger Ready.\r\n");
+    DBG_LOG("Farmranger Ready (binary upload %s).\r\n",
+            bFRLoggerBinary ? "supported" : "not supported");
     return true;
+}
+
+bool FARMRANGER_bLoggerSupportsBinary(void)
+{
+    return bFRDeviceOn && bFRLoggerBinary;
 }
 
 /* --------------------------------------------------------------------------
@@ -510,57 +531,24 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
 }
 
 /* --------------------------------------------------------------------------
- * FARMRANGER_bLogData — sends neighbor table to logger
+ * AT+LOG (CSV) upload removed — primary now speaks AT+BLOG only. See
+ * FARMRANGER_bBLogData / FARMRANGER_bBLogBasicData below.
  * -------------------------------------------------------------------------- */
-/* One CSV row — see FARMRANGER_iFormatRow for the column order. Worst case is
- * ~67 chars (8-hex id + signed micro-degree lat/lon + the 4-hex RssiSrc); 80
- * still leaves margin. The margin matters: a row that would exceed this aborts
- * the WHOLE upload rather than truncating (both passes in FARMRANGER_bLogData
- * treat >= FR_CSV_ROW_MAX as a hard failure). */
-#define FR_CSV_ROW_MAX 80
 
-/* Inter-row pacing for the CSV upload (ms). The fr9 receives into a 128-byte
- * UART RX ring drained by a co-operative loop that echoes every byte to USB;
- * if the whole payload is streamed back-to-back at line rate that ring
- * overflows and the fr9 never counts the full length (→ "LOG TIMEOUT"). We
- * therefore wait for each row to leave the wire and pause briefly, bounding
- * the in-flight data to a single row and giving the fr9 time to drain. This is
- * the throttle the per-byte osDelay in HAL_UART_vTxPutBuffer used to provide
- * before that path was sped up for the (USART2) flash-log dump. */
+/* Inter-row pacing for the binary upload (ms). The fr9 receives into a
+ * 128-byte UART RX ring drained by a co-operative loop that echoes every
+ * byte to USB; if the whole payload is streamed back-to-back at line rate
+ * that ring overflows and the fr9 never counts the full length (→ "LOG
+ * TIMEOUT"). We therefore wait for each chunk to leave the wire and pause
+ * briefly, bounding the in-flight data and giving the fr9 time to drain. */
 #define FR_LOG_ROW_GAP_MS 10U
 
-/* Upper bound (ms) on waiting for one CSV row to leave the wire. A row is at
- * most FR_CSV_ROW_MAX bytes, ~7 ms at 115200, so this only trips when USART1
- * is wedged. Without a bound such a wait hangs the AppTask with the campaign
- * sleep lock held, so the device never reaches STOP2 again. */
+/* Upper bound (ms) on waiting for one upload chunk to leave the wire. A chunk
+ * is at most FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES = 66 bytes, ~6 ms
+ * at 115200, so this only trips when USART1 is wedged. Without a bound such a
+ * wait hangs the AppTask with the campaign sleep lock held, so the device
+ * never reaches STOP2 again. Also bounds the AT+RTLOG row drain. */
 #define FR_LOG_TX_DRAIN_TIMEOUT_MS 3500U
-
-/* Format neighbor `i` into `row` (size FR_CSV_ROW_MAX). Returns the byte
- * count, or <=0 / >=FR_CSV_ROW_MAX on error. */
-static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
-{
-    /* Column order (must match fr9-side advanced-mode DBG_LOG header in
-     * FRTAG_vLogCmdHandler): DeviceId, Hops, Wave, RSSI, BatMv, Move, Lat, Lon,
-     * FwPatch, RssiSrc.
-     *
-     * RssiSrc is appended LAST, and is the node whose DReq produced the RSSI in
-     * this row — 0 when the neighbour's firmware predates the field. The fr9
-     * counts tab-separated records and streams the bytes to its log without
-     * parsing the columns, so a new column costs it nothing; only its printed
-     * header line needs the matching update. */
-    return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%u,%d,%u,%u,%ld,%ld,%u,%X\t",
-                    (unsigned int)n->u32DeviceId,
-                    n->u8HopCount,
-                    n->u8Wave,
-                    n->i16Rssi,
-                    n->u16BatMv,
-                    n->u8MoveState,
-                    (long)n->i32LatUDeg,
-                    (long)n->i32LonUDeg,
-                    n->u8FwPatch,
-                    (unsigned int)n->u16BestRssiSrcId);
-}
 
 /* Upload retry policy. The fr9 signals a failed transfer (bytes lost on the
  * wire, e.g. its RX ring overflowed during a GNSS acquire or a flash-log page
@@ -571,107 +559,131 @@ static int FARMRANGER_iFormatRow(char *row, const MeshDiscoveredNeighbor_t *n)
 #define FR_LOG_VERDICT_MS      6500U
 #define FR_LOG_RETRY_DELAY_MS  250U
 
-/* One AT+LOG upload attempt: handshake, paced row stream, final verdict.
- * `pos` is the pre-computed total payload length. */
-static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
-                                   uint16_t count, size_t pos)
+/* ==========================================================================
+ * Binary discovery upload (AT+BLOG)
+ *
+ * See Farmranger.h for the wire format and why it exists. What follows is the
+ * CSV path's structure with the formatting replaced; the parts that are the
+ * same are the same on purpose - the pacing, the attempt count and the 6.5 s
+ * verdict window are all values the CSV path arrived at against real fr9
+ * behaviour, and none of them changes because the bytes are binary.
+ *
+ * Two differences worth knowing:
+ *
+ * - No count==0 special case. The CSV path needs one because AT+LOG=0 has no
+ *   payload at all, so the fr9 answers "Logger ready" and "OK" on adjacent
+ *   ticks and a queue reset between them loses the OK. An empty binary
+ *   campaign still has its 8-byte header to send, so the normal three-step
+ *   flow applies and that race cannot arise here.
+ * - The CRC has to be known before the header line goes out, so pass 1 folds
+ *   it while it counts. That is the only reason pass 1 exists at all; the
+ *   length is just 8 + count*22.
+ * ========================================================================== */
+
+/* Records per UART write.
+ *
+ * 3 * 22 = 66 bytes, chosen to sit just under the ~67-byte worst case of a
+ * single CSV row - the in-flight size that FR_LOG_ROW_GAP_MS was tuned
+ * against and that the fr9's 128-byte co-operatively-drained RX ring is known
+ * to survive. Larger chunks would be faster and are probably fine, but "fine"
+ * here means "does not overflow a ring on the other board", and there is no
+ * reason to re-litigate that with a bigger number when the campaign takes
+ * under a second either way. */
+#define FR_BLOG_RECS_PER_CHUNK  3U
+
+/* ---- little-endian writers ---- */
+
+static void FARMRANGER_vPut16(uint8_t *p, uint16_t v)
 {
-    char row[FR_CSV_ROW_MAX];
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+}
 
-    /* Step 1: send AT+LOG=<len> and wait for "Logger ready". Without it the
-     * fr9 is not in its payload state and the stream would go into the void —
-     * fail the attempt rather than transmit blind. */
-    /* AT+LOG=<len>,<primaryVerMMmmpp> — the primary's own running version
-     * travels with the campaign so fr9 can log which firmware captured this
-     * batch. Once per upload, not per row (it doesn't vary within a campaign). */
-    char cmd[40];
-    snprintf(cmd, sizeof(cmd), "AT+LOG=%u,%lu\r\n",
-             (unsigned)pos, (unsigned long)VERSION_u32Get());
+static void FARMRANGER_vPut32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+    p[2] = (uint8_t)((v >> 16) & 0xFFU);
+    p[3] = (uint8_t)((v >> 24) & 0xFFU);
+}
 
-    DBG_LOG("LogData: attempt sending AT+LOG=%u (primary v%lu)\r\n",
-            (unsigned)pos, (unsigned long)VERSION_u32Get());
+/* Payload header: version, record type, count, this primary's device id,
+ * discovery duration (0 when the caller has none to report — see the
+ * FR_BLOG_HDR_BYTES note in Farmranger.h). */
+static void FARMRANGER_vPackHeader(uint8_t *hdr, uint8_t u8Type, uint16_t count,
+                                   uint32_t u32DurationS)
+{
+    hdr[0] = (uint8_t)FR_BLOG_FORMAT_VER;
+    hdr[1] = u8Type;
+    FARMRANGER_vPut16(&hdr[2], count);
+    FARMRANGER_vPut32(&hdr[4], LORARADIO_u32GetUniqueId());
+    FARMRANGER_vPut32(&hdr[8], u32DurationS);
+}
 
-    /* For an empty upload (count==0) the fr9 sends "Logger ready\r\n" and
-     * "OK\r\n" back-to-back on adjacent state-machine ticks. Splitting that
-     * into a separate Step-1 wait (via bATSend, which resets the line queue
-     * on entry) only exists to guard the payload stream below -- there's no
-     * stream to guard here, and the split is exactly what created a
-     * consume-race that lost the OK and forced an unnecessary retry (the
-     * fr9 then received a second AT+LOG=0, logging the empty campaign
-     * twice). Skip the AT-handler round-trip: send AT+LOG=0 directly and
-     * let Step 3 below discard the Logger ready and pick up the OK from
-     * the same queue. For count>0 the payload's own streaming time gives
-     * fr9 the gap it needs, so the split remains correct. */
-    char respBuf[32] = {0};
-    if (count == 0)
+/* Advanced record, FR_BLOG_RECORD_BYTES bytes. Field order is the wire
+ * contract in Farmranger.h, NOT the struct's own layout - see the note there
+ * about why this is written out a field at a time. */
+static void FARMRANGER_vPackRow(uint8_t *rec, const MeshDiscoveredNeighbor_t *n)
+{
+    FARMRANGER_vPut32(&rec[0],  n->u32DeviceId);
+    FARMRANGER_vPut32(&rec[4],  (uint32_t)n->i32LatUDeg);
+    FARMRANGER_vPut32(&rec[8],  (uint32_t)n->i32LonUDeg);
+    FARMRANGER_vPut16(&rec[12], (uint16_t)n->i16Rssi);
+    FARMRANGER_vPut16(&rec[14], n->u16BatMv);
+    FARMRANGER_vPut16(&rec[16], n->u16BestRssiSrcId);
+    rec[18] = n->u8HopCount;
+    rec[19] = n->u8Wave;
+    rec[20] = n->u8FwPatch;
+    /* bit0 carries u8MoveState as-is (0 = moving, 1 = still). Not inverted
+     * into a "moving" boolean anywhere along the way - the fr9 renders this
+     * straight back into the Move column it has always printed. */
+    rec[21] = (uint8_t)((n->u8MoveState ? 0x01U : 0x00U)
+                      | (n->bGpsValid  ? 0x02U : 0x00U));
+}
+
+/* Basic record, same width, different fields - and no hops/wave, because
+ * basic mode runs no mesh campaign. */
+static void FARMRANGER_vPackBasicRow(uint8_t *rec, const MeshBasicNeighbor_t *n)
+{
+    FARMRANGER_vPut32(&rec[0],  n->u32DeviceId);
+    FARMRANGER_vPut32(&rec[4],  (uint32_t)(n->bGpsValid ? n->i32LatUDeg : 0));
+    FARMRANGER_vPut32(&rec[8],  (uint32_t)(n->bGpsValid ? n->i32LonUDeg : 0));
+    FARMRANGER_vPut32(&rec[12], n->bGpsValid ? n->u32GpsAgeS : 0UL);
+    FARMRANGER_vPut16(&rec[16], n->u16BatMv);
+    FARMRANGER_vPut16(&rec[18], (uint16_t)n->i16Rssi);
+    rec[20] = n->u8FwPatch;
+    rec[21] = (uint8_t)((n->u8MoveState ? 0x01U : 0x00U)
+                      | (n->bGpsValid  ? 0x02U : 0x00U));
+}
+
+/* Queue a chunk and wait for it to leave the wire, then pause. Same shape as
+ * the CSV row loop: bound the in-flight bytes to one chunk so the fr9's RX
+ * ring cannot overflow. Returns false on a TX stall. */
+static bool FARMRANGER_bBLogSendChunk(const uint8_t *p, uint16_t n)
+{
+    HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)p, n);
+
+    uint32_t u32TxStart = osKernelGetTickCount();
+    while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
     {
-        /* Reset the line queue so nothing stale from before this attempt
-         * lands in Step 3 as a false verdict. */
-        osMessageQueueReset(xLineQueue);
-        HAL_UART_vTxPutBuffer(&farmranger.UartHandle,
-                              (uint8_t *)cmd,
-                              (uint16_t)strlen(cmd));
-    }
-    else
-    {
-        if (!FARMRANGER_bATSend(cmd,
-                                FARMRANGER_bParseLoggerReady,
-                                respBuf,
-                                sizeof(respBuf),
-                                respBuf,
-                                1000))
+        if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
         {
-            EVTLOG(LOG_FRLOG_ERROR, 1);
-            DBG_LOG("LogData: No 'Logger ready' received (Step 1 fail).\r\n");
+            EVTLOG(LOG_FRLOG_ERROR, 2);
+            DBG_LOG("UART TX timeout (BLOG)\r\n");
             return false;
         }
+        osDelay(1);
     }
 
-    /* Step 2: stream the CSV payload one row at a time, paced so the fr9 keeps
-     * up. HAL_UART_vTxPutByte copies each byte into the TX ring, so `row` is
-     * reusable as soon as vTxPutBuffer returns; after queueing a row we wait
-     * for it to fully leave the wire (HAL_UART_bTxIdle) and then pause
-     * FR_LOG_ROW_GAP_MS. That bounds the in-flight data to one row so the fr9's
-     * RX ring can't overflow (see FR_LOG_ROW_GAP_MS). */
-    for (uint16_t i = 0; i < count; i++)
-    {
-        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
-        if (n <= 0 || n >= (int)sizeof(row))
-            return false;
+    osDelay(FR_LOG_ROW_GAP_MS);
+    return true;
+}
 
-        HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)n);
-
-        /* Wait for this row to drain off the wire before sending the next. */
-        uint32_t u32TxStart = osKernelGetTickCount();
-        while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
-        {
-            if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
-            {
-                EVTLOG(LOG_FRLOG_ERROR, 2);
-                DBG_LOG("UART TX timeout\r\n");
-                return false;
-            }
-            osDelay(1);
-        }
-
-        osDelay(FR_LOG_ROW_GAP_MS);
-    }
-
-    /* Step 3: wait for the fr9's verdict — "OK" (all bytes counted) or "ERR"
-     * (its silence timeout hit before the count was reached: bytes were lost
-     * and the upload must be retried). No line at all also fails the attempt.
-     *
-     * Captured INLINE off xLineQueue rather than via FARMRANGER_bATSend, and
-     * without resetting the queue first. The fr9 answers AT+LOG=0 by sending
-     * "Logger ready\r\n" and "OK\r\n" back-to-back on adjacent state-machine
-     * ticks (see fr9's FRTAG_vLogCmdHandler), so for empty uploads the "OK"
-     * regularly lands here before this code even starts waiting -- either
-     * queued right behind the "Logger ready" that Step 1 consumed, or arriving
-     * within microseconds of the empty Step 2 loop finishing. Going through
-     * bATSend would call osMessageQueueReset on entry (via the AT handler) and
-     * lose that already-queued OK; the whole upload would time out at
-     * FR_LOG_VERDICT_MS and retry unnecessarily, logging the same discovery
-     * twice on the fr9. */
+/* Wait for the fr9's verdict. Read INLINE off xLineQueue without resetting it,
+ * for the same reason the CSV path does - see the long note in
+ * FARMRANGER_bLogAttempt's Step 3. Returns true only on "OK". */
+static bool FARMRANGER_bBLogVerdict(void)
+{
     char       cVerdict    = '\0';
     uint32_t   u32Start    = osKernelGetTickCount();
     bool       bGotVerdict = false;
@@ -691,196 +703,208 @@ static bool FARMRANGER_bLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
 
     if (!bGotVerdict)
     {
-        DBG_LOG("LogData: no verdict received (Step 3 timeout).\r\n");
+        DBG_LOG("BLogData: no verdict received (Step 3 timeout).\r\n");
         EVTLOG(LOG_FRLOG_ERROR, 3);
         return false;
     }
 
     if (cVerdict != 'O')
     {
-        DBG_LOG("LogData: fr9 reported ERR (bytes lost).\r\n");
+        DBG_LOG("BLogData: fr9 reported ERR (crc or bytes lost).\r\n");
         EVTLOG(LOG_FRLOG_ERROR, 4);
         return false;
     }
 
-    DBG_LOG("LogData: Step 3 OK (verdict='%c')\r\n", cVerdict);
     return true;
 }
 
-/* Basic-mode row format for the primary's periodic flush. Different
- * column set from FARMRANGER_iFormatRow — no hops/wave/RSSI (there's
- * no mesh campaign in basic mode), has GPS age. Consumed the same way
- * on fr9 (opaque byte stream, "\t" record delimiter — see
- * FRTAG_vLogCmdHandler in fr9's frtag.c), so no fr9-side parser change
- * is required; the flash-log dump just shows a different column count
- * per row in basic-mode uploads vs advanced-mode uploads. */
-static int FARMRANGER_iFormatBasicRow(char *row, const MeshBasicNeighbor_t *n)
+/* One AT+BLOG attempt. `u16Len` and `u16Crc` come from the single pass the
+ * caller already made over the table, so an attempt never re-folds the CRC. */
+static bool FARMRANGER_bBLogAttempt(const MeshDiscoveredNeighbor_t *neighbors,
+                                    uint16_t count, uint16_t u16Len, uint16_t u16Crc,
+                                    uint32_t u32DurationS)
 {
-    /* Basic-mode columns (must match the fr9 basic-mode header string in
-     * FRTAG_vLogCmdHandler): DeviceId,BatMv,RSSI,Move,FwPatch,Lat,Lon,AgeS */
-    return snprintf(row, FR_CSV_ROW_MAX,
-                    "%X,%u,%d,%u,%u,%ld,%ld,%lu\t",
-                    (unsigned int)n->u32DeviceId,
-                    n->u16BatMv,
-                    n->i16Rssi,
-                    n->u8MoveState,
-                    n->u8FwPatch,
-                    n->bGpsValid ? (long)n->i32LatUDeg : 0L,
-                    n->bGpsValid ? (long)n->i32LonUDeg : 0L,
-                    n->bGpsValid ? (unsigned long)n->u32GpsAgeS : 0UL);
-}
+    uint8_t  au8Chunk[FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES];
+    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
+    char     cmd[48];
+    char     respBuf[32] = {0};
 
-static bool FARMRANGER_bLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
-                                        uint16_t count, size_t pos)
-{
-    /* Structurally identical to FARMRANGER_bLogAttempt but formats via
-     * iFormatBasicRow. Kept as a parallel function rather than a
-     * callback-parameterized shared body so the fast advanced-mode path
-     * stays function-pointer-free (matters on this small MCU) and the
-     * two column sets can drift independently without cross-impact. */
-    char row[FR_CSV_ROW_MAX];
+    snprintf(cmd, sizeof(cmd), "AT+BLOG=%u,%lu,%04X\r\n",
+             (unsigned)u16Len, (unsigned long)VERSION_u32Get(), (unsigned)u16Crc);
 
-    char cmd[40];
-    int n = snprintf(cmd, sizeof(cmd), "AT+LOG=%u,%lu\r\n",
-                     (unsigned)pos, (unsigned long)VERSION_u32Get());
-    if (n <= 0) return false;
+    DBG_LOG("BLogData: AT+BLOG=%u,%lu,%04X (%u records)\r\n",
+            (unsigned)u16Len, (unsigned long)VERSION_u32Get(),
+            (unsigned)u16Crc, (unsigned)count);
 
-    char respBuf[32] = {0};
-    if (!FARMRANGER_bATSend(cmd, FARMRANGER_bParseLoggerReady, respBuf, sizeof(respBuf), NULL, 3000))
+    /* Step 1: without "Logger ready" the fr9 is not in its payload state, so
+     * the stream would go into the void. Fail rather than transmit blind. */
+    if (!FARMRANGER_bATSend(cmd,
+                            FARMRANGER_bParseLoggerReady,
+                            respBuf,
+                            sizeof(respBuf),
+                            respBuf,
+                            1000))
     {
-        DBG_LOG("LogData: No 'Logger ready' received (basic Step 1 fail).\r\n");
         EVTLOG(LOG_FRLOG_ERROR, 1);
+        DBG_LOG("BLogData: No 'Logger ready' received (Step 1 fail).\r\n");
         return false;
     }
 
-    for (uint16_t i = 0; i < count; i++)
+    /* Step 2: header, then the records in paced chunks. */
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count, u32DurationS);
+    if (!FARMRANGER_bBLogSendChunk(au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES))
+        return false;
+
+    for (uint16_t i = 0; i < count; )
     {
-        int rn = FARMRANGER_iFormatBasicRow(row, &neighbors[i]);
-        if (rn <= 0 || rn >= (int)sizeof(row))
+        uint16_t u16InChunk = 0;
+
+        while ((u16InChunk < FR_BLOG_RECS_PER_CHUNK) && (i < count))
+        {
+            FARMRANGER_vPackRow(&au8Chunk[u16InChunk * FR_BLOG_RECORD_BYTES],
+                                &neighbors[i]);
+            u16InChunk++;
+            i++;
+        }
+
+        if (!FARMRANGER_bBLogSendChunk(au8Chunk,
+                (uint16_t)(u16InChunk * FR_BLOG_RECORD_BYTES)))
             return false;
-        /* Same as the advanced path: queue the whole row through
-         * HAL_UART_vTxPutBuffer, then wait - bounded - for it to leave the
-         * wire. This used to push the row byte-by-byte, ignore whether each
-         * byte fit the TX ring (safe only while FR_CSV_ROW_MAX stays below the
-         * ring's capacity), and wait for TxIdle with no bound at all, so a
-         * wedged USART1 hung the AppTask with the campaign sleep lock held. */
-        HAL_UART_vTxPutBuffer(&farmranger.UartHandle, (uint8_t *)row, (uint16_t)rn);
-
-        uint32_t u32TxStart = osKernelGetTickCount();
-        while (!HAL_UART_bTxIdle(&farmranger.UartHandle))
-        {
-            if ((osKernelGetTickCount() - u32TxStart) >= FR_LOG_TX_DRAIN_TIMEOUT_MS)
-            {
-                EVTLOG(LOG_FRLOG_ERROR, 2);
-                DBG_LOG("LogData: UART TX timeout (basic)\r\n");
-                return false;
-            }
-            osDelay(1);
-        }
-
-        osDelay(FR_LOG_ROW_GAP_MS);
     }
 
-    char cVerdict     = '?';
-    uint32_t u32Start = osKernelGetTickCount();
-    bool bGotVerdict  = false;
-    FrRxLine_t line;
-    while ((osKernelGetTickCount() - u32Start) < FR_LOG_VERDICT_MS)
-    {
-        if (osMessageQueueGet(xLineQueue, &line, NULL, 50U) == osOK)
-        {
-            if (FARMRANGER_bParseLogVerdict(line.data, &cVerdict))
-            {
-                bGotVerdict = true;
-                break;
-            }
-        }
-    }
-
-    if (!bGotVerdict)
-    {
-        DBG_LOG("LogData: no verdict received (basic Step 3 timeout).\r\n");
-        return false;
-    }
-    if (cVerdict != 'O')
-    {
-        DBG_LOG("LogData: fr9 reported ERR on basic-mode flush.\r\n");
-        return false;
-    }
-    return true;
+    /* Step 3 */
+    return FARMRANGER_bBLogVerdict();
 }
 
-bool FARMRANGER_bLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count)
+static bool FARMRANGER_bBLogBasicAttempt(const MeshBasicNeighbor_t *neighbors,
+                                         uint16_t count, uint16_t u16Len, uint16_t u16Crc)
 {
-    char   row[FR_CSV_ROW_MAX];
-    size_t pos = 0;
+    /* Parallel to FARMRANGER_bBLogAttempt for the same reason
+     * bLogBasicAttempt is parallel to bLogAttempt: the two column sets should
+     * be free to drift without either path growing a function pointer. */
+    uint8_t  au8Chunk[FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES];
+    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
+    char     cmd[48];
+    char     respBuf[32] = {0};
+
+    snprintf(cmd, sizeof(cmd), "AT+BLOG=%u,%lu,%04X\r\n",
+             (unsigned)u16Len, (unsigned long)VERSION_u32Get(), (unsigned)u16Crc);
+
+    if (!FARMRANGER_bATSend(cmd, FARMRANGER_bParseLoggerReady,
+                            respBuf, sizeof(respBuf), respBuf, 3000))
+    {
+        EVTLOG(LOG_FRLOG_ERROR, 1);
+        DBG_LOG("BLogData: No 'Logger ready' (basic Step 1 fail).\r\n");
+        return false;
+    }
+
+    /* 0: no meaningful single-campaign duration for a boundary flush — see
+     * the FR_BLOG_HDR_BYTES note in Farmranger.h. */
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
+    if (!FARMRANGER_bBLogSendChunk(au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES))
+        return false;
+
+    for (uint16_t i = 0; i < count; )
+    {
+        uint16_t u16InChunk = 0;
+
+        while ((u16InChunk < FR_BLOG_RECS_PER_CHUNK) && (i < count))
+        {
+            FARMRANGER_vPackBasicRow(&au8Chunk[u16InChunk * FR_BLOG_RECORD_BYTES],
+                                     &neighbors[i]);
+            u16InChunk++;
+            i++;
+        }
+
+        if (!FARMRANGER_bBLogSendChunk(au8Chunk,
+                (uint16_t)(u16InChunk * FR_BLOG_RECORD_BYTES)))
+            return false;
+    }
+
+    return FARMRANGER_bBLogVerdict();
+}
+
+bool FARMRANGER_bBLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count,
+                          uint32_t u32DurationS)
+{
+    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
+    uint8_t  au8Rec[FR_BLOG_RECORD_BYTES];
+    uint16_t u16Len;
+    uint16_t u16Crc;
+
+    /* Pass 1: fold the CRC over exactly the bytes pass 2 will send. One record
+     * buffer, so RAM use is constant in the neighbour count - the same reason
+     * the CSV path makes two passes over one row buffer instead of building
+     * the whole payload. */
+    u16Len = (uint16_t)(FR_BLOG_HDR_BYTES + (count * FR_BLOG_RECORD_BYTES));
+
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_ADVANCED, count, u32DurationS);
+    u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES);
 
     for (uint16_t i = 0; i < count; i++)
     {
-        int n = FARMRANGER_iFormatBasicRow(row, &neighbors[i]);
-        if (n <= 0 || n >= (int)sizeof(row))
-            return false;
-        pos += (size_t)n;
+        FARMRANGER_vPackRow(au8Rec, &neighbors[i]);
+        u16Crc = CRC16_u16CcittUpdate(u16Crc, au8Rec, (uint16_t)FR_BLOG_RECORD_BYTES);
     }
 
+    /* Pass 2: upload, retrying a failed transfer. The fr9 returns to idle
+     * before the next AT+BLOG goes out because the verdict wait outlasts its
+     * silence timeout, so each attempt is self-contained. */
     for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
     {
-        if (FARMRANGER_bLogBasicAttempt(neighbors, count, pos))
+        if (FARMRANGER_bBLogAttempt(neighbors, count, u16Len, u16Crc, u32DurationS))
         {
             if (u8Attempt > 1U)
-                DBG_LOG("LogData: basic upload OK on attempt %u\r\n", u8Attempt);
+                DBG_LOG("BLogData: upload OK on attempt %u\r\n", u8Attempt);
             return true;
         }
+
         if (u8Attempt < FR_LOG_ATTEMPTS)
         {
-            DBG_LOG("LogData: basic attempt %u failed, retrying...\r\n", u8Attempt);
+            DBG_LOG("BLogData: attempt %u failed, retrying...\r\n", u8Attempt);
             osDelay(FR_LOG_RETRY_DELAY_MS);
         }
     }
-    DBG_LOG("LogData: basic all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
+
+    DBG_LOG("BLogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
     return false;
 }
 
-bool FARMRANGER_bLogData(MeshDiscoveredNeighbor_t *neighbors, uint16_t count)
+bool FARMRANGER_bBLogBasicData(MeshBasicNeighbor_t *neighbors, uint16_t count)
 {
-    /* The AT+LOG protocol needs the total payload length up front, so build
-     * it in two passes over a single small row buffer rather than one large
-     * static payload buffer: pass 1 sums the byte count, pass 2 streams each
-     * row. Keeps RAM use to one ~80-byte row regardless of neighbor count. */
-    char   row[FR_CSV_ROW_MAX];
-    size_t pos = 0;
+    uint8_t  au8Hdr[FR_BLOG_HDR_BYTES];
+    uint8_t  au8Rec[FR_BLOG_RECORD_BYTES];
+    uint16_t u16Len;
+    uint16_t u16Crc;
 
-    /* Pass 1: compute total payload length. */
+    u16Len = (uint16_t)(FR_BLOG_HDR_BYTES + (count * FR_BLOG_RECORD_BYTES));
+
+    FARMRANGER_vPackHeader(au8Hdr, (uint8_t)FR_BLOG_TYPE_BASIC, count, 0UL);
+    u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, au8Hdr, (uint16_t)FR_BLOG_HDR_BYTES);
+
     for (uint16_t i = 0; i < count; i++)
     {
-        int n = FARMRANGER_iFormatRow(row, &neighbors[i]);
-        if (n <= 0 || n >= (int)sizeof(row))
-            return false;
-        pos += (size_t)n;
+        FARMRANGER_vPackBasicRow(au8Rec, &neighbors[i]);
+        u16Crc = CRC16_u16CcittUpdate(u16Crc, au8Rec, (uint16_t)FR_BLOG_RECORD_BYTES);
     }
 
-    /* Pass 2: upload, retrying on a failed transfer. A single field event
-     * (fr9 RX overrun during its GNSS window / a flash page erase) drops a
-     * chunk of bytes mid-stream; without a retry that discovery is lost for
-     * good. Each attempt is self-contained — the fr9 returns to idle before
-     * the next AT+LOG goes out (verdict wait > its silence timeout). */
     for (uint8_t u8Attempt = 1U; u8Attempt <= FR_LOG_ATTEMPTS; u8Attempt++)
     {
-        if (FARMRANGER_bLogAttempt(neighbors, count, pos))
+        if (FARMRANGER_bBLogBasicAttempt(neighbors, count, u16Len, u16Crc))
         {
             if (u8Attempt > 1U)
-                DBG_LOG("LogData: upload OK on attempt %u\r\n", u8Attempt);
+                DBG_LOG("BLogData: basic upload OK on attempt %u\r\n", u8Attempt);
             return true;
         }
 
         if (u8Attempt < FR_LOG_ATTEMPTS)
         {
-            DBG_LOG("LogData: attempt %u failed, retrying...\r\n", u8Attempt);
+            DBG_LOG("BLogData: basic attempt %u failed, retrying...\r\n", u8Attempt);
             osDelay(FR_LOG_RETRY_DELAY_MS);
         }
     }
 
-    DBG_LOG("LogData: all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
+    DBG_LOG("BLogData: basic all %u attempts failed\r\n", FR_LOG_ATTEMPTS);
     return false;
 }
 
@@ -1300,9 +1324,20 @@ static bool FARMRANGER_bParseLogVerdict(const char *line, void *ctx)
     return false;
 }
 
+/* The fr9 sends "RDY\r\n" on firmware before 9.12.13 and "RDY,B\r\n" from
+ * 9.12.13, where ",B" means "I accept AT+BLOG". Matching on "RDY" alone, as
+ * this always has, is what makes the suffix safe to add; the suffix is then
+ * read separately so the caller can pick the binary path without having to
+ * probe for it and eat three timeouts against an older board. */
 static bool FARMRANGER_bParseRDY(const char *line, void *ctx)
 {
     (void)ctx;
-    return (line != NULL && strstr(line, "RDY") != NULL);
+
+    if (line == NULL || strstr(line, "RDY") == NULL)
+        return false;
+
+    bFRLoggerBinary = (strstr(line, ",B") != NULL);
+
+    return true;
 }
 
