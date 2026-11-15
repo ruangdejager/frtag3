@@ -1,15 +1,15 @@
 /*
  * Fota_Config.h
  *
- * PARTLY SHARED with frtag2_bootloader/fr_bootloader/inc/Fota_Config.h.
+ * PARTLY SHARED with frtag3_bootloader/fr_bootloader/inc/Fota_Config.h.
  * The flash layout and the application/bootloader handoff contract live in
  * both copies and MUST stay identical in both: the internal flash split,
  * the scratchpad and metadata addresses, the metadata record offsets, magic
- * and markers, OTA_BOOT_MAGIC and the backup-register usage, OTA_FW_INFO_ADDR
- * and FwVersion_t. Any change to one of those has to be made in both files
- * together, because the bootloader is frozen in the field and reads them
- * from its own copy. The two files are, however, no longer byte-identical:
- * this copy carries application-only blocks (the fw_info identity offset, the
+ * and markers, OTA_BOOT_MAGIC and the backup-register usage, OTA_FW_INFO_ADDR,
+ * OTA_FW_INFO_OFFSET and FwVersion_t. Any change to one of those has to be
+ * made in both files together, because the bootloader is frozen in the field
+ * and reads them from its own copy. The two files are, however, no longer
+ * byte-identical: this copy carries application-only blocks (the
  * install-failure counter, the pending-Prep expiry, the pre-send erase
  * threshold, multi-primary coexistence and the verify quiet window), rewrites
  * several comments, and describes the AT25EU0041A flash part and the self-test
@@ -35,7 +35,7 @@
  *
  * ---- Internal flash map (STM32WLE5CC, 256 KB, 2 KB pages) ----
  *
- *   0x08000000 - 0x08004FFF   bootloader (20 KB, frtag2_bootloader project)
+ *   0x08000000 - 0x08004FFF   bootloader (20 KB, frtag3_bootloader project)
  *   0x08005000 - 0x0803FFFF   application (236 KB)
  *
  * ---- External NOR map (AT25EU0041A, 512 KB, 4 KB sectors) ----

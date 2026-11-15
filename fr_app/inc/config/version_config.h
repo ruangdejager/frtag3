@@ -31,8 +31,11 @@
 
 /* Compiled into this image at the fixed address OTA_FW_INFO_ADDR (see
  * version_config.c and STM32WLE5CCUX_FLASH.ld's .fw_info section) so the
- * OTA bootloader can read "what's currently installed" directly out of
- * internal flash, with no runtime dependency of its own. */
+ * OTA bootloader (../frtag3_bootloader) can read "what's currently installed"
+ * directly out of internal flash, with no runtime dependency of its own. It
+ * sits in the image's first 2 KB page, which that bootloader erases first and
+ * programs last, so an unfinished install reads as "no app" rather than as
+ * this version. */
 extern const FwVersion_t gFwVersion;
 
 #endif /* FR_APP_INC_CONFIG_VERSION_CONFIG_H_ */

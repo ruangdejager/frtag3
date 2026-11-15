@@ -417,7 +417,7 @@ static inline void BSP_LED_Toggle(Led_TypeDef led)
  * PC14/PC15  OSC32_IN/OSC32_OUT: the 32.768 kHz LSE crystal, fitted. The RTC
  *            runs from it and all timekeeping depends on it - the calendar,
  *            the 1 Hz heartbeat wake and the STOP2 tick reconciliation in
-  *            vPortSuppressTicksAndSleep(). The frtag2 bootloader starts it
+  *            vPortSuppressTicksAndSleep(). The frtag3 bootloader starts it
  *            first, in its own SystemClock_Config() (an LSE failure hangs the
  *            bootloader, before this image runs); the LSE keeps running across
  *            the jump and is re-asserted by

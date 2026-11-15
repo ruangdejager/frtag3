@@ -726,15 +726,21 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
          *
          * Values must be from the fixed set of WakeupInterval enum
          * mappings (15/30/60/120/240 min); anything else is rejected. */
+        /* Validity is a separate flag, not a sentinel enum value (review F25,
+         * 2026-11-13). WAKEUP_INTERVAL_MAX_COUNT is an alias of
+         * WAKEUP_INTERVAL_240_MIN (both 5), so using it as "invalid" made a
+         * correct "schedule 240" look invalid and be refused. */
         uint32_t u32Mins = (uint32_t)strtoul(p + 19, NULL, 10);
-        WakeupInterval eNew = WAKEUP_INTERVAL_MAX_COUNT;   /* sentinel */
+        WakeupInterval eNew = WAKEUP_INTERVAL_15_MIN;
+        bool bValid = true;
         if      (u32Mins == 15U)  eNew = WAKEUP_INTERVAL_15_MIN;
         else if (u32Mins == 30U)  eNew = WAKEUP_INTERVAL_30_MIN;
         else if (u32Mins == 60U)  eNew = WAKEUP_INTERVAL_60_MIN;
         else if (u32Mins == 120U) eNew = WAKEUP_INTERVAL_120_MIN;
         else if (u32Mins == 240U) eNew = WAKEUP_INTERVAL_240_MIN;
+        else                      bValid = false;
 
-        if (eNew != WAKEUP_INTERVAL_MAX_COUNT)
+        if (bValid)
         {
             MESHNETWORK_vSetWakeupInterval(eNew);
             snprintf(resp, sizeof(resp), "Discovery interval set to %u min\r\n",

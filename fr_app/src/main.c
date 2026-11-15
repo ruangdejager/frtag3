@@ -57,7 +57,7 @@ int main(void)
      * from reset they float: PA0 is the fr9 wake line on a primary and the
      * GNSS LDO enable on a secondary, PA4 the battery divider's load-switch
      * enable, PA11 the accelerometer chip select. SystemClock_Config() below starts
-     * the LSE crystal. Behind the frtag2 bootloader (every deployed board)
+     * the LSE crystal. Behind the frtag3 bootloader (every deployed board)
      * the LSE is already running: the bootloader starts it in its own
      * SystemClock_Config() and HAL_RCC_DeInit() leaves the backup domain
      * alone, so the wait here is effectively zero, and any multi-second cold

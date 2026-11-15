@@ -11,9 +11,11 @@
  * image starts without the bootloader (a debugger launch), the LSE start
  * inside SystemClock_Config() can take up to LSE_STARTUP_TIMEOUT (5 s) - or
  * end in Error_Handler() if the crystal never starts - so the safe state goes
- * in before it. Behind the frtag2 bootloader the LSE is already running and
- * the wait is effectively zero; the safe state then simply shortens the
- * application's own float window as far as it can go. Running that early
+ * in before it. Behind the frtag3 bootloader the LSE is already running and
+ * the wait is effectively zero, and the bootloader has applied these same
+ * levels itself before its own LSE start (frtag3_bootloader Hal/src/hal_gpio.c
+ * - keep the two in step); its HAL_DeInit() at the jump resets the ports, so
+ * this re-applies them a few microseconds later. Running that early
  * means running at the 4 MHz reset MSI clock with no kernel: HAL_GPIO_vInit()
  * must stay free of RTOS calls, logging and delays.
  *
