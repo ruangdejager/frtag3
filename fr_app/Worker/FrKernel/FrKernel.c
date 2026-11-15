@@ -548,7 +548,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         {
             FRKERNEL_vRespond(eXport,
                 "  tag flash clear             erase ext-flash log\r\n"
-                "  tag flash eraseall           erase entire ext-flash (log + staged OTA image)\r\n"
+                "  tag flash eraseall           erase ext-flash log + staged OTA image, keeps LoRaWAN nonce\r\n"
                 "  tag flash stream            stream ext-flash log\r\n"
                 "  tag fwaccept [off]          arm/disarm firmware acceptance (secondary)\r\n"
                 "  tag fwdistribute            distribute staged firmware (primary)\r\n");
@@ -557,7 +557,7 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
         {
             FRKERNEL_vRespond(eXport,
                 "  tag <ID> flash clear        erase ext-flash log\r\n"
-                "  tag <ID> flash eraseall     erase entire ext-flash (log + staged OTA image)\r\n"
+                "  tag <ID> flash eraseall     erase ext-flash log + staged OTA image, keeps LoRaWAN nonce\r\n"
                 "  tag <ID> flash stream       stream ext-flash log\r\n"
                 "  tag <ID> fwaccept [off]     arm/disarm firmware acceptance (secondary)\r\n"
                 "  tag <ID> fwdistribute       distribute staged firmware (primary)\r\n");
@@ -908,12 +908,14 @@ static void FRKERNEL_vProcessCommand(FrKernelXport_e eXport, const char *line)
     }
     else if (strcmp(p, "flash eraseall") == 0)
     {
-        /* Whole-chip erase: log AND the OTA image scratchpad/metadata below
-         * it. Destroys any staged-but-not-yet-installed OTA image along
-         * with the log — deliberate full field-unit reset, not routine
-         * maintenance, hence the distinct command name from "flash clear". */
+        /* Log AND the OTA image scratchpad/metadata below it. Destroys any
+         * staged-but-not-yet-installed OTA image along with the log —
+         * deliberate field-unit reset, not routine maintenance, hence the
+         * distinct command name from "flash clear". No longer a chip erase:
+         * the LoRaWAN DevNonce journal survives it (review LW04, see
+         * LOG_vEraseAll), so this command cannot lock a tag out of TTN. */
         DBGLOG_vRequestEraseAll();
-        FRKERNEL_vAck(eXport, bBulk, "Full ext-flash erase requested (log + staged OTA image)\r\n");
+        FRKERNEL_vAck(eXport, bBulk, "Ext-flash erase requested (log + OTA image; nonce kept)\r\n");
     }
     else if (strcmp(p, "flash stream") == 0)
     {

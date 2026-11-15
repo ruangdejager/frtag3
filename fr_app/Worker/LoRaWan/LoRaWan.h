@@ -23,9 +23,10 @@
  *
  * The session is RAM-only (no context save), so every reboot re-joins. The
  * LoRaWAN 1.0.4 DevNonce, which the join server requires to keep
- * increasing across those re-joins, is persisted in the last sector of the
- * external NOR (LORAWAN_NVM_FLASH_ADDR, carved off the text log - see
- * Log.h).
+ * increasing across those re-joins, is persisted in a two-sector journal
+ * near the top of the external NOR (LORAWAN_NVM_SECTOR0/1_ADDR, carved off
+ * the text log - see Log.h and "DevNonce persistence" in LoRaWan.c). No
+ * JoinRequest is sent unless its DevNonce has been written and read back.
  */
 
 #ifndef WORKER_LORAWAN_LORAWAN_H_

@@ -61,11 +61,9 @@
 #include "GPS.h"
 #include "version_config.h"
 
-#ifdef STORAGE_BACKEND_FLASH
 #include "Flash.h"
 #include "Flash_Config.h"
-#include "Log.h"          /* LORAWAN_NVM_FLASH_ADDR */
-#endif
+#include "Log.h"          /* LORAWAN_NVM_SECTOR0/1_ADDR */
 
 #include <string.h>
 
@@ -104,9 +102,11 @@ static osThreadId_t     volatile xSessionTask = NULL;
 static bool             bMacReady      = false;
 static bool             bRequestOpen   = false;   /* one of ours is outstanding */
 static volatile uint8_t eResult        = LW_RESULT_PENDING;
-#ifdef STORAGE_BACKEND_FLASH
-static uint16_t         u16NvmNextRec  = 0U;      /* next free record slot */
-#endif
+/* DevNonce journal state (see "DevNonce persistence" below). */
+static bool             bNvmKnown      = false;   /* high-water mark read OK  */
+static uint16_t         u16NvmHigh     = 0U;      /* largest nonce on flash   */
+static uint8_t          u8NvmActive    = 0U;      /* sector holding it        */
+static uint16_t         u16NvmNextRec  = 0U;      /* next free slot in it     */
 
 /* --------------------------------------------------------------------------
  * Radio IRQ deferral (radio_conf.h hooks)
@@ -191,16 +191,61 @@ static uint8_t LORAWAN_u8GetBatteryLevel(void)
 
 /* --------------------------------------------------------------------------
  * DevNonce persistence
+ *
+ * LoRaWAN 1.0.4 DevNonce is a counter the network server remembers per
+ * device: a JoinRequest whose DevNonce is not above every one it has seen
+ * before is refused, and keeps being refused until someone resets the
+ * device's nonce history in the TTN console. So the one hard rule here is
+ * that a DevNonce that has gone on air is never used again, across any number
+ * of resets, brown-outs and failed writes.
+ *
+ * History (review LW01, 2026-11-13, plus a worse finding while fixing it):
+ *   - This code was ported from frtag2 inside #ifdef STORAGE_BACKEND_FLASH.
+ *     frtag3 dropped that option (7122280, "Drop MicroSD"), so on this branch
+ *     the whole journal compiled out: restore returned 0 and store returned
+ *     false, i.e. every boot restarted DevNonce at 0 and only logged a
+ *     warning. The guard is gone - flash is the only backend frtag3 has.
+ *   - The journal was one sector. Rolling it over erased the only copy of the
+ *     high-water mark before writing the replacement; a reset in that gap
+ *     read back a blank sector and restarted at 0.
+ *   - A read error or a torn record made restore return whatever it had seen
+ *     so far, and a failed store still let the join go out.
+ *
+ * Journal: two adjacent 4 KB sectors (LORAWAN_NVM_SECTOR0/1_ADDR, Log.h).
+ * Each holds append-only 8-byte records - magic "LW", nonce, ~nonce, 0x0000
+ * - programmed only onto blank bytes; 8-byte alignment keeps every record
+ * inside one 256-byte program page. The high-water mark is the LARGEST valid
+ * nonce found in either sector (the nonce is monotonic, so "largest" and
+ * "newest" agree, and it does not matter which record was written last).
+ * Records go into the sector holding the high-water mark. When that sector
+ * is full - or holds a torn or foreign record, so appending to it can no
+ * longer be trusted - the OTHER sector is erased and the record is written
+ * there. The sector holding the high-water mark is therefore never erased
+ * while it is the only copy: a reset at any point leaves at least one
+ * readable record at or above every nonce that has been sent.
+ *
+ * Reservation: LORAWAN_bStartJoin reserves the nonce the MAC is about to use
+ * (current + 1; LoRaMacCryptoPrepareJoinRequest increments and then sends)
+ * and sends the JoinRequest only if that record was written AND read back
+ * intact. Anything less - flash absent, read error, erase/program failure,
+ * readback mismatch, 16-bit space exhausted - refuses the join; the next
+ * session tries again. A tag that cannot persist its nonce must not join,
+ * because a join it cannot remember is exactly the one that locks it out
+ * after the next reset.
+ *
+ * Both sectors blank is the only state that restarts at 0. That is a fresh
+ * device; LOG_vEraseAll no longer erases these sectors (review LW04), so a
+ * maintenance erase cannot produce it. Wear: 512 records per sector, one
+ * sector erase per 512 joins, against the part's 10k-cycle rating.
  * -------------------------------------------------------------------------- */
-#ifdef STORAGE_BACKEND_FLASH
-/* External NOR, one sector (LORAWAN_NVM_FLASH_ADDR). Append-only 8-byte
- * records - magic, nonce, ~nonce, 0x0000 - and the last valid one wins, so a
- * record is only ever programmed onto blank bytes. 512 fit before the sector
- * is erased and restarted, i.e. one erase per 512 join attempts. Records are
- * 8-byte aligned, so none straddles a 256-byte program page. */
 #define LORAWAN_NVM_MAGIC              0x4C57U     /* "LW" */
 #define LORAWAN_NVM_REC_BYTES          8U
 #define LORAWAN_NVM_RECS_PER_SECTOR    (FLASH_SECTOR_SIZE_BYTES / LORAWAN_NVM_REC_BYTES)
+#define LORAWAN_NVM_SECTORS            2U
+
+static const uint32_t au32NvmSector[LORAWAN_NVM_SECTORS] = {
+    LORAWAN_NVM_SECTOR0_ADDR, LORAWAN_NVM_SECTOR1_ADDR,
+};
 
 static bool LORAWAN_bNvmRecValid(const uint8_t *r, uint16_t *pu16Nonce)
 {
@@ -214,23 +259,42 @@ static bool LORAWAN_bNvmRecValid(const uint8_t *r, uint16_t *pu16Nonce)
     return true;
 }
 
-/* Scan the sector for the newest record. Also leaves u16NvmNextRec at the
- * first blank slot - or at LORAWAN_NVM_RECS_PER_SECTOR, which makes the next
- * write erase first, when the sector is full or holds anything that is not
- * ours (on a unit upgraded from v2.4.x it is the tail of the old text log). */
-static uint16_t LORAWAN_u16NvmRestore(void)
+static void LORAWAN_vNvmBuildRec(uint8_t r[LORAWAN_NVM_REC_BYTES], uint16_t u16Nonce)
+{
+    r[0] = (uint8_t)(LORAWAN_NVM_MAGIC >> 8);
+    r[1] = (uint8_t)LORAWAN_NVM_MAGIC;
+    r[2] = (uint8_t)(u16Nonce >> 8);
+    r[3] = (uint8_t)u16Nonce;
+    r[4] = (uint8_t)((uint16_t)~u16Nonce >> 8);
+    r[5] = (uint8_t)~u16Nonce;
+    r[6] = 0x00U;
+    r[7] = 0x00U;
+}
+
+/* Scan one sector. Returns false only if it could not be read. On success:
+ *   *pbAny     a valid record was found
+ *   *pu16Max   the largest valid nonce (0 if none)
+ *   *pu16Next  the slot to append to, or LORAWAN_NVM_RECS_PER_SECTOR when
+ *              the sector must not be appended to: full, or anything that is
+ *              neither a valid record nor blank (a torn record, old log text
+ *              on a unit upgraded from the one-sector layout), or a written
+ *              slot after a blank one. Valid records are still counted in
+ *              all of those cases; only appending stops. */
+static bool LORAWAN_bNvmScanSector(uint32_t u32Base, bool *pbAny,
+                                   uint16_t *pu16Max, uint16_t *pu16Next)
 {
     uint8_t  au8Buf[64];
-    uint16_t u16Last  = 0U;
-    uint16_t u16Nonce = 0U;
+    uint16_t u16FirstBlank = LORAWAN_NVM_RECS_PER_SECTOR;
+    bool     bDirty        = false;
 
-    u16NvmNextRec = LORAWAN_NVM_RECS_PER_SECTOR;
+    *pbAny   = false;
+    *pu16Max = 0U;
 
     for (uint16_t u16Rec = 0U; u16Rec < LORAWAN_NVM_RECS_PER_SECTOR; )
     {
-        uint32_t u32Addr = LORAWAN_NVM_FLASH_ADDR + (uint32_t)u16Rec * LORAWAN_NVM_REC_BYTES;
+        uint32_t u32Addr = u32Base + (uint32_t)u16Rec * LORAWAN_NVM_REC_BYTES;
         if (!FLASH_vRead(u32Addr, au8Buf, sizeof(au8Buf)))
-            return u16Last;   /* unreadable: keep the erase-first default */
+            return false;
 
         for (uint16_t i = 0U; i < sizeof(au8Buf); i += LORAWAN_NVM_REC_BYTES, u16Rec++)
         {
@@ -239,44 +303,114 @@ static uint16_t LORAWAN_u16NvmRestore(void)
             for (uint8_t k = 0U; k < LORAWAN_NVM_REC_BYTES; k++)
                 if (r[k] != 0xFFU) { bBlank = false; break; }
 
+            uint16_t u16Nonce = 0U;
             if (bBlank)
             {
-                u16NvmNextRec = u16Rec;
-                return u16Last;
+                if (u16FirstBlank == LORAWAN_NVM_RECS_PER_SECTOR)
+                    u16FirstBlank = u16Rec;
             }
-            if (!LORAWAN_bNvmRecValid(r, &u16Nonce))
-                return u16Last;   /* foreign data: erase before next write */
-            u16Last = u16Nonce;
+            else
+            {
+                if (u16FirstBlank != LORAWAN_NVM_RECS_PER_SECTOR)
+                    bDirty = true;               /* written slot after a blank */
+                if (LORAWAN_bNvmRecValid(r, &u16Nonce))
+                {
+                    if (!*pbAny || u16Nonce > *pu16Max)
+                        *pu16Max = u16Nonce;
+                    *pbAny = true;
+                }
+                else
+                {
+                    bDirty = true;               /* torn or foreign */
+                }
+            }
         }
     }
-    return u16Last;   /* full: erase before next write */
-}
 
-static bool LORAWAN_bNvmStore(uint16_t u16Nonce)
-{
-    if (u16NvmNextRec >= LORAWAN_NVM_RECS_PER_SECTOR)
-    {
-        if (!FLASH_vSectorErase(LORAWAN_NVM_FLASH_ADDR))
-            return false;
-        u16NvmNextRec = 0U;
-    }
-
-    uint8_t r[LORAWAN_NVM_REC_BYTES] = {
-        (uint8_t)(LORAWAN_NVM_MAGIC >> 8), (uint8_t)LORAWAN_NVM_MAGIC,
-        (uint8_t)(u16Nonce >> 8),          (uint8_t)u16Nonce,
-        (uint8_t)((uint16_t)~u16Nonce >> 8), (uint8_t)~u16Nonce,
-        0x00U, 0x00U,
-    };
-    uint32_t u32Addr = LORAWAN_NVM_FLASH_ADDR + (uint32_t)u16NvmNextRec * LORAWAN_NVM_REC_BYTES;
-    if (!FLASH_vPageWrite(u32Addr, r, sizeof(r)))
-        return false;
-    u16NvmNextRec++;
+    *pu16Next = bDirty ? LORAWAN_NVM_RECS_PER_SECTOR : u16FirstBlank;
     return true;
 }
-#else
-static uint16_t LORAWAN_u16NvmRestore(void)       { return 0U; }
-static bool     LORAWAN_bNvmStore(uint16_t u16Nonce) { (void)u16Nonce; return false; }
-#endif /* STORAGE_BACKEND_FLASH */
+
+/* Read both sectors and adopt the high-water mark. Returns false - leaving
+ * bNvmKnown false, so no join can be sent - if either sector is unreadable:
+ * a partial view could miss the larger of the two. */
+static bool LORAWAN_bNvmRestore(void)
+{
+    bool     abAny[LORAWAN_NVM_SECTORS];
+    uint16_t au16Max[LORAWAN_NVM_SECTORS];
+    uint16_t au16Next[LORAWAN_NVM_SECTORS];
+
+    bNvmKnown = false;
+    for (uint8_t s = 0U; s < LORAWAN_NVM_SECTORS; s++)
+    {
+        if (!LORAWAN_bNvmScanSector(au32NvmSector[s], &abAny[s], &au16Max[s], &au16Next[s]))
+        {
+            DBG_LOG("lorawan: devNonce journal sector %u unreadable\r\n", (unsigned)s);
+            return false;
+        }
+    }
+
+    /* Active sector = the one holding the high-water mark. With no records
+     * anywhere (fresh device) start in sector 0. */
+    uint8_t u8Active = 0U;
+    if (abAny[1] && (!abAny[0] || au16Max[1] > au16Max[0]))
+        u8Active = 1U;
+
+    u8NvmActive   = u8Active;
+    u16NvmHigh    = abAny[u8Active] ? au16Max[u8Active] : 0U;
+    u16NvmNextRec = au16Next[u8Active];
+    bNvmKnown     = true;
+    return true;
+}
+
+/* Durably reserve u16Nonce. True only once a record >= u16Nonce is on flash
+ * and has been read back intact. */
+static bool LORAWAN_bNvmReserve(uint16_t u16Nonce)
+{
+    if (!bNvmKnown && !LORAWAN_bNvmRestore())
+        return false;
+
+    if (u16Nonce <= u16NvmHigh)
+        return true;                 /* already covered (e.g. a join the MAC
+                                        refused before preparing it) */
+
+    uint8_t  u8Sector = u8NvmActive;
+    uint16_t u16Slot  = u16NvmNextRec;
+    if (u16Slot >= LORAWAN_NVM_RECS_PER_SECTOR)
+    {
+        /* Rotate. The other sector holds nothing above u16NvmHigh, so
+         * erasing it loses nothing; the active one is left intact. */
+        u8Sector = (uint8_t)(u8NvmActive ^ 1U);
+        if (!FLASH_vSectorErase(au32NvmSector[u8Sector]))
+            return false;
+        u16Slot = 0U;
+    }
+
+    uint8_t  au8Rec[LORAWAN_NVM_REC_BYTES];
+    uint8_t  au8Back[LORAWAN_NVM_REC_BYTES];
+    uint16_t u16Back = 0U;
+    uint32_t u32Addr = au32NvmSector[u8Sector] + (uint32_t)u16Slot * LORAWAN_NVM_REC_BYTES;
+    LORAWAN_vNvmBuildRec(au8Rec, u16Nonce);
+
+    bool bOk = FLASH_vPageWrite(u32Addr, au8Rec, sizeof(au8Rec)) &&
+               FLASH_vRead(u32Addr, au8Back, sizeof(au8Back)) &&
+               LORAWAN_bNvmRecValid(au8Back, &u16Back) && (u16Back == u16Nonce);
+    if (!bOk)
+    {
+        /* That slot may now hold a partial record: stop appending to this
+         * sector. If it was the active one, the next attempt rotates; if it
+         * was the freshly erased one, the next attempt erases it again. The
+         * high-water mark is untouched either way. */
+        if (u8Sector == u8NvmActive)
+            u16NvmNextRec = LORAWAN_NVM_RECS_PER_SECTOR;
+        return false;
+    }
+
+    u8NvmActive   = u8Sector;
+    u16NvmNextRec = (uint16_t)(u16Slot + 1U);
+    u16NvmHigh    = u16Nonce;
+    return true;
+}
 
 static LoRaMacNvmData_t *LORAWAN_ptNvm(void)
 {
@@ -411,15 +545,19 @@ static bool LORAWAN_bMacInit(void)
      * applies the join back-off from it, which is what keeps a tag with no
      * coverage from joining every 15 min forever. */
 
-    /* Continue the DevNonce count from before this boot. */
-    uint16_t u16Nonce = LORAWAN_u16NvmRestore();
-    LORAWAN_ptNvm()->Crypto.DevNonce = u16Nonce;
+    /* Continue the DevNonce count from before this boot. If the journal
+     * cannot be read now, DevNonce stays 0 here and bNvmKnown stays false:
+     * LORAWAN_bStartJoin retries the read and refuses to join until it
+     * succeeds, so the placeholder is never sent. */
+    bool bNvmOk = LORAWAN_bNvmRestore();
+    LORAWAN_ptNvm()->Crypto.DevNonce = bNvmOk ? u16NvmHigh : 0U;
 
     uint8_t au8Eui[8];
     LORAWAN_vGetUniqueId(au8Eui);
-    DBG_LOG("lorawan: DevEUI=%02X%02X%02X%02X%02X%02X%02X%02X devNonce=%u\r\n",
+    DBG_LOG("lorawan: DevEUI=%02X%02X%02X%02X%02X%02X%02X%02X devNonce=%u%s\r\n",
             au8Eui[0], au8Eui[1], au8Eui[2], au8Eui[3],
-            au8Eui[4], au8Eui[5], au8Eui[6], au8Eui[7], (unsigned)u16Nonce);
+            au8Eui[4], au8Eui[5], au8Eui[6], au8Eui[7], (unsigned)u16NvmHigh,
+            bNvmOk ? "" : " (journal UNREADABLE - joins held)");
 
     bMacReady = true;
     return true;
@@ -442,14 +580,43 @@ bool LORAWAN_bIsJoined(void)
 static bool LORAWAN_bStartJoin(void)
 {
     /* Persist the nonce this request will use BEFORE sending it: LoRaMac
-     * increments DevNonce and then transmits, so storing (current + 1)
+     * increments DevNonce and then transmits, so reserving (current + 1)
      * first means a reset at any point after this - mid-join included -
-     * restarts above every nonce that has gone on air. */
+     * restarts above every nonce that has gone on air. If the reservation
+     * cannot be made durable, the join is NOT sent (review LW01): this used
+     * to log a warning and join anyway, which is precisely the join a reset
+     * would then repeat. See "DevNonce persistence" above. */
+    if (!bNvmKnown)
+    {
+        if (!LORAWAN_bNvmRestore())
+        {
+            DBG_LOG("lorawan: join NOT sent - devNonce journal unreadable\r\n");
+            return false;
+        }
+    }
+
     LoRaMacNvmData_t *ptNvm = LORAWAN_ptNvm();
+    /* Never step below the journal: covers a restore that only succeeded
+     * after init had left the 0 placeholder in the MAC. */
+    if (ptNvm->Crypto.DevNonce < u16NvmHigh)
+        ptNvm->Crypto.DevNonce = u16NvmHigh;
+
+    /* 16-bit space exhausted: the next increment would wrap to 0, a value
+     * the server has already seen. Only reprovisioning (new keys and a reset
+     * nonce history on the server) can bring the tag back. */
+    if (ptNvm->Crypto.DevNonce == 0xFFFFU)
+    {
+        DBG_LOG("lorawan: join NOT sent - devNonce space exhausted, reprovision required\r\n");
+        return false;
+    }
+
     uint16_t u16Next = (uint16_t)(ptNvm->Crypto.DevNonce + 1U);
-    if (!LORAWAN_bNvmStore(u16Next))
-        DBG_LOG("lorawan: WARNING devNonce %u not persisted - a reboot may reuse it\r\n",
+    if (!LORAWAN_bNvmReserve(u16Next))
+    {
+        DBG_LOG("lorawan: join NOT sent - devNonce %u could not be persisted\r\n",
                 (unsigned)u16Next);
+        return false;
+    }
 
     MlmeReq_t tReq;
     memset(&tReq, 0, sizeof(tReq));

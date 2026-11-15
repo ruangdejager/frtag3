@@ -43,9 +43,10 @@
  *   0x00000 - 0x3AFFF   OTA image scratchpad (sectors 0-58, 236 KB;
  *                       scratch offset N maps to OTA_APP_BASE_ADDR + N)
  *   0x3B000 - 0x3BFFF   OTA metadata (sector 59)
- *   0x3C000 - 0x7DFFF   text log (sectors 60-125; see Services/Log/Log.h)
- *   0x7E000 - 0x7EFFF   LoRaWAN DevNonce record (sector 126; LORAWAN_NVM_FLASH_ADDR
- *                       in Log.h, written by Worker/LoRaWan/LoRaWan.c)
+ *   0x3C000 - 0x7CFFF   text log (sectors 60-124; see Services/Log/Log.h)
+ *   0x7D000 - 0x7EFFF   LoRaWAN DevNonce journal (sectors 125-126;
+ *                       LORAWAN_NVM_SECTOR0/1_ADDR in Log.h, written by
+ *                       Worker/LoRaWan/LoRaWan.c)
  *   0x7F000 - 0x7FFFF   flash self-test scratch (sector 127; see
  *                       Device/Flash/Flash_Config.h). Not part of the
  *                       app/bootloader contract - the bootloader never
