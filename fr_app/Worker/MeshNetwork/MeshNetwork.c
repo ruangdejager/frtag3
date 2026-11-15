@@ -1689,28 +1689,25 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
                                s16Rssi, u8AckCount);
     EVTLOG(LOG_RX_ACK, u32LogValue);
 
-    if (FORWARD_bHasSeen(u32AckMsgId))
-    {
-#ifdef ENABLE_MESH_VERBOSE_LOG
-        DBG("MeshNetwork: Ack seen before\r\n");
-#endif
-        return;
-    }
-    FORWARD_vAdd(u32AckMsgId);
-
-    if (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER &&
-        !MESHNETWORK_bTxBacklogHigh())
-    {
-        MESHNETWORK_bSendPacket(pBuf, u32Len);
-        DBG("MeshNetwork: Ack forwarded\r\n");
-        u16StatMsgsForwarded++;
-        DIAG_INC(FwdAck);
-        EVTLOG(LOG_TX_ACK, 2);
-    }
-
-    /* Multi-primary: primaries never beacon, so they never need to
+    /* Own-ack handling runs BEFORE the dedupe gate (review F06, 2026-11-13).
+     * The forward ring stores 16-bit folded fingerprints (MESH_FP_FOLD), so
+     * an unseen ack can collide with an older id - 0x13160020 and 0xE200F136
+     * both fold to 0x1336 - and the early return below used to swallow it
+     * before this block ran: the tag ignored the ack that names it and kept
+     * beaconing until another copy happened to get through. The ring exists
+     * to stop redundant RELAYS; whether this tag has been acknowledged is a
+     * separate question and must not depend on it. Stopping is idempotent,
+     * so running it for every copy of the same ack is harmless.
+     *
+     * Multi-primary: primaries never beacon, so they never need to
      * stop-on-ACK. Guard explicitly so any future primary code path
-     * cannot accidentally trip the secondary state machine. */
+     * cannot accidentally trip the secondary state machine.
+     *
+     * The relay decision below uses the role as it was BEFORE this ack:
+     * a stop flips the node to NODE_ROLE_FORWARDER, and when the relay ran
+     * first a tag never relayed the ack that silenced it. Snapshotting keeps
+     * that relay behaviour exactly as it was. */
+    const bool bWasForwarder = (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER);
     if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
         uint32_t u32MyId = LORARADIO_u32GetUniqueId();
@@ -1725,6 +1722,24 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
                 break;
             }
         }
+    }
+
+    if (FORWARD_bHasSeen(u32AckMsgId))
+    {
+#ifdef ENABLE_MESH_VERBOSE_LOG
+        DBG("MeshNetwork: Ack seen before\r\n");
+#endif
+        return;
+    }
+    FORWARD_vAdd(u32AckMsgId);
+
+    if (bWasForwarder && !MESHNETWORK_bTxBacklogHigh())
+    {
+        MESHNETWORK_bSendPacket(pBuf, u32Len);
+        DBG("MeshNetwork: Ack forwarded\r\n");
+        u16StatMsgsForwarded++;
+        DIAG_INC(FwdAck);
+        EVTLOG(LOG_TX_ACK, 2);
     }
 }
 
@@ -1766,6 +1781,22 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     uint32_t u32LogValue;
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, 0, s16Rssi, 0);
     EVTLOG(LOG_RX_TS, u32LogValue);
+
+    /* Reject an out-of-set interval before ANY of this packet takes effect -
+     * clock, UTC dedupe state, firmware arming, mode, GPS and the relay
+     * (review F26, 2026-11-13). The byte comes straight off the air, and the
+     * setter used to accept 0: u8CurrentWakeupIntervalMin[0] is 0, and
+     * DeviceDiscovery divides UTC by interval * 60 on every heartbeat. Because
+     * TimeSync is relayed, one malformed copy could reach the whole herd, and
+     * a tag whose schedule is broken no longer wakes to hear the valid
+     * TimeSync that would repair it. A legitimate primary only ever sends a
+     * value from the fixed set (DeviceDiscovery maps fr9's minutes onto it),
+     * so dropping the whole packet loses nothing. */
+    if (tInterval < WAKEUP_INTERVAL_15_MIN || tInterval > WAKEUP_INTERVAL_240_MIN)
+    {
+        DBG_LOG("MeshNetwork: TimeSync dropped - invalid interval %u\r\n", (unsigned)tInterval);
+        return;
+    }
 
     /* I2: dedicated dedup — only a strictly newer UTC propagates (also kills
      * late echoes of older TimeSyncs). Not the shared msg-id ring: raw UTC
@@ -2582,13 +2613,30 @@ uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void)
     return u8Max;
 }
 
+/* Only the five real intervals are accepted (review F26, 2026-11-13). The old
+ * test was "<= WAKEUP_INTERVAL_MAX_COUNT", which let 0 through: the enum
+ * starts at 1, so 0 indexes the unset slot of u8CurrentWakeupIntervalMin and
+ * reads back as a 0-minute interval that DeviceDiscovery then divides by. */
 void MESHNETWORK_vSetWakeupInterval(WakeupInterval tNewInterval)
 {
-    if (tNewInterval <= WAKEUP_INTERVAL_MAX_COUNT)
+    if (tNewInterval >= WAKEUP_INTERVAL_15_MIN && tNewInterval <= WAKEUP_INTERVAL_240_MIN)
         tCurrentWakeupInterval = tNewInterval;
 }
 WakeupInterval MESHNETWORK_tGetWakeupInterval(void) { return tCurrentWakeupInterval; }
-uint8_t        MESHNETWORK_u8GetWakeupInterval(void) { return u8CurrentWakeupIntervalMin[tCurrentWakeupInterval]; }
+
+/* Never returns 0. Every caller multiplies this by 60 and divides or takes a
+ * modulo by the result (DeviceDiscovery's slot and flush-boundary
+ * arithmetic), so a zero here is a divide by zero. The setter already keeps
+ * the state valid; this is the backstop in case anything ever writes
+ * tCurrentWakeupInterval another way. */
+uint8_t MESHNETWORK_u8GetWakeupInterval(void)
+{
+    uint8_t u8Min = 0U;
+    if (tCurrentWakeupInterval >= WAKEUP_INTERVAL_15_MIN &&
+        tCurrentWakeupInterval <= WAKEUP_INTERVAL_240_MIN)
+        u8Min = u8CurrentWakeupIntervalMin[tCurrentWakeupInterval];
+    return (u8Min != 0U) ? u8Min : u8CurrentWakeupIntervalMin[WAKEUP_INTERVAL_15_MIN];
+}
 
 void MESHNETWORK_vSetDiscoveryMode(DiscoveryMode_e eMode)
 {

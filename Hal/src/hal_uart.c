@@ -174,7 +174,7 @@ void HAL_UART_vInit(void)
         LL_USART_SetHWFlowCtrl(BSP_GPS_USART_INSTANCE, LL_USART_HWCONTROL_NONE);
         LL_USART_ConfigAsyncMode(BSP_GPS_USART_INSTANCE);
         /* Standard TX/RX mapping on both roles (see above). SWAP resets to 0,
-         * the frtag2 bootloader runs HAL_DeInit() (a forced peripheral reset)
+         * the frtag3 bootloader runs HAL_DeInit() (a forced peripheral reset)
          * before jumping here, and nothing in this firmware sets it, so this
          * line records the intent rather than changing anything. The bit is
          * only writable while UE = 0, which holds at the boot call and on the

@@ -142,16 +142,16 @@ image's true version from the bytes themselves rather than from a filename or ma
    `C:\Code\frtag-firmware-dev\frtag3-firmware` (creating the folder if missing). It writes
    files only — it never commits or pushes those repos.
 
-frtag3 has no bootloader project of its own yet, so the script still reads the bootloader hex
-from `../frtag2_bootloader`.
+The bootloader is its own repo, `../frtag3_bootloader` (forked from the retired
+`../frtag2_bootloader` on 2026-11-15). The script reads `Debug/frtag3_bootloader.hex` and
+`FRTAG_BL_VER` from there; without that build it still produces the app-only artifacts.
 
 ## OTA
 
 `fr_app/Worker/Fota/Fota_Config.h` shares its flash layout and handoff constants with the
-same file in `frtag2_bootloader/fr_bootloader/inc/` — those are the app/bootloader contract,
-so any change to them must be made in both places. The two files are no longer
-byte-identical: the app copy carries application-only additions. This coupling still points
-at frtag2's bootloader and will need resolving when frtag3 diverges.
+same file in `../frtag3_bootloader/fr_bootloader/inc/` — those are the app/bootloader
+contract, so any change to them must be made in both places. The two files are not
+byte-identical: the app copy carries application-only additions.
 
 Flow: fr9 fetches `version.json` and the `.bin`, streams it over UART to the primary tag; the
 primary writes it into the external NOR scratchpad (mapped 1:1 to the app base address),
@@ -160,7 +160,11 @@ own `.fw_info` before accepting it. The primary LoRa-distributes the staged imag
 secondaries in windowed chunk sessions with a repair pass; secondaries only accept while
 explicitly armed. On success either side writes `TAMP->BKP0R = OTA_BOOT_MAGIC` and the
 version to `BKP1R`, then resets; the bootloader compares against the installed app's
-`.fw_info` read straight from flash and programs only if strictly newer.
+`.fw_info` read straight from flash and programs only if strictly newer, after checking the
+staged image's XOR-8 and its own `.fw_info`. The install erases app page 0 (vectors +
+`.fw_info`) first and programs it last, so a power cut mid-install reads as "no app" and the
+next boot reinstalls; the bootloader jumps only to an app whose vector table looks sane and
+otherwise resets and retries.
 
 ## Build configuration
 

@@ -57,7 +57,7 @@
 #
 # Version numbers come from:
 #   frtag3:            fr_app/inc/config/version_config.h (VERSION_SW_MAJOR/MINOR/PATCH)
-#   frtag2_bootloader: ../frtag2_bootloader/fr_bootloader/src/main.c (FRTAG_BL_VER)
+#   frtag3_bootloader: ../frtag3_bootloader/fr_bootloader/src/main.c (FRTAG_BL_VER)
 
 param (
     [string]$mode = "Debug"
@@ -80,13 +80,13 @@ if (-Not (Test-Path $bin_file_path)) {
 }
 
 # Bootloader hex - same $mode, same layout as frtag3 (both Debug/).
-$bootloader_dir  = "$dir\..\..\frtag2_bootloader"
-$bl_hex_filename = "$bootloader_dir\$mode\frtag2_bootloader.hex"
+$bootloader_dir  = "$dir\..\..\frtag3_bootloader"
+$bl_hex_filename = "$bootloader_dir\$mode\frtag3_bootloader.hex"
 $bl_version_path = Resolve-Path "$bootloader_dir\fr_bootloader\src\main.c"
 $bl_version = Select-String $bl_version_path -pattern '_BL_VER\s+(\d+)' | Foreach-Object { $_.Matches.Groups[1].Value }
 
 if (-Not (Test-Path $bl_hex_filename)) {
-    Write-Host "Could not find bootloader hex at $bl_hex_filename - is frtag2_bootloader compiled in $mode?"
+    Write-Host "Could not find bootloader hex at $bl_hex_filename - is frtag3_bootloader compiled in $mode?"
     Write-Host "The combined 'bl' artifact will be skipped; app-only artifacts still produced."
     $has_bootloader = $false
 } else {
@@ -101,6 +101,46 @@ $Patch = Select-String $version_h_path -pattern '_PATCH\s+(\d+)' | Foreach-Objec
 $version_str = "${Major}.${Minor}.${Patch}"
 
 Write-Host "frtag3 release: v${version_str} + bootloader v${bl_version} (mode=$mode)"
+
+# Runs before ANYTHING is written - publish folders, the versioned HEX copies
+# in Debug\ and the publish repos alike - so the abort message below ("nothing
+# has been written") is literally true (review R01, 2026-11-13). It used to run
+# after both HEX files had been copied, leaving mislabelled HEX behind.
+# ---- Checksums, computed once against the bin CubeIDE just built ------------
+# Same bytes get published to every repo in $publish_dirs, so the CRC/XOR are
+# computed once here rather than once per destination.
+$app_bin_bytes = [System.IO.File]::ReadAllBytes($bin_file_path)
+
+# ---- Identity gate: does the image agree with the version we are labelling it?
+# The linker KEEPs a .fw_info record (major/minor/patch, uint16 LE) at image
+# offset 0x200. The tag bootloader reads it to decide what is installed, and
+# both fr9 and the tag app now check it before adopting or installing an image.
+# Verifying it HERE means a mislabelled artifact cannot be published at all.
+#
+# Worth the six bytes: on 2026-09-01, 2.1.7/2.1.8/2.1.9 all built to exactly
+# 109068 B with an identical xor8 of 0xC5, fr9's "already on the filesystem"
+# check is (size, xor8), so it adopted the previous release and served it under
+# the new version number. Tags installed it, booted reporting the old version,
+# were offered the "new" one again, and looped until a human intervened. A
+# stale or wrongly-named bin reaching this script would do the same thing.
+$fw_info_offset = 0x200
+if ($app_bin_bytes.Length -lt ($fw_info_offset + 6)) {
+    Write-Host "ABORT: bin is only $($app_bin_bytes.Length) B - too small to hold fw_info at 0x200"
+    exit 1
+}
+$bin_major = [uint16]$app_bin_bytes[$fw_info_offset]     + ([uint16]$app_bin_bytes[$fw_info_offset + 1] -shl 8)
+$bin_minor = [uint16]$app_bin_bytes[$fw_info_offset + 2] + ([uint16]$app_bin_bytes[$fw_info_offset + 3] -shl 8)
+$bin_patch = [uint16]$app_bin_bytes[$fw_info_offset + 4] + ([uint16]$app_bin_bytes[$fw_info_offset + 5] -shl 8)
+$bin_version_str = "${bin_major}.${bin_minor}.${bin_patch}"
+
+if ($bin_version_str -ne $version_str) {
+    Write-Host "ABORT: version mismatch - version_config.h says $version_str but the built"
+    Write-Host "       bin's fw_info record says $bin_version_str."
+    Write-Host "       $bin_file_path is stale or is not the image for this version."
+    Write-Host "       Rebuild in CubeIDE before publishing; nothing has been written."
+    exit 1
+}
+Write-Host "fw_info check OK: bin declares v$bin_version_str, matching version_config.h"
 
 # Destinations: every repo that mirrors the app-only .bin + version.json.
 # All are separate local git repos this script only ever writes files
@@ -137,42 +177,6 @@ if ($has_bootloader) {
     $combined_hex = $app_hex_raw -replace ":00000001FF", $bl_hex_raw
     Set-Content -Path $bl_hex_versioned -Value $combined_hex
 }
-
-# ---- Checksums, computed once against the bin CubeIDE just built ------------
-# Same bytes get published to every repo in $publish_dirs, so the CRC/XOR are
-# computed once here rather than once per destination.
-$app_bin_bytes = [System.IO.File]::ReadAllBytes($bin_file_path)
-
-# ---- Identity gate: does the image agree with the version we are labelling it?
-# The linker KEEPs a .fw_info record (major/minor/patch, uint16 LE) at image
-# offset 0x200. The tag bootloader reads it to decide what is installed, and
-# both fr9 and the tag app now check it before adopting or installing an image.
-# Verifying it HERE means a mislabelled artifact cannot be published at all.
-#
-# Worth the six bytes: on 2026-09-01, 2.1.7/2.1.8/2.1.9 all built to exactly
-# 109068 B with an identical xor8 of 0xC5, fr9's "already on the filesystem"
-# check is (size, xor8), so it adopted the previous release and served it under
-# the new version number. Tags installed it, booted reporting the old version,
-# were offered the "new" one again, and looped until a human intervened. A
-# stale or wrongly-named bin reaching this script would do the same thing.
-$fw_info_offset = 0x200
-if ($app_bin_bytes.Length -lt ($fw_info_offset + 6)) {
-    Write-Host "ABORT: bin is only $($app_bin_bytes.Length) B - too small to hold fw_info at 0x200"
-    exit 1
-}
-$bin_major = [uint16]$app_bin_bytes[$fw_info_offset]     + ([uint16]$app_bin_bytes[$fw_info_offset + 1] -shl 8)
-$bin_minor = [uint16]$app_bin_bytes[$fw_info_offset + 2] + ([uint16]$app_bin_bytes[$fw_info_offset + 3] -shl 8)
-$bin_patch = [uint16]$app_bin_bytes[$fw_info_offset + 4] + ([uint16]$app_bin_bytes[$fw_info_offset + 5] -shl 8)
-$bin_version_str = "${bin_major}.${bin_minor}.${bin_patch}"
-
-if ($bin_version_str -ne $version_str) {
-    Write-Host "ABORT: version mismatch - version_config.h says $version_str but the built"
-    Write-Host "       bin's fw_info record says $bin_version_str."
-    Write-Host "       $bin_file_path is stale or is not the image for this version."
-    Write-Host "       Rebuild in CubeIDE before publishing; nothing has been written."
-    exit 1
-}
-Write-Host "fw_info check OK: bin declares v$bin_version_str, matching version_config.h"
 
 # CRC32 (IEEE 802.3, poly 0xEDB88320) computed manually to avoid PowerShell
 # hex-literal quirks (>= 0x80000000 parses as negative Int32; use ToUInt32).

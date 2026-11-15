@@ -1061,6 +1061,14 @@ bool FOTA_bUartAcquire(void)
 
 /* Full-session chunk bitmap: max image / chunk = 236K / 224 = 1079 chunks */
 #define OTA_BITMAP_BYTES  ((OTA_APP_MAX_SIZE / OTA_LORA_CHUNK_LEN + 8U) / 8U + 1U)
+#define OTA_BITMAP_BITS   ((uint32_t)OTA_BITMAP_BYTES * 8U)
+
+/* The bitmap must cover the largest image the Prep validation below accepts.
+ * That validation (review F11, 2026-11-13) bounds an incoming session by this
+ * capacity; this assert keeps the two from drifting apart if OTA_APP_MAX_SIZE
+ * or OTA_LORA_CHUNK_LEN ever change. */
+_Static_assert(((OTA_APP_MAX_SIZE + OTA_LORA_CHUNK_LEN - 1U) / OTA_LORA_CHUNK_LEN) <= OTA_BITMAP_BITS,
+               "au8ChunkBitmap too small for OTA_APP_MAX_SIZE / OTA_LORA_CHUNK_LEN");
 
 /* ---- Shared session state ---- */
 static uint32_t u32SessionId;
@@ -1148,12 +1156,24 @@ static uint16_t FOTA_u16GetU16(const uint8_t *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
+/* Both helpers only ever index au8ChunkBitmap, so they bound the index by its
+ * capacity. This is the second line of defence behind the OtaPrep geometry
+ * check (review F11): chunk and poll handling index the bitmap by values that
+ * come off the air, and before that check an accepted Prep could advertise up
+ * to 65535 chunks against a 1088-bit map, so an OtaChunk with a high index
+ * wrote past the end of the array into neighbouring RAM. Out of range reads as
+ * "have it" (nothing is requested or re-written for a chunk that cannot
+ * exist) and an out-of-range set is dropped. */
 static bool FOTA_bBitGet(const uint8_t *pu8Map, uint16_t u16Bit)
 {
+    if ((uint32_t)u16Bit >= OTA_BITMAP_BITS)
+        return true;
     return (pu8Map[u16Bit / 8U] & (uint8_t)(1U << (u16Bit % 8U))) != 0U;
 }
 static void FOTA_vBitSet(uint8_t *pu8Map, uint16_t u16Bit)
 {
+    if ((uint32_t)u16Bit >= OTA_BITMAP_BITS)
+        return;
     pu8Map[u16Bit / 8U] |= (uint8_t)(1U << (u16Bit % 8U));
 }
 
@@ -1295,16 +1315,36 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
                 }
             }
 
-            tPrep.u32SessionId   = u32NewSid;
-            tPrep.u32Version     = u32Ver;
-            tPrep.u32ImageSize   = FOTA_u32GetU32(&pu8Buf[9]);
-            tPrep.u16TotalChunks = FOTA_u16GetU16(&pu8Buf[13]);
-            tPrep.u8ChunkLen     = pu8Buf[15];
-            tPrep.u8ImageXor     = pu8Buf[16];
+            /* Parse into a local record and validate the whole geometry
+             * before anything shared changes (review F11, 2026-11-13). The
+             * old check only refused zeros and an oversized image, so a Prep
+             * could advertise any chunk count and any chunk length: the
+             * receive loop then indexed au8ChunkBitmap (1088 bits) by chunk
+             * numbers up to 65535 and wrote completion bits past its end.
+             * The primary always sends OTA_LORA_CHUNK_LEN and
+             * ceil(size / OTA_LORA_CHUNK_LEN) chunks (FOTA_vDistribute), so
+             * anything else is not a Prep this firmware can serve and is
+             * dropped without touching tPrep. */
+            FotaPrepInfo_t tNew;
+            tNew.u32SessionId   = u32NewSid;
+            tNew.u32Version     = u32Ver;
+            tNew.u32ImageSize   = FOTA_u32GetU32(&pu8Buf[9]);
+            tNew.u16TotalChunks = FOTA_u16GetU16(&pu8Buf[13]);
+            tNew.u8ChunkLen     = pu8Buf[15];
+            tNew.u8ImageXor     = pu8Buf[16];
 
-            if (tPrep.u8ChunkLen == 0U || tPrep.u16TotalChunks == 0U ||
-                tPrep.u32ImageSize == 0U || tPrep.u32ImageSize > OTA_APP_MAX_SIZE)
+            if (tNew.u8ChunkLen != OTA_LORA_CHUNK_LEN ||
+                tNew.u32ImageSize == 0U || tNew.u32ImageSize > OTA_APP_MAX_SIZE ||
+                (uint32_t)tNew.u16TotalChunks !=
+                    (tNew.u32ImageSize + OTA_LORA_CHUNK_LEN - 1U) / OTA_LORA_CHUNK_LEN ||
+                (uint32_t)tNew.u16TotalChunks > OTA_BITMAP_BITS)
+            {
+                DBG_LOG("Fota: OtaPrep sid=%08X rejected - bad geometry (%lu B, %u chunks of %u)\r\n",
+                        (unsigned)u32NewSid, (unsigned long)tNew.u32ImageSize,
+                        (unsigned)tNew.u16TotalChunks, (unsigned)tNew.u8ChunkLen);
                 return;
+            }
+            tPrep = tNew;
 
             DBG_LOG("Fota: OtaPrep latched sid=%08X v%lu (%lu B, %u chunks)\r\n",
                     (unsigned)u32NewSid, (unsigned long)u32Ver,
@@ -1346,9 +1386,14 @@ void FOTA_vOnLoraPacket(const uint8_t *pu8Buf, uint16_t u16Len)
 
             uint16_t u16Idx = FOTA_u16GetU16(&pu8Buf[5]);
             uint8_t  u8Len  = pu8Buf[7];
+            /* The last clause keeps a chunk inside the image the Prep
+             * declared (review F11): with the Prep geometry now fixed, only
+             * the final chunk may be short, and no chunk may run past
+             * u32ImageSize into scratch the session does not own. */
             if (u8Len == 0U || u8Len > OTA_LORA_CHUNK_LEN ||
                 (uint16_t)(OTA_PKT_CHUNK_HDR_LEN + u8Len) > u16Len ||
-                u16Idx >= tPrep.u16TotalChunks)
+                u16Idx >= tPrep.u16TotalChunks ||
+                (uint32_t)u16Idx * tPrep.u8ChunkLen + u8Len > tPrep.u32ImageSize)
                 return;
 
             u32LastSessionPktTick = osKernelGetTickCount();
@@ -2176,9 +2221,22 @@ void FOTA_vSecondaryReceive(void)
                             (u16BadAt != 0xFFFFU) ? (unsigned)au8ChunkMail[u16BadAt] : 0U,
                             (u16BadAt != 0xFFFFU) ? (unsigned)au8Verify[u16BadAt] : 0U);
                 }
-
-                FOTA_vBitSet(au8ChunkBitmap, u16ChunkMailIdx);
-                u16ChunksHave++;
+                else
+                {
+                    /* Only a verified chunk counts as received (review F16,
+                     * 2026-11-13). This used to run after a failed verify as
+                     * well, so a chunk known to be wrong in flash was marked
+                     * complete, never reported missing to the primary, and
+                     * survived until the whole-image XOR-8 at the end - which
+                     * an even number of flipped bits in one column passes.
+                     * Left clear, the next OtaPoll reports it and the repair
+                     * pass re-sends it. A sector that genuinely cannot hold
+                     * the bytes then shows up as a chunk that stays missing
+                     * until the session's silence timeout, not as a silently
+                     * corrupt image. */
+                    FOTA_vBitSet(au8ChunkBitmap, u16ChunkMailIdx);
+                    u16ChunksHave++;
+                }
 
                 /* Progress line: first chunk, then every ~10%, then the
                  * last one — same throttling convention as the primary's
