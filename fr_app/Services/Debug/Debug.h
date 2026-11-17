@@ -30,7 +30,7 @@ void DEBUG_vPutBufferBlocking(const uint8_t *buf, uint16_t len);
 /* "Quiet" is an advisory flag, not a transport-level mute -- it does not
  * gate DEBUG_vPutBuffer itself. It exists so a raw passthrough that's
  * temporarily the sole intended thing on the wire (e.g. FrKernel's LoRa
- * bridge relaying an ext-flash log dump) can ask ambient periodic output
+ * console relaying an ext-flash log dump) can ask ambient periodic output
  * (e.g. platform.c's 1 Hz heartbeat marker) to hold off for its duration;
  * each such producer checks DEBUG_bIsQuiet() itself before writing. */
 void DEBUG_vSetQuiet(bool quiet);

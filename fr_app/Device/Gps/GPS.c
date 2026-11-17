@@ -97,7 +97,7 @@ static bool                 bSessionActive = false;   /* drives RX-task gating  
  * one the request took. The eventual GPS_vPowerOff() would then release a
  * lock this module never held, stealing another subsystem's reference and
  * dropping the device into STOP2 while that subsystem still needed it.
- * Matters now that "tag prodsleep"/"tag solarsleep" call GPS_vShutdown()
+ * Matters now that kernel commands 'P'/'S' call GPS_vShutdown()
  * from the FrKernel task at an arbitrary moment. */
 static volatile bool        bSessionCancelled = false;
 static bool                 bCallerNotified= false;   /* GNSS_vOnSolution edge       */
@@ -530,7 +530,7 @@ static void GPS_vMaybeSyncRtc(uint32_t u32GpsUnixTime)
 void GPS_vRequestFix(bool bAutoShutdownIn, uint32_t u32TtffTimeoutS, bool bForce)
 {
     /* Safe no-op if GPS_vInit() was never called (PRIMARY role, or the
-     * FRKERNEL_INTERFACE_LORA_BRIDGE build). The wake-schedule task fires this
+     * FRKERNEL_INTERFACE_LORA_CONSOLE build). The wake-schedule task fires this
      * unconditionally on every cycle, so being defensive here is required. */
     if (xGpsLock == NULL || xGpsResultFlags == NULL) return;
 
@@ -725,7 +725,7 @@ void GPS_vShutdown(void)
 bool GPS_bSelfTest(uint32_t u32TimeoutMs)
 {
     /* GPS not initialised (no xGpsLock created): PRIMARY role, or the
-     * FRKERNEL_INTERFACE_LORA_BRIDGE build. Treat as pass so the LED doesn't
+     * FRKERNEL_INTERFACE_LORA_CONSOLE build. Treat as pass so the LED doesn't
      * flag a hardware fault for a receiver this build or role never uses. */
     if (xGpsLock == NULL) return true;
 

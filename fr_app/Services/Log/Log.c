@@ -235,6 +235,16 @@ uint32_t LOG_u32GetUsedBytes(void)
     if (!bWrapped)
         return u32WriteAddr - LOG_FLASH_START_ADDR;
 
+    /* Wrapped with the head sitting exactly on the tail: the partition is
+     * FULL, not empty. It happens whenever a write ends on the last byte of
+     * the sector just before the tail - LOG_vWrite has already erased that
+     * sector and moved the tail past it, so the head lands on the tail's first
+     * byte. The general branch below read that as 0 bytes used, so a stream
+     * requested in that state sent nothing at all until the next log line
+     * moved the head, which on a sleeping tag can be a whole wake interval. */
+    if (u32WriteAddr == u32StartAddr)
+        return LOG_FLASH_SIZE_BYTES;
+
     if (u32WriteAddr >= u32StartAddr)
         return u32WriteAddr - u32StartAddr;
 
@@ -281,32 +291,80 @@ void LOG_vEraseAll(void)
 
 /* -------------------------------------------------------------------------- */
 
-void LOG_vStreamToDebug(void)
+static volatile bool s_bStreamAbort = false;
+
+void LOG_vAbortStream(void)
 {
-    LOG_vStreamViaSink(DEBUG_vPutBuffer);
+    s_bStreamAbort = true;
 }
 
-void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
+/* DEBUG_vPutBuffer adapted to the LogSink_t shape: the UART ring never
+ * refuses a chunk, so this sink never stops a stream on its own. */
+static bool LOG_bDebugSink(const uint8_t *data, uint16_t len)
 {
-    char hdr[64];
+    DEBUG_vPutBuffer(data, len);
+    return true;
+}
+
+void LOG_vStreamToDebug(uint8_t u8Percent)
+{
+    LOG_vStreamViaSink(LOG_bDebugSink, u8Percent, NULL);
+}
+
+void LOG_vStreamViaSink(LogSink_t sink, uint8_t u8Percent,
+                        LogStreamResult_t *pResult)
+{
+    LogStreamResult_t tRes = {0};
+    s_bStreamAbort = false;
+
+    if ((u8Percent == 0U) || (u8Percent > 100U))
+        u8Percent = 100U;
+
+    /* Snapshot once. Nothing can move the head or tail while this runs - the
+     * caller is the DbgLog consumer, the log's only writer - but reading the
+     * pair once keeps the window self-consistent by construction rather than
+     * by that convention alone. */
+    const uint32_t u32Used = LOG_u32GetUsedBytes();
+
+    /* The newest u8Percent % is the window that ENDS at the head, so it
+     * starts (100 - u8Percent) % of the way from the tail. Computed in 64 bits
+     * so a full 268 KB partition times 100 cannot overflow. */
+    const uint32_t u32Skip = (uint32_t)(((uint64_t)u32Used * (100U - u8Percent)) / 100U);
+    uint32_t u32Remaining  = u32Used - u32Skip;
+    uint32_t u32Addr       = u32StartAddr + u32Skip;   /* FIFO tail = oldest byte */
+    if (u32Addr >= LOG_FLASH_END_ADDR)
+        u32Addr -= LOG_FLASH_SIZE_BYTES;               /* wrap */
+
+    tRes.u32Total = u32Remaining;
+
+    char hdr[80];
     int  n = snprintf(hdr, sizeof(hdr),
-                      "\r\n==== EXT-FLASH LOG DUMP (%lu bytes) ====\r\n",
-                      (unsigned long)LOG_u32GetUsedBytes());
-    if (n > 0)
-        sink((const uint8_t *)hdr, (uint16_t)n);
+                      "\r\n==== EXT-FLASH LOG DUMP (latest %u%%: %lu of %lu bytes) ====\r\n",
+                      (unsigned)u8Percent, (unsigned long)u32Remaining,
+                      (unsigned long)u32Used);
+    if ((n > 0) && !sink((const uint8_t *)hdr, (uint16_t)n))
+        tRes.bAborted = true;
 
-    uint32_t u32Remaining = LOG_u32GetUsedBytes();
-    uint32_t u32Addr      = u32StartAddr;        /* FIFO tail = oldest byte */
-    /* 200 B: comfortably under the LoRa FrKernel per-packet payload cap
-     * (LORA_MAX_PACKET_SIZE - 3 = 253 B), so a chunk normally maps to exactly
-     * one radio packet, while still being far fewer, larger flash reads /
-     * sink calls than the old 64 B chunking (which throttled throughput over
-     * both the debug UART and, worse, LoRa). A sink that needs a smaller unit
-     * is free to split further itself. */
+    /* 200 B: comfortably under the FrKernel v2 per-frame payload
+     * (FRK_MAX_PAYLOAD, 246 B), so a chunk maps to exactly one radio packet,
+     * while still being far fewer, larger flash reads / sink calls than the
+     * old 64 B chunking (which throttled throughput over both the debug UART
+     * and, worse, LoRa). A sink that needs a smaller unit may split further. */
     uint8_t  au8Chunk[200];
+    /* A partial stream starts inside some line; drop the bytes up to the
+     * first newline so the operator's first line is a whole one. Only the
+     * first chunk is searched - a 200-byte line does not exist in this log,
+     * and if it did the cost is one partial line, not a lost stream. */
+    bool     bTrimToLine = (u32Skip > 0U);
 
-    while (u32Remaining > 0U)
+    while ((u32Remaining > 0U) && !tRes.bAborted)
     {
+        if (s_bStreamAbort)
+        {
+            tRes.bAborted = true;
+            break;
+        }
+
         uint16_t u16Chunk = (u32Remaining > sizeof(au8Chunk))
                           ? (uint16_t)sizeof(au8Chunk)
                           : (uint16_t)u32Remaining;
@@ -314,9 +372,54 @@ void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
         if ((u32Addr + u16Chunk) > LOG_FLASH_END_ADDR)
             u16Chunk = (uint16_t)(LOG_FLASH_END_ADDR - u32Addr);
 
-        FLASH_vRead(u32Addr, au8Chunk, u16Chunk);
-        sink(au8Chunk, u16Chunk);
+        /* FLASH_vRead fails when the device has gated off, when it never
+         * comes ready, on an SPI error, or (ENABLE_FLASH_READ_CRC) when two
+         * reads of the same range disagree. The result used to be ignored and
+         * the buffer sent anyway - on a gated-off part that meant the whole
+         * log's worth of whatever the stack buffer last held, presented as
+         * the log. Retry once (a read-verify mismatch is usually transient),
+         * then send an explicit marker in place of the bytes, so a hole in
+         * the log is visible as a hole. */
+        bool bRead = FLASH_vRead(u32Addr, au8Chunk, u16Chunk);
+        if (!bRead)
+            bRead = FLASH_vRead(u32Addr, au8Chunk, u16Chunk);
 
+        bool bSinkOk;
+        if (bRead)
+        {
+            const uint8_t *pu8Out = au8Chunk;
+            uint16_t       u16Out = u16Chunk;
+            if (bTrimToLine)
+            {
+                bTrimToLine = false;
+                for (uint16_t i = 0U; i < u16Chunk; i++)
+                {
+                    if (au8Chunk[i] == '\n')
+                    {
+                        pu8Out = &au8Chunk[i + 1U];
+                        u16Out = (uint16_t)(u16Chunk - i - 1U);
+                        break;
+                    }
+                }
+            }
+            bSinkOk = (u16Out == 0U) || sink(pu8Out, u16Out);
+        }
+        else
+        {
+            if (tRes.u16ReadFails < UINT16_MAX)
+                tRes.u16ReadFails++;
+            n = snprintf(hdr, sizeof(hdr), "\r\n[read fail @0x%06lX, %u bytes skipped]\r\n",
+                         (unsigned long)u32Addr, (unsigned)u16Chunk);
+            bSinkOk = (n <= 0) || sink((const uint8_t *)hdr, (uint16_t)n);
+        }
+
+        if (!bSinkOk)
+        {
+            tRes.bAborted = true;
+            break;
+        }
+
+        tRes.u32Bytes += u16Chunk;
         u32Addr += u16Chunk;
         if (u32Addr >= LOG_FLASH_END_ADDR)
             u32Addr = LOG_FLASH_START_ADDR;      /* wrap */
@@ -324,8 +427,20 @@ void LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len))
         u32Remaining -= u16Chunk;
     }
 
-    static const char end[] = "\r\n==== EXT-FLASH LOG DUMP END ====\r\n";
-    sink((const uint8_t *)end, (uint16_t)(sizeof(end) - 1U));
+    /* Footer even on an abort (unless the sink itself is what failed, in
+     * which case it would only fail again), so a reader of a UART capture can
+     * tell a stream that finished from one that was cut. */
+    if (!tRes.bAborted || s_bStreamAbort)
+    {
+        n = snprintf(hdr, sizeof(hdr), "\r\n==== EXT-FLASH LOG DUMP %s ====\r\n",
+                     tRes.bAborted ? "ABORTED" : "END");
+        if (n > 0)
+            (void)sink((const uint8_t *)hdr, (uint16_t)n);
+    }
+
+    s_bStreamAbort = false;
+    if (pResult != NULL)
+        *pResult = tRes;
 }
 
 /* -------------------------------------------------------------------------- */

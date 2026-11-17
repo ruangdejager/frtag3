@@ -47,7 +47,17 @@ static osThreadId_t      xConsumer   = NULL;
 static volatile bool     bDumpRequested = false;
 static volatile bool     bEraseRequested = false;
 static volatile bool     bEraseAllRequested = false;
-static void            (*pfnDumpSink)(const uint8_t *data, uint16_t len) = NULL;
+/* The pending/running stream. The request fields are written before
+ * bDumpRequested is raised and snapshotted by the consumer before it is
+ * cleared, so a request can never be half-seen; bDumpRunning covers the
+ * stream itself, so a second request while one runs is refused rather than
+ * queued behind it. The old single pfnDumpSink was cleared unconditionally
+ * when a stream ended, which silently redirected a second LoRa request made
+ * during the first one to the tag's own debug UART. */
+static volatile bool      bDumpRunning = false;
+static LogSink_t volatile pfnDumpSink  = NULL;
+static volatile uint8_t   u8DumpPct    = 100U;
+static void (* volatile   pfnDumpDone)(const LogStreamResult_t *pRes) = NULL;
 
 /* Count of whole messages dropped because the ring was full. Incremented under
  * xFmtMutex (on the producer push path); snapshotted+cleared under the same
@@ -143,11 +153,26 @@ void DBGLOG_vPut(uint8_t dest, const char *format, ...)
 
 /* -------------------------------------------------------------------------- */
 
+/* See DBGLOG_vMuteVerboseUart. */
+static volatile bool bVerboseUartMuted = false;
+
+void DBGLOG_vMuteVerboseUart(bool bMute)
+{
+    bVerboseUartMuted = bMute;
+}
+
 void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...)
 {
     /* Same restrictions as DBGLOG_vPut. */
     if (__get_IPSR() != 0U)  return;
     if (xConsumer == NULL)   return;
+
+    if (bVerboseUartMuted)
+    {
+        dest = (uint8_t)(dest & (uint8_t)~DBGLOG_DEST_UART);
+        if (dest == 0U)
+            return;
+    }
 
     /* Build the "<date> <time> <mv>mV " prefix on a small local buffer, then
      * format the caller's message *directly after it* into the shared acFmt
@@ -207,20 +232,40 @@ void DBGLOG_vPutLog(const char *format, ...)
 
 /* -------------------------------------------------------------------------- */
 
-void DBGLOG_vRequestDump(void)
+bool DBGLOG_bRequestDump(uint8_t u8Percent)
 {
-    pfnDumpSink = NULL;
-    bDumpRequested = true;
-    if (xConsumer != NULL)
-        osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+    return DBGLOG_bRequestDumpVia(NULL, u8Percent, NULL);
 }
 
-void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len))
+bool DBGLOG_bRequestDumpVia(LogSink_t sink, uint8_t u8Percent,
+                            void (*pfnDone)(const LogStreamResult_t *pRes))
 {
+    if (bDumpRequested || bDumpRunning)
+        return false;
+
     pfnDumpSink = sink;
+    u8DumpPct   = u8Percent;
+    pfnDumpDone = pfnDone;
     bDumpRequested = true;
     if (xConsumer != NULL)
         osThreadFlagsSet(xConsumer, DBGLOG_WAKE_FLAG);
+    return true;
+}
+
+bool DBGLOG_bDumpBusy(void)
+{
+    return bDumpRequested || bDumpRunning;
+}
+
+void DBGLOG_vCancelDump(void)
+{
+    /* Not yet started: withdraw the request. Running: ask the stream loop to
+     * stop at its next chunk. The consumer runs above every caller of this
+     * (FrKernel is osPriorityLow), so it cannot be preempted between seeing
+     * the request and marking itself running. */
+    bDumpRequested = false;
+    if (bDumpRunning)
+        LOG_vAbortStream();
 }
 
 void DBGLOG_vRequestErase(void)
@@ -268,16 +313,25 @@ static void DBGLOG_vConsumerTask(void *arg)
          * remains the only writer of the debug transport. */
         if (bDumpRequested)
         {
+            LogSink_t sink  = pfnDumpSink;
+            uint8_t   u8Pct = u8DumpPct;
+            void    (*pfnDone)(const LogStreamResult_t *) = pfnDumpDone;
+
+            bDumpRunning   = true;
             bDumpRequested = false;
-            if (pfnDumpSink != NULL)
+
+            if (sink != NULL)
             {
-                LOG_vStreamViaSink(pfnDumpSink);
-                pfnDumpSink = NULL;
+                LogStreamResult_t tRes;
+                LOG_vStreamViaSink(sink, u8Pct, &tRes);
+                if (pfnDone != NULL)
+                    pfnDone(&tRes);
             }
             else
             {
-                LOG_vStreamToDebug();
+                LOG_vStreamToDebug(u8Pct);
             }
+            bDumpRunning = false;
         }
 
         /* Drain every complete frame currently published. */

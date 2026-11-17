@@ -214,7 +214,7 @@ bool RADIOTESTMODE_bEnter(void)
 
     /* A beaconing secondary has no task of its own — it rides MeshNetwork's TX
      * worker. Refuse up front if that worker is not there rather than entering
-     * a mode that would then never transmit (a bridge build skips
+     * a mode that would then never transmit (a console build skips
      * MESHNETWORK_vInit's campaign side). A silent no-beacon "success" would be
      * indistinguishable, from the far end of a range walk, from a link that
      * simply does not reach. */
@@ -590,7 +590,7 @@ static void RTM_vTeardown(void)
  * critical section RADIOTESTMODE_u32ServiceBeacon uses.
  * -------------------------------------------------------------------------- */
 /* Pull the id and sequence out of a beacon payload. Shared by the listener
- * and by the bridge's passive print below, so the wire format is decoded in
+ * and by the console's passive print below, so the wire format is decoded in
  * exactly one place — two copies of this would be two things to keep in step
  * with RADIOTESTMODE_u32ServiceBeacon's snprintf. Returns false for anything
  * that is not one of our beacons. */

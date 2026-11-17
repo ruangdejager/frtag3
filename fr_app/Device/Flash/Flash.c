@@ -869,7 +869,7 @@ void FLASH_vInit(void)
     /* Deliberately not a commented-out FLASH_vChipErase() any more. One
      * uncommented line here wipes every field unit it is flashed to, including
      * the staged OTA image that is the only way to fix it again. If a bring-up
-     * wipe is needed, use "tag flash eraseall" - it is one command, it is
+     * wipe is needed, use kernel command 'W' - it is one command, it is
      * logged, and it cannot be enabled by accident. */
 
     FLASH_vUnlock();

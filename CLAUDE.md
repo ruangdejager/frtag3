@@ -57,7 +57,7 @@ work to concentrate in `Hal/`.
 | --- | --- |
 | `Device/` | Peripheral drivers owned by this board: `Acc`, `Flash`, `Gps`, `LoraRadio`, `Farmranger` (UART link to the fr9 board). Bus I/O via `Hal/`, plus device protocol and health/retry logic. |
 | `Worker/` | Subsystems with their own lifecycle or state machine: `Battery`, `Fota`, `FrKernel`, `MeshNetwork`, `Movement`, `Power`, `SolarPower`. Built on one or more Devices. |
-| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTest` (`RadioTestMode.c`: runtime link/range test, entered with `tag <ID> radiotest`; not a separate build). |
+| `Tasks/` | Outermost application behaviour: `DeviceDiscovery` (the main AppTask — primary/secondary campaign loop, radio scheduling, drives Fota and MeshNetwork sessions) and `RadioTest` (`RadioTestMode.c`: runtime link/range test, entered with the kernel command `R`; not a separate build). |
 | `Services/` | Application services used across modules: `Debug` (raw debug transport, USART2), `Log` (circular text log on the external NOR flash), `SelfTest` (boot-time peripheral smoke tests, reported on the green LED and over FrKernel). |
 | `inc/`, `src/` | Cross-cutting glue that is not a module: `main.c`, `init.c` (boot sequencer), `DbgLog`, `flashLog`, `math_func`, `time_driver`, `uart_callbacks`, `inc/config/` build and version headers. |
 | `settings/` | `settings_default.c/h` — the persisted-settings struct and its compile-time defaults. |

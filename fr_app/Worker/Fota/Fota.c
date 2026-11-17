@@ -1074,7 +1074,7 @@ _Static_assert(((OTA_APP_MAX_SIZE + OTA_LORA_CHUNK_LEN - 1U) / OTA_LORA_CHUNK_LE
 static uint32_t u32SessionId;
 
 /* Secondary firmware-acceptance gate. bFwAcceptViaKernel distinguishes an
- * explicit "tag <ID> fwaccept" (which enables the OTA-receive rendezvous
+ * explicit kernel command 'w' (which enables the OTA-receive rendezvous
  * inside a kernel session) from the discovery TimeSync auto-arm (which must
  * NOT be consumed by an unrelated kernel/log-download wakeup). */
 static volatile bool bFwAcceptArmed;
@@ -2093,7 +2093,7 @@ void FOTA_vArmAcceptance(void)
 
 void FOTA_vArmAcceptanceKernel(void)
 {
-    /* Explicit "tag <ID> fwaccept" — the only arm source allowed to run an
+    /* Explicit kernel command 'w' — the only arm source allowed to run an
      * OTA receive inside a live FrKernel session (see the kernel rendezvous
      * in DeviceDiscovery.c). */
     bFwAcceptArmed     = true;

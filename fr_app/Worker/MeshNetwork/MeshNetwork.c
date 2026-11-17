@@ -38,6 +38,7 @@
 #include "GPS.h"
 #include "Movement.h"
 #include "RadioTestMode.h"   /* R&D radio link/range test gates */
+#include "FrKernel.h"        /* kernelV2 exclusivity gate */
 
 /* ---- DBeacon flags byte (byte 15) ---- */
 #define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
@@ -914,6 +915,11 @@ static uint32_t MESHNETWORK_u32JitterRand(void)
     x ^= x << 5;
     u32JitterRngState = x;
     return x;
+}
+
+uint32_t MESHNETWORK_u32Random(void)
+{
+    return MESHNETWORK_u32JitterRand();
 }
 
 /* The jitter CEILING for this node right now: the quiet-channel value, widened
@@ -2187,7 +2193,7 @@ void MESHNETWORK_vParserTask(void *pvParameters)
          * what makes the test a clean one-way measurement, and it is why the
          * only way out is a shake. A listening primary keeps exactly two
          * doors open — the beacons it is here to measure, and FrKernel, so
-         * "tag <ID> radio stop" can still reach it. */
+         * kernel command 'Q' can still reach it. */
         if (RADIOTESTMODE_bActive())
         {
             if (!RADIOTESTMODE_bIsListener())
@@ -2203,6 +2209,22 @@ void MESHNETWORK_vParserTask(void *pvParameters)
 
             if (eType != MeshPktType_FrKernel)
                 continue;
+        }
+
+        /* kernelV2: while a kernel session owns this device it takes part in
+         * nothing else on the air - no beacon, DReq, D-Ack or TimeSync is
+         * handled (so none is relayed, and no campaign state changes under
+         * the session). Only the kernel's own frames and OTA traffic pass:
+         * the kernel can arm an OTA receive ("w") or start a distribute
+         * ("o"), and FOTA ignores OTA packets it was not armed for. Same
+         * shape as the two filters above. */
+        if (FRKERNEL_bIsActive() &&
+            eType != MeshPktType_FrKernel &&
+            eType != MeshPktType_OtaPrep && eType != MeshPktType_OtaPrepAck &&
+            eType != MeshPktType_OtaChunk && eType != MeshPktType_OtaPoll &&
+            eType != MeshPktType_OtaReport)
+        {
+            continue;
         }
 
         switch (eType)
@@ -2230,14 +2252,14 @@ void MESHNETWORK_vParserTask(void *pvParameters)
                  * the test itself — the gate above intercepts these when it
                  * is — so this is a bystander hearing someone else's test.
                  *
-                 * The bridge is a passive listener on the whole mesh and is
+                 * The kernel console is a passive listener on the whole mesh and is
                  * the obvious rig to watch a range test from, so it decodes
                  * and prints. Every other build drops it silently: type 0 is
                  * now a type we legitimately transmit, so falling through to
                  * default's "Unknown pkt type" would have every production
                  * unit within earshot of a test log a line every 5 s about a
                  * packet that is not addressed to it and is not a fault. */
-#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+#ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
                 (void)RADIOTESTMODE_bLogBeacon(tRx.buffer + 1,
                                                (uint8_t)(tRx.length - 1),
                                                tRx.rssi, tRx.snr,

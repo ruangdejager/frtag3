@@ -13,8 +13,11 @@
 #ifndef TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_
 #define TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_
 
+#include <stdbool.h>
+
 #include "cmsis_os2.h"
 #include "MeshNetwork.h"
+#include "FrKernel_Config.h"   /* kernel connect-window lengths */
 
 /* ---- Discovery timing ---- */
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
@@ -251,14 +254,14 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * the 5 s TX cadence to keep the ratio of on-to-off time consistent. */
 #define DEVICE_DISCOVERY_BASIC_TX_GUARD_S         5U
 
-/* Kernel wakeup (shake-sequence): how long to wait for the user to start a
- * FrKernel session (send any "tag ..." command) before giving up and letting
- * the device return to deep sleep. 3 min so an operator has time to type
- * after the ~6 s shake sequence, accounting for the ~5 s -devicereq reply
- * jitter (see the LoRa spread in FrKernel.c). Once a session is actually
- * open FrKernel's own FRKERNEL_INACTIVITY_TIMEOUT_MS (5 min) is the real
- * "close this session" gate. */
-#define DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS  (180 * 1000)  /* 3 min */
+/* Kernel connect windows (kernelV2): how long a tag listens for a console's
+ * CONNECT after the shake sequence (FRKERNEL_SHAKE_WINDOW_MS, 2 min) and at the
+ * start of every discovery wake (FRKERNEL_WAKE_WINDOW_MS, 5 s) live in
+ * fr_app/Worker/FrKernel/FrKernel_Config.h with the rest of the session
+ * tuning. The wake window has to fit inside the quiet wake buffer: */
+_Static_assert(FRKERNEL_WAKE_WINDOW_MS <= APP_WAKEUP_BUFFER_MS,
+               "the discovery-wake kernel window must fit inside "
+               "APP_WAKEUP_BUFFER_MS, before any campaign traffic");
 
 /* Minimum time the fr9 attention line stays low when the primary drops the
  * logger session and reopens it (around the LoRa firmware distribute). The
@@ -267,10 +270,18 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
  * never comes. */
 #define DEVICE_DISCOVERY_LOGGER_RELINK_GAP_MS     1000U
 
+/* Longest the end of a pass waits for the radio TX queue to empty before
+ * deep-sleeping the chip. Covers one packet's worst carrier sense
+ * (LORA_TX_CARRIER_WAIT_MS, 5 s) only partly on purpose: anything still
+ * stuck after this is not going to get through and is dropped. */
+#define DEVICE_DISCOVERY_TX_DRAIN_MAX_MS          3000U
+
 /* osEventFlags bit — set by wakeup-schedule task to start a campaign */
 #define DISCOVERY_WAKEUP_BIT                (1UL << 0)
 
-/* osEventFlags bit — set by Movement to bypass deep sleep into FrKernel */
+/* osEventFlags bit — set by the shake sequence (Movement, via
+ * DEVICE_DISCOVERY_vTriggerKernelWakeup) to wake the AppTask into the kernel
+ * shake window instead of a campaign */
 #define DISCOVERY_KERNEL_BIT                (1UL << 1)
 
 /* osEventFlags bit — set by wakeup-schedule task in basic mode when the
@@ -287,6 +298,11 @@ _Static_assert(MESH_WAVE_BUDGET_MS <= APP_PRIMARY_CAMPAIGN_MAX_MS,
 /* Thread flag bit — set by OtaUpdate when OTA session traffic needs the
  * AppTask (an OtaPrep announcement, or a chunk in the receive mailbox) */
 #define DEVICE_DISCOVERY_NOTIFY_OTA         (1UL << 1)
+
+/* Thread flag bit — set by FrKernel whenever a kernel session opens or closes,
+ * so the AppTask reacts at once (abandon the campaign, leave the session loop)
+ * rather than on its next poll */
+#define DEVICE_DISCOVERY_NOTIFY_KERNEL      (1UL << 2)
 
 /* ---- Logger driver macros ---- */
 #define DEVICE_DISCOVERY_DRIVER_bConnectLogger()             FARMRANGER_bDeviceOn()
@@ -319,17 +335,21 @@ DeviceRole_e       DEVICE_DISCOVERY_eGetDeviceRole(void);
 osThreadId_t       DEVICE_DISCOVERY_xGetTaskHandle(void);
 void               DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
 
+/* FrKernel -> AppTask: a kernel session has opened (bOpened) or closed. */
+void               DEVICE_DISCOVERY_vOnKernelSession(bool bOpened);
+
 /* Super-deep sleep (secondary only): discovery, acc logging and scheduled
  * wakes all stop; the STOP2 indicator goes green. The two variants differ
  * only in what may wake the device again:
- *   vEnterProductionSleep — a rising panel level OR the shake sequence.
- *   vEnterSolarSleep      — the shake sequence ONLY, so a flat unit can take
+ *   bEnterProductionSleep — a rising panel level OR the shake sequence.
+ *   bEnterSolarSleep      — the shake sequence ONLY, so a flat unit can take
  *                           a full charge off the panel with the whole system
  *                           disabled instead of waking as soon as the sun
  *                           hits it.
- * Both report PRODUCTION_SLEEP via eGetProductionState(). */
-void               DEVICE_DISCOVERY_vEnterProductionSleep(void);
-void               DEVICE_DISCOVERY_vEnterSolarSleep(void);
+ * Both report PRODUCTION_SLEEP via eGetProductionState(). Both return false,
+ * and do nothing, on a primary (no panel, no accelerometer to wake it). */
+bool               DEVICE_DISCOVERY_bEnterProductionSleep(void);
+bool               DEVICE_DISCOVERY_bEnterSolarSleep(void);
 ProductionState_e  DEVICE_DISCOVERY_eGetProductionState(void);
 
 #endif /* TASKS_DEVICEDISCOVERY_DEVICEDISCOVERY_H_ */

@@ -207,7 +207,7 @@ void GPS_vNotifyOnRX(void);
  * enough bytes and at least two NMEA sentence starts ('$') were seen to
  * prove the module is alive on the wire (a byte count alone could be met
  * by noise on the unpulled RX pin). Returns true without touching the
- * hardware when GPS was never initialised (primary role, bridge build).
+ * hardware when GPS was never initialised (primary role, console build).
  * Does NOT go through the normal session state machine (no dispatcher
  * kick, no bSessionActive) — safe to call from INIT_vInitialization
  * before the rest of the system is up. Blocking. */

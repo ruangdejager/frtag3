@@ -47,22 +47,47 @@ void     LOG_vErase(void);
  * metadata below it (a single chip-erase command, faster than per-sector
  * for the full 512 KB). Destroys any staged-but-not-yet-installed OTA
  * image along with the log; only intended for a deliberate full field-unit
- * reset ("tag flash eraseall"), not routine log maintenance. */
+ * reset (kernel command 'W'), not routine log maintenance. */
 void     LOG_vEraseAll(void);
 
 /* Release the NOR flash into deep-power-down for the idle/STOP2 period that
  * follows. Called by the DbgLog consumer as its last act before it blocks. */
 void     LOG_vPark(void);
 
+/* A stream sink takes one chunk and returns false to stop the stream early:
+ * the LoRa sink returns false when the radio could not take the packet in a
+ * bounded time, so a stream whose session has gone away (radio asleep, kernel
+ * exited) ends instead of blocking the DbgLog consumer forever. */
+typedef bool (*LogSink_t)(const uint8_t *data, uint16_t len);
+
+/* What a stream did, for the caller's end-of-stream report. */
+typedef struct {
+    uint32_t u32Bytes;       /* log bytes handed to the sink                 */
+    uint32_t u32Total;       /* bytes the stream set out to send             */
+    uint16_t u16ReadFails;   /* chunks that could not be read and were
+                              * replaced by a "[read fail ...]" marker       */
+    bool     bAborted;       /* LOG_vAbortStream() or the sink stopped it    */
+} LogStreamResult_t;
+
 /* Stream the entire log FIFO (oldest → newest) out the debug transport via
  * DEBUG_vPutBuffer. Intended as a test/readback hook; call when no task is
  * concurrently writing the log (e.g. at boot right after LOG_vInit). */
-void     LOG_vStreamToDebug(void);
+void     LOG_vStreamToDebug(uint8_t u8Percent);
 
-/* Same content and chunking as LOG_vStreamToDebug, but each chunk is handed
- * to the given sink instead of hardcoding DEBUG_vPutBuffer -- e.g. FrKernel's
- * LoRa interface redirects "tag flash stream" over the radio instead of the
- * debug UART, since the requester has no UART session to read it from. */
-void     LOG_vStreamViaSink(void (*sink)(const uint8_t *data, uint16_t len));
+/* Stream the newest u8Percent % of the log (100 = all of it, oldest to
+ * newest) through the given sink. A partial stream starts at the first line
+ * boundary inside its window, so it never opens mid-line. Same content and
+ * chunking as LOG_vStreamToDebug - e.g. FrKernel's LoRa interface sends it
+ * over the radio, since the requester has no UART session to read it from.
+ *
+ * Must run on the DbgLog consumer (see DBGLOG_bRequestDumpVia): that task is
+ * the only writer of the log, so nothing can erase the sector being read.
+ * pResult may be NULL. */
+void     LOG_vStreamViaSink(LogSink_t sink, uint8_t u8Percent,
+                            LogStreamResult_t *pResult);
+
+/* Ask a running stream to stop at its next chunk. Safe from any task; a no-op
+ * when nothing is streaming. Cleared when the next stream starts. */
+void     LOG_vAbortStream(void);
 
 #endif /* SERVICES_LOG_LOG_H_ */

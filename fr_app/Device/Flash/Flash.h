@@ -49,7 +49,7 @@ bool    FLASH_bRecoverDevice(uint8_t *pu8Id, uint8_t *pu8Attempts);
 /* Durable health summary. Everything here survives the flash being unusable
  * (it is all in RAM plus a TAMP backup register), which is the point: when the
  * flash is the casualty, the flash log cannot be the place the fault is
- * recorded. Retrievable over FrKernel ("tag <ID> flash") so a field unit that
+ * recorded. Retrievable over FrKernel (kernel command 'f') so a field unit that
  * cannot be reached with a UART can still be asked what is wrong. */
 typedef struct
 {

@@ -30,6 +30,9 @@
 #define INC_DBGLOG_H_
 
 #include <stdint.h>
+#include <stdbool.h>
+
+#include "Log.h"     /* LogSink_t, LogStreamResult_t */
 
 /* Output destinations (bitmask) */
 #define DBGLOG_DEST_UART   (1U << 0)
@@ -44,16 +47,29 @@ void DBGLOG_vPut(uint8_t dest, const char *format, ...);
 /* Like DBGLOG_vPut, but prefixes the line with "<date> <time> <battery>mV ". */
 void DBGLOG_vPutVerbose(uint8_t dest, const char *format, ...);
 
-/* Ask the consumer task to stream the whole external-flash log over the debug
- * transport. Done from the consumer so it stays the single UART writer (no
- * interleaving with live log output). */
-void DBGLOG_vRequestDump(void);
+/* Ask the consumer task to stream the newest u8Percent % of the external-flash
+ * log (100 = all of it) over the debug transport. Done from the consumer so it
+ * stays the single UART writer (no interleaving with live log output).
+ * Returns false, and requests nothing, while a stream is already pending or
+ * running - see DBGLOG_bDumpBusy. */
+bool DBGLOG_bRequestDump(uint8_t u8Percent);
 
-/* Same as DBGLOG_vRequestDump, but streams via the given sink instead of the
+/* Same as DBGLOG_bRequestDump, but streams via the given sink instead of the
  * debug UART -- still run from the consumer task, so it can't race the
  * consumer's own log writes on the shared storage device. Used by FrKernel's
- * LoRa interface, which has no UART session to read a UART-routed dump from. */
-void DBGLOG_vRequestDumpVia(void (*sink)(const uint8_t *data, uint16_t len));
+ * LoRa interface, which has no UART session to read a UART-routed dump from.
+ * pfnDone (may be NULL) is called on the consumer task once the stream has
+ * finished or been aborted, with what it did - FrKernel uses it to send the
+ * end-of-stream frame. */
+bool DBGLOG_bRequestDumpVia(LogSink_t sink, uint8_t u8Percent,
+                            void (*pfnDone)(const LogStreamResult_t *pRes));
+
+/* True from a dump request until that stream has finished. */
+bool DBGLOG_bDumpBusy(void);
+
+/* Stop a running stream at its next chunk (LOG_vAbortStream), or cancel one
+ * that was requested but has not started yet. */
+void DBGLOG_vCancelDump(void);
 
 /* Ask the consumer task to erase the whole text log (the external-flash log
  * region, via LOG_vErase). Done from the consumer so it never races the
@@ -65,6 +81,13 @@ void DBGLOG_vRequestErase(void);
  * (LOG_vEraseAll), not just the log. Destroys any staged-but-not-yet-
  * installed OTA image. Same consumer-task rationale as DBGLOG_vRequestErase. */
 void DBGLOG_vRequestEraseAll(void);
+
+/* Drop the UART half of every VERBOSE line (DBG / DBG_LOG) while bMute is
+ * true; the flash half of DBG_LOG/LOG and all plain _DBG_ lines are
+ * unaffected. The kernel console mutes these so its terminal is an operator
+ * UI rather than a scrolling debug trace, and prints its own output through
+ * _DBG_ - which keeps the DbgLog consumer the only writer of the UART. */
+void DBGLOG_vMuteVerboseUart(bool bMute);
 
 /* Compatibility wrappers (UART-only / flash-only). */
 void DBGLOG_vPutDebug(const char *format, ...);

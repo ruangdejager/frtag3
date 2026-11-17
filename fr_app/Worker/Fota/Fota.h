@@ -99,7 +99,7 @@ bool FOTA_bDistributePending(void);
  * + repair, finalize). Replaces the discovery campaign for this slot. */
 void FOTA_vDistribute(void);
 
-/* On-demand distribution ("tag <ID> fwdistribute"): re-send whatever VALID
+/* On-demand distribution (kernel command 'o'): re-send whatever VALID
  * image is staged, one-shot. */
 bool FOTA_bRequestDistribute(void);
 bool FOTA_bDistributeRequested(void);
@@ -127,10 +127,10 @@ void FOTA_vSecondaryReceive(void);
  *     wakes so a secondary catches up on a later campaign. NOT honoured inside
  *     a kernel wakeup (would let a stray OtaPrep during a log-download session
  *     start a pointless receive).
- *   - FOTA_vArmAcceptanceKernel(): explicit "tag <ID> fwaccept" — the only
+ *   - FOTA_vArmAcceptanceKernel(): explicit kernel command 'w' — the only
  *     source that enables the OTA-receive rendezvous inside a live FrKernel
  *     session.
- * Both cleared by "tag <ID> fwaccept off", by a completed/attempted receive,
+ * Both cleared by kernel command 'w off', by a completed/attempted receive,
  * or by reset. FOTA_bAcceptanceArmedViaKernel() is true only for the latter. */
 void FOTA_vArmAcceptance(void);
 void FOTA_vArmAcceptanceKernel(void);

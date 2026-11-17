@@ -146,8 +146,8 @@ void INIT_vInitialization(void *parameters)
 #ifdef FRKERNEL_INTERFACE_LORA
         " FRKERNEL_INTERFACE_LORA\r\n"
 #endif
-#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
-        " FRKERNEL_INTERFACE_LORA_BRIDGE\r\n"
+#ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
+        " FRKERNEL_INTERFACE_LORA_CONSOLE\r\n"
 #endif
 #ifdef DEBUG_OUTPUT_UART
         " DEBUG_OUTPUT_UART\r\n"
@@ -155,6 +155,11 @@ void INIT_vInitialization(void *parameters)
 #ifdef DEBUG_OUTPUT_USB
         " DEBUG_OUTPUT_USB\r\n"
 #endif
+        "");
+    /* Split in three: a DbgLog message is capped at 255 B including its ~24 B
+     * prefix, and as one call the whole list silently lost its tail once nine
+     * or so options were defined. Each group below fits even fully defined. */
+    _DBG_LOG_(""
 #ifdef ENABLE_LEDS
         " ENABLE_LEDS\r\n"
 #endif
@@ -173,11 +178,16 @@ void INIT_vInitialization(void *parameters)
 #ifdef ENABLE_FLASH_STRESS_TEST
         " ENABLE_FLASH_STRESS_TEST\r\n"
 #endif
+        "");
+    _DBG_LOG_(""
 #ifdef ENABLE_MESH_DIAG_COUNTERS
         " ENABLE_MESH_DIAG_COUNTERS\r\n"
 #endif
 #ifdef ENABLE_MESH_VERBOSE_LOG
         " ENABLE_MESH_VERBOSE_LOG\r\n"
+#endif
+#ifdef ENABLE_RADIO_VERBOSE_LOG
+        " ENABLE_RADIO_VERBOSE_LOG\r\n"
 #endif
 #ifdef ENABLE_SOLAR_PERIODIC_LOG
         " ENABLE_SOLAR_PERIODIC_LOG\r\n"
@@ -217,16 +227,16 @@ void INIT_vInitialization(void *parameters)
     LORARADIO_vInit();
     FRKERNEL_vInit();
 
-#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+#ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
     /*
-     * UART<->LoRa FrKernel bridge (bench test rig): this primary's only job
-     * is relaying whatever the user types over the debug UART out as a LoRa
-     * FrKernel command, and printing whatever answer comes back. MeshNetwork
-     * supplies the radio TX/RX plumbing (its parser task is what delivers
-     * inbound FrKernel packets to FRKERNEL.c's callback); DeviceDiscovery,
-     * Farmranger, GPS and Movement are all skipped -- a scheduled campaign or
-     * logger session would fight this device for the radio/UART instead of
-     * just relaying.
+     * kernelV2 operator console (FrKernelConsole.c): this unit's only job is
+     * "c <id>" / "c bulk" and sending the command letters typed on its debug
+     * UART to tags as FrKernel v2 frames, then printing what comes back.
+     * MeshNetwork supplies the radio TX/RX plumbing (its parser task is what
+     * delivers inbound FrKernel frames to the console's callback);
+     * DeviceDiscovery, Farmranger, GPS and Movement are all skipped -- a
+     * scheduled campaign or logger session would fight the console for the
+     * radio/UART.
      */
     MESHNETWORK_vInit();
 
@@ -236,12 +246,13 @@ void INIT_vInitialization(void *parameters)
      * things at once -- STOP2 parks the debug UART pins to analog (the
      * terminal would go dead), and it suspends the CPU core entirely, so
      * the LoRa radio task could only service RX/TX once per 1 Hz RTC
-     * heartbeat instead of promptly. Without this the bridge looks "asleep"
+     * heartbeat instead of promptly. Without this the console looks "asleep"
      * within moments of boot completing. */
     SYSTEM_vSleepLockAcquire();
 
     /* Sample the channel noise floor for the whole life of this build. The
-     * bridge is the rig a range test is watched from, and a beacon's RSSI
+     * console is the rig a range test is watched from ("dbg" shows the beacon
+     * lines), and a beacon's RSSI
      * means little without the noise it is competing against — without this
      * every beacon line it prints would read "nf=n/a".
      *
@@ -286,7 +297,7 @@ void INIT_vInitialization(void *parameters)
          * (Debug UART is a separate peripheral, so the two no longer conflict.) */
         FARMRANGER_vInit();
     }
-#endif /* FRKERNEL_INTERFACE_LORA_BRIDGE */
+#endif /* FRKERNEL_INTERFACE_LORA_CONSOLE */
 
     TIME_vInit();
 

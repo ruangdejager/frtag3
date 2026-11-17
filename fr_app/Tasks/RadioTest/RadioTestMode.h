@@ -11,7 +11,7 @@
  * no task is created, no queue is allocated, no sleep lock is held, and every
  * gate in MeshNetwork / DeviceDiscovery is a single already-false read.
  *
- * Entering (both roles):   tag <ID> radiotest
+ * Entering (both roles):   kernel command R
  *
  *   SECONDARY -> beacons "RT <id> <seq>" every 5 s and goes deliberately deaf:
  *                every inbound radio packet is dropped, including FrKernel, so
@@ -29,7 +29,7 @@
  *                beacon count for every beacon heard, and pushes each one to
  *                the fr9 logger board over the Farmranger UART as it is
  *                measured, so the run is on fr9 flash live rather than at the
- *                end. Keeps the FrKernel door open so "tag <ID> radio stop"
+ *                end. Keeps the FrKernel door open so kernel command 'Q'
  *                can end the mode over the air.
  *
  * The mode is RAM-only and deliberately not persisted: a reboot returns the
@@ -132,10 +132,10 @@ void RADIOTESTMODE_vOnBeacon(const uint8_t *pBuf, uint8_t u8Len,
 /* Decode one beacon frame and log it, WITHOUT being in the mode and without
  * touching any of its state. Returns false if the frame is not one of ours.
  *
- * For the FRKERNEL_INTERFACE_LORA_BRIDGE bench rig, which is a passive
+ * For the FRKERNEL_INTERFACE_LORA_CONSOLE bench rig, which is a passive
  * listener on the whole mesh and has no role in a range test — it never runs
  * RADIOTESTMODE_bEnter, so RADIOTESTMODE_vOnBeacon above would ignore it.
- * Without this the bridge printed "MeshNetwork: Unknown pkt type 0" at every
+ * Without this the bridge (now the console) printed "MeshNetwork: Unknown pkt type 0" at every
  * beacon, which is the one rig you would most want to watch a range test
  * from.
  *

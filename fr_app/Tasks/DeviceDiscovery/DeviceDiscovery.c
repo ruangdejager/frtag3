@@ -66,11 +66,29 @@ static volatile ProductionState_e eProductionState = PRODUCTION_READY;
  * reachable exit and clears it. */
 static volatile bool bSolarWakeDisabled = false;
 
+/* Set by the shake trigger, cleared once that shake has been served - by a
+ * kernel session, or by its window running out. DISCOVERY_KERNEL_BIT alone
+ * cannot say this: it is also set when a bench-UART session opens (see
+ * DEVICE_DISCOVERY_vOnKernelSession), and a shake that arrived mid-campaign
+ * and was then used by a session would otherwise open a second, pointless
+ * 2-minute window on the next pass. */
+static volatile bool bShakePending = false;
+
 /* ---- Forward declarations ---- */
-static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake);
+static bool DEVICE_DISCOVERY_bEnterSleepMode(bool bAllowSolarWake);
 static void DEVICE_DISCOVERY_vSendTS(void);
 static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
+static void DEVICE_DISCOVERY_vRunKernelSession(void);
+
+/* Seed the CALLING task's rand() (newlib keeps it per task, see
+ * DEVICE_DISCOVERY_vInit). MESHNETWORK_u32Random is already per node and per
+ * boot (radio RNG ^ unique id) and, unlike the radio RNG itself, is safe to
+ * draw from a task other than the radio task. */
+static void DEVICE_DISCOVERY_vSeedRand(void)
+{
+    srand((unsigned int)(MESHNETWORK_u32Random() ^ LORARADIO_u32GetUniqueId()));
+}
 
 /* --------------------------------------------------------------------------
  * DEVICE_DISCOVERY_vInit
@@ -80,11 +98,14 @@ void DEVICE_DISCOVERY_vInit(void)
     xDiscoveryEventFlags = osEventFlagsNew(NULL);
     configASSERT(xDiscoveryEventFlags != NULL);
 
-    /* Seed rand() from the LoRa unique id so basic-mode beacon jitter
-     * differs from one node to the next on the very first roll (same
-     * boot moment, different id -> different sequence). Used only for
-     * the basic-mode 5..15 s beacon spacing; no security implications. */
-    srand((unsigned int)LORARADIO_u32GetUniqueId());
+    /* rand() is NOT seeded here any more. configUSE_NEWLIB_REENTRANT gives
+     * every FreeRTOS task its own newlib _reent, and rand()'s state lives in
+     * it - so the srand() that used to sit here seeded only the init task,
+     * which exits straight afterwards. Every task that actually calls rand()
+     * (the schedule task for the basic-beacon jitter, the AppTask for the
+     * FOTA distribute back-off) ran on newlib's default seed, so every tag in
+     * the herd drew the SAME "random" offsets and collided anyway. Each of
+     * those tasks now seeds itself on entry - see DEVICE_DISCOVERY_vSeedRand. */
 
     static const osThreadAttr_t app_attr = {
         .name       = "DevDiscoveryApp",
@@ -126,6 +147,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
 {
     (void)pvParameters;
 
+    DEVICE_DISCOVERY_vSeedRand();   /* FOTA distribute back-off */
+
     for (;;)
     {
         /* ----------------------------------------------------------------
@@ -135,6 +158,18 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                                              DISCOVERY_WAKEUP_BIT | DISCOVERY_KERNEL_BIT | DISCOVERY_BASIC_BEACON_BIT,
                                              osFlagsWaitAny,
                                              osWaitForever);
+
+        /* The AppTask owns its own sleep lock: taken here, once per pass,
+         * released once at the end of the pass. The wake sources used to take
+         * it (schedule fire, shake, solar activation, basic beacon) while this
+         * loop released one per pass - but event flags coalesce, so two wakes
+         * landing in one pass (a scheduled slot during a long kernel session,
+         * a shake during a campaign) were two acquires against one release,
+         * and the leaked count kept the MCU out of STOP2 until the next
+         * reset. Nothing can sleep between a trigger setting its bit and this
+         * line: the bit makes this task ready, and STOP2 is only entered from
+         * the idle task. */
+        SYSTEM_vSleepLockAcquire();
 
         /* Multi-primary: arm the "first TimeSync only" gate for this
          * wake cycle. Subsequent TimeSyncs from other primaries during
@@ -207,7 +242,36 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         DBG_LOG("DeviceDiscovery %X: Woke up for discovery.\r\n",
             LORARADIO_u32GetUniqueId());
 
-        osDelay(APP_WAKEUP_BUFFER_MS);
+        /* Wake buffer + kernel connect window (kernelV2). The buffer is the
+         * quiet part of every wake - no DReq goes out until it has passed on
+         * the primary - so it is where a console's CONNECT can be heard
+         * without competing with campaign traffic, and listening for it costs
+         * nothing: the radio is in RX for this time anyway. A connect here
+         * takes this device out of this campaign entirely; it does not take
+         * part in discovery while the kernel has it. */
+        {
+            const uint32_t u32BufStart = osKernelGetTickCount();
+            (void)osThreadFlagsClear(DEVICE_DISCOVERY_NOTIFY_KERNEL);
+            FRKERNEL_vOpenWindow(FRKERNEL_WINDOW_WAKE, FRKERNEL_WAKE_WINDOW_MS);
+
+            uint32_t u32Elapsed = 0U;
+            while (!FRKERNEL_bIsActive() && (u32Elapsed < APP_WAKEUP_BUFFER_MS))
+            {
+                (void)osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_KERNEL, osFlagsWaitAny,
+                                        APP_WAKEUP_BUFFER_MS - u32Elapsed);
+                u32Elapsed = osKernelGetTickCount() - u32BufStart;
+            }
+            /* The WAKE window expires on its own after FRKERNEL_WAKE_WINDOW_MS.
+             * It is not closed here: a shake window opened just before this
+             * wake shares the same slot and must keep running. */
+
+            if (FRKERNEL_bIsActive())
+            {
+                DBG_LOG("DeviceDiscovery %X: kernel connected in wake window - skipping this campaign\r\n",
+                    LORARADIO_u32GetUniqueId());
+                goto kernel_session;
+            }
+        }
         EVTLOG(LOG_DISCOVERY_START, eDeviceRole);
 
         /* Wall time for the whole discovery, wake to "complete" below — not to
@@ -257,6 +321,9 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                 uint32_t u32WaitedMs = 0U;
                 while (u32WaitedMs < DEVICE_DISCOVERY_BASIC_LISTEN_WINDOW_MS)
                 {
+                    /* A kernel session (bench UART) owns the device. */
+                    if (FRKERNEL_bIsActive())
+                        break;
                     if (MESHNETWORK_u16GetBasicNeighborCount() >= DEVICE_DISCOVERY_BASIC_HWM)
                         (void)DEVICE_DISCOVERY_bBasicLogAndClear("HWM");
                     osDelay(250);
@@ -489,6 +556,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         pcWaveEnd = "RADIOTEST";
                         break;
                     }
+
+                    /* A kernel session opened mid-campaign (only possible from
+                     * the bench UART - LoRa connects are confined to the wake
+                     * window) owns the device from here: abandon the waves. */
+                    if (FRKERNEL_bIsActive())
+                    {
+                        pcWaveEnd = "KERNEL";
+                        break;
+                    }
                 }
 
                 const uint16_t u16UnionNow = MESHNETWORK_u16GetNeighborCount();
@@ -545,7 +621,7 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                     (unsigned)bPrevWaveBarren,
                     (unsigned)bBeaconSeenThisWave);
 
-                if (RADIOTESTMODE_bActive())
+                if (RADIOTESTMODE_bActive() || FRKERNEL_bIsActive())
                 {
                     bDiscoveryFinished = true;
                     MESHNETWORK_vStopPrimaryAck();
@@ -639,9 +715,17 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             for (;;)
             {
                 uint32_t r = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_TIMESYNC |
-                                               DEVICE_DISCOVERY_NOTIFY_OTA,
+                                               DEVICE_DISCOVERY_NOTIFY_OTA |
+                                               DEVICE_DISCOVERY_NOTIFY_KERNEL,
                                                osFlagsWaitAny,
                                                APP_SECONDARY_POLL_MS);
+
+                /* A kernel session owns the device from the moment it opens
+                 * (a shake window that was already open when this campaign
+                 * started, or the bench UART): abandon the campaign now. */
+                if (FRKERNEL_bIsActive())
+                    break;
+
                 if (!(r & osFlagsError))
                 {
                     /* OTA prep announced instead of a DReq: this wake slot
@@ -720,7 +804,8 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                         LORARADIO_u32GetUniqueId(), APP_OTA_PREP_WAIT_MS);
 
                     uint32_t u32WaitStart = osKernelGetTickCount();
-                    while ((osKernelGetTickCount() - u32WaitStart) < APP_OTA_PREP_WAIT_MS)
+                    while (((osKernelGetTickCount() - u32WaitStart) < APP_OTA_PREP_WAIT_MS) &&
+                           !FRKERNEL_bIsActive())
                     {
                         uint32_t r2 = osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_OTA,
                                                         osFlagsWaitAny, APP_SECONDARY_POLL_MS);
@@ -747,6 +832,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              * beaconing into the post-campaign delay (until the beacon cap). */
             MESHNETWORK_vStopBeaconingSelf();
         }
+
+        /* A kernel session that opened during the campaign owns the device:
+         * no stats, no fr9 logger session, and above all not the campaign-end
+         * radio TX flush below, which would throw the kernel's own replies
+         * away. The session loop does the teardown that matters. */
+        if (FRKERNEL_bIsActive())
+            goto kernel_session;
 
         /* ----------------------------------------------------------------
          * Discovery complete — log and upload (primary only)
@@ -915,6 +1007,10 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
             {
                 DBG_LOG("DeviceDiscovery: radio test active - skipping logger session\r\n");
             }
+            else if (FRKERNEL_bIsActive())
+            {
+                DBG_LOG("DeviceDiscovery: kernel session active - skipping logger session\r\n");
+            }
             else
             {
                 /* ---- Logger connection + upload (fr9 Farmranger board) ----
@@ -1070,100 +1166,144 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         } /* end if (!bKernelWakeup) */
         else
         {
-            /* Kernel wakeup (shake-sequence): give the user a window to start
-             * a FrKernel session before falling back to sleep. Without this,
-             * FRKERNEL_bIsConnected() below is still false at the instant we
-             * wake (no command has been sent yet) and we'd go straight back
-             * to sleep. */
-            DBG_LOG("DeviceDiscovery: Kernel wakeup - waiting up to %u s for FrKernel session...\r\n",
-                DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS / 1000U);
+            /* Shake wake (kernelV2): listen for a console's CONNECT for
+             * FRKERNEL_SHAKE_WINDOW_MS, then go back to the schedule if none
+             * came. The shake itself already opened the window, so a connect
+             * could land even while a campaign was still running; it is
+             * re-opened here so the operator gets the full window from the
+             * moment this device is actually idle and listening.
+             *
+             * The radio is woken HERE, on the task that sequences its power,
+             * not only by the trigger: a shake that arrived during a campaign
+             * used to be followed by that campaign's tail deep-sleeping the
+             * radio, and the 3-minute window that came after it was deaf. The
+             * solar-activation path had the same hole and never woke the radio
+             * at all. */
+            HAL_UART_vInit();
+            DEBUG_vInit();
+            LORARADIO_vWakeUp();
 
-            /* Drop any leftover discovery TimeSync auto-arm before the kernel
-             * session opens: this wake is for kernel commands, not OTA. Left
-             * armed, a stray OtaPrep here would latch (bPrepPending) and — since
-             * the kernel rendezvous only serves an explicit "tag fwaccept" — sit
-             * un-consumed, then reject the next campaign's real OtaPrep as a
-             * different-sid session ("locked to"), wedging that secondary out of
-             * OTA. The next discovery TimeSync re-arms it anyway, so nothing is
-             * lost. An explicit "tag <ID> fwaccept" during the session re-arms
-             * via the kernel path. */
-            if (!FOTA_bAcceptanceArmedViaKernel())
-                FOTA_vDisarmAcceptance();
-
-            uint32_t u32WaitedMs = 0U;
-            while (!FRKERNEL_bIsConnected() && u32WaitedMs < DEVICE_DISCOVERY_KERNEL_WAKEUP_WINDOW_MS)
+            if (!FRKERNEL_bIsActive() && bShakePending)
             {
-                /* A prodsleep/solarsleep command taken during this window is
-                 * an order to sleep NOW — don't keep the device awake for the
-                 * rest of the 3 min holding the kernel sleep lock. (The
-                 * command's own auto-release can otherwise be missed entirely
-                 * by this 500 ms poll, since it clears the session flag ~100 ms
-                 * after setting it.) */
-                if (eProductionState == PRODUCTION_SLEEP)
-                    break;
+                FRKERNEL_vOpenWindow(FRKERNEL_WINDOW_SHAKE, FRKERNEL_SHAKE_WINDOW_MS);
+                DBG_LOG("DeviceDiscovery: shake - kernel listening up to %u s for a connect\r\n",
+                    (unsigned)(FRKERNEL_SHAKE_WINDOW_MS / 1000U));
 
-                osDelay(500);
-                u32WaitedMs += 500U;
+                /* Drop any leftover discovery TimeSync auto-arm: this wake is
+                 * for kernel commands, not OTA. Left armed, a stray OtaPrep
+                 * here would latch and sit un-consumed, then reject the next
+                 * campaign's real OtaPrep as a different-sid session, wedging
+                 * this secondary out of OTA. The next discovery TimeSync
+                 * re-arms it anyway; an explicit "w" re-arms via the kernel. */
+                if (!FOTA_bAcceptanceArmedViaKernel())
+                    FOTA_vDisarmAcceptance();
+
+                while (FRKERNEL_bWindowOpen() && !FRKERNEL_bIsActive())
+                    (void)osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_KERNEL, osFlagsWaitAny, 500U);
+
+                if (!FRKERNEL_bIsActive())
+                    DBG_LOG("DeviceDiscovery: shake window expired, no connect - back to schedule\r\n");
             }
-
-            if (!FRKERNEL_bIsConnected())
-                DBG_LOG("DeviceDiscovery: Kernel wakeup window expired, no session - sleeping\r\n");
+            bShakePending = false;
         }
+
+kernel_session:
+        /* ---- Kernel session ----
+         * While a session is active the kernel owns this device: no campaign,
+         * no scheduled wake (the schedule task stands down, see
+         * FRKERNEL_bHoldsDevice), no GPS, no mesh traffic (MeshNetwork drops
+         * it). Only "x", 5 min without a command, or a terminal command
+         * (sleep, radio test) gives the device back. */
+        if (FRKERNEL_bIsActive())
+            DEVICE_DISCOVERY_vRunKernelSession();
 
         /* ---- Deep sleep ---- */
         MESHNETWORK_vResetNodeRole();
 
         EVTLOG(LOG_DEVICE_ENTERING_SLEEP, eDeviceRole);
 
-        /* Hold off sleep while an active FrKernel session is in progress.
-         * The user must issue "tag release" (or 5-min inactivity auto-releases).
-         *
-         * This loop is also the OTA-over-kernel-session rendezvous:
-         *   - Secondary armed with "tag <ID> fwaccept" live-listens here for an
-         *     OtaPrep and runs the receive in-place (resets into the bootloader
-         *     on a verified image).
-         *   - Primary asked with "tag <ID> fwdistribute" (its session kept the
-         *     device awake past the campaign) distributes the staged image from
-         *     ext flash here.
-         * The session's s_bConnected is what parked the AppTask in this loop in
-         * the first place, so no extra wake plumbing is needed. */
-        if (FRKERNEL_bIsConnected())
-        {
-            DBG("DeviceDiscovery: FrKernel session active — waiting for release...\r\n");
-            while (FRKERNEL_bIsConnected())
-            {
-                if (eDeviceRole == DEVICE_ROLE_SECONDARY &&
-                    FOTA_bAcceptanceArmedViaKernel() && FOTA_bPrepPending())
-                {
-                    /* Only an EXPLICIT "tag <ID> fwaccept" (kernel arm) runs an
-                     * OTA receive inside a kernel session. A leftover discovery
-                     * TimeSync auto-arm must not be consumed here: it would let
-                     * a stray OtaPrep during a log-download wakeup start a
-                     * pointless receive that no primary is actually feeding
-                     * (the "receiving v... 0/N chunks - abort" seen in field
-                     * logs). Verified image -> resets into the bootloader (no
-                     * return); failure returns here and the session keeps
-                     * holding. */
-                    FOTA_vSecondaryReceive();
-                }
-                else if (eDeviceRole == DEVICE_ROLE_PRIMARY &&
-                         FOTA_bDistributeRequested())
-                {
-                    FOTA_vClearDistributeRequest();
-                    FOTA_vDistribute();
-                }
-                osDelay(500);
-            }
-        }
-
         DBG_LOG("DeviceDiscovery: Waiting for synchronized wake-up...\r\n");
+
+        /* Let anything still queued for the radio actually leave - the final
+         * reply of a kernel session, say - before the chip goes into cold
+         * sleep. Sleeping it with a packet in carrier sense lost that packet,
+         * and the radio task then drove a chip whose registers had been
+         * reset. Bounded, then whatever is left is dropped. */
+        {
+            const uint32_t u32DrainStart = osKernelGetTickCount();
+            while (!LORARADIO_bTxQuiet(0U) &&
+                   ((osKernelGetTickCount() - u32DrainStart) < DEVICE_DISCOVERY_TX_DRAIN_MAX_MS))
+                osDelay(20);
+            LORARADIO_vFlushTxQueue();
+        }
         osDelay(100);
         LORARADIO_vEnterDeepSleep();
 
-        /* Campaign complete — release the sleep lock taken when this wake
-         * was triggered (Discovery wake trigger or ProductionSleep exit). */
+        /* End of pass - release the sleep lock this pass took at its top. */
         SYSTEM_vSleepLockRelease();
     }
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vRunKernelSession
+ *
+ * The AppTask's half of a kernel session: stop everything else, then serve
+ * the OTA rendezvous until the session ends.
+ * -------------------------------------------------------------------------- */
+static void DEVICE_DISCOVERY_vRunKernelSession(void)
+{
+    DBG_LOG("DeviceDiscovery: kernel session - all other activity stopped\r\n");
+
+    /* Cancel whatever the wake was doing. Each of these is a no-op when the
+     * thing it stops is not running. */
+    MESHNETWORK_vSetCampaignOpen(false);       /* no DReq starts an episode   */
+    MESHNETWORK_vStopBeaconingSelf();
+    if (eDeviceRole == DEVICE_ROLE_PRIMARY)
+        MESHNETWORK_vStopPrimaryAck();
+    MESHNETWORK_vFlushTxQueue(false);          /* pending relays/beacons; the
+                                                * radio queue is left alone so
+                                                * the kernel's own replies go */
+    GPS_vShutdown();                           /* pre-trigger / sleep-exit fix */
+    if (!FOTA_bAcceptanceArmedViaKernel())
+        FOTA_vDisarmAcceptance();
+    bShakePending = false;                     /* a pending shake is served   */
+    /* Any DISCOVERY_KERNEL_BIT still set now belongs to this session - its
+     * own open (DEVICE_DISCOVERY_vOnKernelSession) or the shake it serves -
+     * and would only cost an empty extra pass afterwards. A new shake during
+     * the session is ignored by the trigger, so nothing real is lost. */
+    (void)osEventFlagsClear(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
+
+    /* The radio is NOT re-initialised here: every path into a session already
+     * has it awake (campaign, shake branch, or the kernel branch a bench-UART
+     * session wakes), and LORARADIO_vWakeUp re-runs the radio init from this
+     * task - right while the tag's "connected" reply may be on the air. */
+
+    /* The OTA-over-kernel rendezvous:
+     *   - a secondary armed with "w" runs the receive in-place when the
+     *     primary's OtaPrep arrives (a verified image resets into the
+     *     bootloader; a failure returns here and the session carries on);
+     *   - a primary asked with "o" distributes the staged image here.
+     * Only an EXPLICIT kernel arm counts: a leftover discovery TimeSync
+     * auto-arm consumed here would start a receive that no primary is feeding
+     * (the "receiving v... 0/N chunks - abort" seen in field logs). */
+    while (FRKERNEL_bIsActive())
+    {
+        if ((eDeviceRole == DEVICE_ROLE_SECONDARY) &&
+            FOTA_bAcceptanceArmedViaKernel() && FOTA_bPrepPending())
+        {
+            FOTA_vSecondaryReceive();
+        }
+        else if ((eDeviceRole == DEVICE_ROLE_PRIMARY) && FOTA_bDistributeRequested())
+        {
+            FOTA_vClearDistributeRequest();
+            FOTA_vDistribute();
+        }
+
+        (void)osThreadFlagsWait(DEVICE_DISCOVERY_NOTIFY_KERNEL | DEVICE_DISCOVERY_NOTIFY_OTA,
+                                osFlagsWaitAny, 500U);
+    }
+
+    DBG_LOG("DeviceDiscovery: kernel session over - device back on its schedule\r\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -1195,6 +1335,8 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
     static bool     bSlotValid       = false;
     static uint64_t u64LastGpsSlot   = 0;
     static bool     bGpsSlotValid    = false;
+
+    DEVICE_DISCOVERY_vSeedRand();   /* basic-mode beacon jitter */
 
     PLATFORM_bSubscribeToHeartbeat(osThreadGetId(), HB_ALLOW_IN_RECOVERY);
 
@@ -1231,10 +1373,31 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
         if (RADIOTESTMODE_bActive())
             continue;
 
+        /* ---- Kernel holds the device: participate in nothing ----
+         * A kernel session (or a shake window still waiting for a connect)
+         * owns this device. No discovery wake, basic beacon or GPS
+         * pre-trigger may start underneath it. Before kernelV2 this task never
+         * looked: each slot boundary during a session re-initialised the UART,
+         * reset the mesh node role and re-ran the radio's init from this task
+         * - mid kernel reply or log stream - and then left a stale campaign to
+         * run minutes late once the session ended.
+         *
+         * The slot latches are moved on, not left behind, so the slots that
+         * pass during the session are skipped rather than fired late the
+         * moment it ends; the next campaign is the next real boundary. */
+        if (FRKERNEL_bHoldsDevice())
+        {
+            if (bSlotValid)
+                u64LastFiredSlot = u64Slot;
+            if (bGpsSlotValid && (u32IntervalS > DEVICE_DISCOVERY_GPS_PRETRIGGER_S))
+                u64LastGpsSlot = (u64Utc + DEVICE_DISCOVERY_GPS_PRETRIGGER_S) / (uint64_t)u32IntervalS;
+            continue;
+        }
+
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
-            /* SolarSleep ("tag solarsleep"): shake-to-wake only. Skip the
+            /* SolarSleep (kernel 'S'): shake-to-wake only. Skip the
              * solar-activation check below entirely — the whole point is to
              * stay disabled while the panel charges the battery, so a rising
              * Vsolar must not pull us out. The continue still applies,
@@ -1252,13 +1415,18 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                  * no longer in ProductionSleep — see the setter's docs. */
                 HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
 
-                /* Hold off deep sleep until the resulting kernel window
-                 * completes (released at the end of DEVICE_DISCOVERY_vAppTask's
-                 * loop). Re-arm the debug UART BEFORE logging so the activation
-                 * is observable live — STOP2 parked its pins analog and this
+                /* Re-arm the debug UART BEFORE logging so the activation is
+                 * observable live — STOP2 parked its pins analog and this
                  * branch is otherwise the only wake path that forgets to
-                 * restore them. */
-                SYSTEM_vSleepLockAcquire();
+                 * restore them.
+                 *
+                 * No kernel window and no sleep lock any more (kernelV2): the
+                 * kernel opens only on the shake sequence and in the first
+                 * seconds of a discovery wake. This path used to set
+                 * DISCOVERY_KERNEL_BIT for a 3-minute window that it never
+                 * woke the radio for, so it held the MCU out of STOP2 for three
+                 * minutes listening with a sleeping receiver. The device simply
+                 * resumes its schedule; its first campaign is the next slot. */
                 HAL_UART_vInit();
                 DEBUG_vInit();
 
@@ -1270,8 +1438,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                  * unbounded stretch in ProductionSleep (no RTC-correcting
                  * TimeSync while asleep) is exactly the case most likely to
                  * have a drifted RTC, so get it corrected as early as possible.
-                 * GPS_vRequestFix() owns its own deep-sleep lock, independent
-                 * of the kernel-window lock acquired above. */
+                 * GPS_vRequestFix() owns its own deep-sleep lock. */
                 if (POWER_tGetState() & POWER_CLASS_NORMAL)
                 {
                     DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
@@ -1280,8 +1447,6 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
                      * routine GPS via fr9. */
                     GPS_vRequestFix(true, 300, true);
                 }
-
-                osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
             }
             continue;
         }
@@ -1323,10 +1488,8 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
              * a discovery campaign without a fresh fix attempt. */
             if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
             {
-                /* Hold off deep sleep until the discovery campaign completes
-                 * (released at the end of DEVICE_DISCOVERY_vAppTask's loop). */
-                SYSTEM_vSleepLockAcquire();
-
+                /* No sleep lock here: the AppTask takes its own when it picks
+                 * the wake up (see the top of DEVICE_DISCOVERY_vAppTask). */
                 if (eDeviceRole == DEVICE_ROLE_PRIMARY)
                     FARMRANGER_vUartOnWake();
 
@@ -1404,7 +1567,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
 
                     if (POWER_tGetState() & (POWER_CLASS_NORMAL | POWER_CLASS_LOW))
                     {
-                        SYSTEM_vSleepLockAcquire();
+                        /* No sleep lock: the AppTask takes its own. */
                         LORARADIO_vWakeUp();
                         osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_BASIC_BEACON_BIT);
                     }
@@ -1609,6 +1772,14 @@ static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason)
  * -------------------------------------------------------------------------- */
 void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
 {
+    /* Already in a session: the operator is connected and nothing may
+     * interrupt the kernel - a second shake changes nothing. */
+    if (FRKERNEL_bIsActive())
+    {
+        DBG_LOG("DeviceDiscovery: shake ignored - kernel session already active\r\n");
+        return;
+    }
+
     /* Shake is the documented — and, on a beaconing secondary, the only —
      * way out of the R&D radio-test mode: once beaconing it drops every
      * inbound packet, so no over-the-air command can reach it.
@@ -1616,44 +1787,34 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
      * Left first, before any of the normal wakeup work below, so what follows
      * is exactly the kernel window a shake would have produced had the mode
      * never been entered. This function is only ever reached from the
-     * secondary-only shake sequence in Movement.c (solar activation sets
-     * DISCOVERY_KERNEL_BIT directly), so a listening primary is unaffected —
-     * it exits on "tag <ID> radio stop" instead. */
+     * secondary-only shake sequence in Movement.c, so a listening primary is
+     * unaffected — it exits on "Q" instead. */
     if (RADIOTESTMODE_bActive())
         RADIOTESTMODE_vExit("shake");
 
-    /* Hold off deep sleep until the resulting (no-op) campaign completes —
-     * released at the end of DEVICE_DISCOVERY_vAppTask's loop.
-     *
-     * Both the debug UART and the radio are re-armed unconditionally here,
-     * matching the scheduled-wake path below — not one or the other picked
-     * by FRKERNEL_INTERFACE_LORA vs UART. DBG_LOG visibility has nothing to
-     * do with which transport FrKernel commands arrive on: a LORA-interface
-     * secondary still needs its debug UART alive for bench observation, and
-     * the radio must come out of its between-campaigns deep sleep on EVERY
-     * kernel wakeup regardless of interface, or a LoRa-delivered command
-     * (e.g. a broadcast "tag -devicereq") arrives at a radio that's still
-     * off and is never received. */
-    SYSTEM_vSleepLockAcquire();
+    /* Re-arm the debug UART so the wake is observable. The radio is NOT woken
+     * here and no sleep lock is taken: the AppTask does both when it picks up
+     * DISCOVERY_KERNEL_BIT (see the top of DEVICE_DISCOVERY_vAppTask and its
+     * shake branch). If the AppTask is mid-campaign the radio is awake anyway,
+     * and the window opened below already lets a connect land there. */
     HAL_UART_vInit();
     DEBUG_vInit();
-    LORARADIO_vWakeUp();
     DBG("\r\n--- KERNEL WAKEUP ---\r\n");
 
     /* This is the single entry point for shake-triggered wakeups (only ever
      * called from the secondary-only shake-sequence in Movement.c, same
      * role restriction as ProductionSleep — no role guard needed here). A
-     * shake already opens a kernel session regardless of eProductionState,
-     * but without this it never leaves ProductionSleep: once the session
-     * ends the device would fall back to waiting for Vsolar instead of
-     * resuming normal scheduled discovery. Mirrors the solar wake path. */
+     * shake opens a kernel window regardless of eProductionState, but
+     * without this it never leaves ProductionSleep: once the window or
+     * session ends the device would fall back to waiting for Vsolar instead
+     * of resuming normal scheduled discovery. Mirrors the solar wake path. */
     if (eProductionState == PRODUCTION_SLEEP)
     {
         bool bWasSolarSleep = bSolarWakeDisabled;
 
         eProductionState   = PRODUCTION_ACTIVE;
         /* Shake is the ONLY exit from SolarSleep — clear the flag here or the
-         * next ordinary "tag prodsleep" would inherit it and ignore solar. */
+         * next ordinary production sleep would inherit it and ignore solar. */
         bSolarWakeDisabled = false;
         /* Swap the STOP2-indicator LED back to red now that we're no
          * longer in ProductionSleep — see HAL_SYSTEM_vSetSleepIndicatorLed. */
@@ -1664,7 +1825,8 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
         /* Same rationale as the solar wake path: get the RTC corrected as
          * early as possible after an unbounded ProductionSleep stretch,
          * not just at the next scheduled pre-trigger. GPS_vRequestFix()
-         * owns its own sleep lock (released inside GPS_vPowerOff()). */
+         * owns its own sleep lock (released inside GPS_vPowerOff()). If the
+         * operator connects, the kernel session cancels it. */
         if (POWER_tGetState() & POWER_CLASS_NORMAL)
         {
             DBG_LOG("DeviceDiscovery: GPS acquire on ProductionSleep wake (5 min timeout)\r\n");
@@ -1674,7 +1836,30 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
         }
     }
 
+    /* Listen for a connect from now on, even if the AppTask is still busy
+     * with a campaign; the AppTask re-opens the full window once it is idle. */
+    bShakePending = true;
+    FRKERNEL_vOpenWindow(FRKERNEL_WINDOW_SHAKE, FRKERNEL_SHAKE_WINDOW_MS);
     osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vOnKernelSession
+ *
+ * Called by FrKernel when a session opens or closes. The thread flag wakes an
+ * AppTask that is already busy (campaign loop, wake buffer, session loop). On
+ * open, DISCOVERY_KERNEL_BIT also wakes an AppTask that is idle between wakes:
+ * a bench-UART session can open then, and without a pass of its own nothing
+ * would hold the sleep lock or run the session loop. That pass goes through
+ * the kernel branch, which skips the shake window because a session is
+ * already active (or nothing is pending) and falls into the session.
+ * -------------------------------------------------------------------------- */
+void DEVICE_DISCOVERY_vOnKernelSession(bool bOpened)
+{
+    if (DeviceDiscoveryAppTask_handle != NULL)
+        osThreadFlagsSet(DeviceDiscoveryAppTask_handle, DEVICE_DISCOVERY_NOTIFY_KERNEL);
+    if (bOpened && (xDiscoveryEventFlags != NULL))
+        osEventFlagsSet(xDiscoveryEventFlags, DISCOVERY_KERNEL_BIT);
 }
 
 /* --------------------------------------------------------------------------
@@ -1719,21 +1904,23 @@ osThreadId_t DEVICE_DISCOVERY_xGetTaskHandle(void)
 }
 
 /* --------------------------------------------------------------------------
- * DEVICE_DISCOVERY_vEnterSleepMode — shared body for the two super-deep-sleep
+ * DEVICE_DISCOVERY_bEnterSleepMode — shared body for the two super-deep-sleep
  * commands. Identical in every respect (state, indicator LED, suppressed
  * discovery/acc logging) except whether a solar-level rise may wake us:
- *   bAllowSolarWake == true  -> "tag prodsleep"  (solar OR shake)
- *   bAllowSolarWake == false -> "tag solarsleep" (shake only; the panel gets
+ *   bAllowSolarWake == true  -> kernel 'P'  (solar OR shake)
+ *   bAllowSolarWake == false -> kernel 'S' (shake only; the panel gets
  *                               to charge the battery undisturbed)
  * -------------------------------------------------------------------------- */
-static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake)
+static bool DEVICE_DISCOVERY_bEnterSleepMode(bool bAllowSolarWake)
 {
     const char *pacName = bAllowSolarWake ? "ProductionSleep" : "SolarSleep";
 
+    /* Returns false, having done nothing, on a primary - so the kernel can
+     * say so instead of acknowledging a sleep that never happened. */
     if (eDeviceRole != DEVICE_ROLE_SECONDARY)
     {
         DBG_LOG("DeviceDiscovery: %s not applicable on primary device\r\n", pacName);
-        return;
+        return false;
     }
 
     bSolarWakeDisabled = !bAllowSolarWake;
@@ -1768,22 +1955,23 @@ static void DEVICE_DISCOVERY_vEnterSleepMode(bool bAllowSolarWake)
      * exit path (solar activation or Kernel wakeup) swaps it back to red. */
     HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_GREEN);
     DBG_LOG("DeviceDiscovery: Entering %s\r\n", pacName);
+    return true;
 }
 
 /* --------------------------------------------------------------------------
- * DEVICE_DISCOVERY_vEnterProductionSleep
+ * DEVICE_DISCOVERY_bEnterProductionSleep
  * -------------------------------------------------------------------------- */
-void DEVICE_DISCOVERY_vEnterProductionSleep(void)
+bool DEVICE_DISCOVERY_bEnterProductionSleep(void)
 {
-    DEVICE_DISCOVERY_vEnterSleepMode(true);
+    return DEVICE_DISCOVERY_bEnterSleepMode(true);
 }
 
 /* --------------------------------------------------------------------------
- * DEVICE_DISCOVERY_vEnterSolarSleep
+ * DEVICE_DISCOVERY_bEnterSolarSleep
  * -------------------------------------------------------------------------- */
-void DEVICE_DISCOVERY_vEnterSolarSleep(void)
+bool DEVICE_DISCOVERY_bEnterSolarSleep(void)
 {
-    DEVICE_DISCOVERY_vEnterSleepMode(false);
+    return DEVICE_DISCOVERY_bEnterSleepMode(false);
 }
 
 /* --------------------------------------------------------------------------

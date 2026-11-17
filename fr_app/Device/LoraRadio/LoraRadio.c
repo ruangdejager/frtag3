@@ -26,9 +26,21 @@
 #include "LoraRadio_Driver.h"
 #include "dbg_log.h"
 #include "radio_driver.h"
+#include "build_config.h"
 
 #include <string.h>
 #include <stdlib.h>
+
+/* Per-packet radio trace (TX done, CAD busy/clear, CAD back-off): one or two
+ * lines for EVERY transmission. Compiled out unless ENABLE_RADIO_VERBOSE_LOG.
+ * During a kernel log stream they alone filled the 4 KB DbgLog ring within
+ * ~30 frames and so pushed out every real event, and on the kernel console
+ * they scrolled a line per CONNECT beacon across the operator's terminal. */
+#ifdef ENABLE_RADIO_VERBOSE_LOG
+#  define RADIO_VDBG(...)   DBG(__VA_ARGS__)
+#else
+#  define RADIO_VDBG(...)   do { } while (0)
+#endif
 
 /* ---- Private defines ---- */
 /* TX queue: 8 (was 24). Each slot is a full ~264 B LoraRadio_Packet_t from the
@@ -350,7 +362,7 @@ void LORARADIO_vRadioTask(void *arg)
         /* ---------- TX DONE ---------- */
         if (events & RADIO_EVT_TX_DONE)
         {
-            DBG("LoraRadio: TX done IRQ received\r\n");
+            RADIO_VDBG("LoraRadio: TX done IRQ received\r\n");
             SUBGRF_ClearIrqStatus(IRQ_TX_DONE);
             LORARADIO_DRIVER_vEnterRxMode(0);
         }
@@ -513,12 +525,12 @@ bool LORARADIO_bCarrierSense(void)
 
     if (r & RADIO_EVT_CAD_BUSY)
     {
-        DBG("Loraradio: CAD busy\r\n");
+        RADIO_VDBG("Loraradio: CAD busy\r\n");
         return false;
     }
     if (r & RADIO_EVT_CAD_CLEAR)
     {
-        DBG("Loraradio: CAD clear\r\n");
+        RADIO_VDBG("Loraradio: CAD clear\r\n");
         return true;
     }
 
@@ -611,7 +623,7 @@ bool LORARADIO_bCarrierSenseAndWait(uint32_t maxWaitMs)
         uint32_t backoffMs = CAD_BASE_BACKOFF_MS
             + LORARADIO_u32GetRandomNumber(window - CAD_BASE_BACKOFF_MS + 1);
 
-        DBG("Loraradio: CAD back-off %lu ms (fail=%lu)\r\n", backoffMs, failCount);
+        RADIO_VDBG("Loraradio: CAD back-off %lu ms (fail=%lu)\r\n", backoffMs, failCount);
 
         /* Back-off sleep — also uses ALL_FLAGS so any event wakes us cleanly */
         uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, backoffMs);

@@ -580,7 +580,7 @@ typedef struct {
     uint8_t  u8FwPatch;      /* sender's VERSION_SW_PATCH — logged per-neighbor
                               * so "did unit X pick up the latest OTA" is
                               * answerable from the fr9 flash log without
-                              * touching each device with `tag <ID> fwver`. */
+                              * touching each device with the kernel 'i' command. */
     /* Which node's DReq produced i16Rssi above. i16Rssi is the reading of the
      * ONE DReq that triggered this beaconing episode - not the strongest heard
      * during it (that used to drift as later, unrelated receptions came in;
@@ -838,6 +838,13 @@ void MESHNETWORK_vLogUnackedNeighbors(void);
  * density, see MESH_TX_JITTER_BUSY_MS. Logged in the campaign stats line so the
  * field logs record the window that produced them. */
 uint32_t MESHNETWORK_u32GetTxJitterCeilingMs(void);
+
+/* One draw from the node's TX-jitter PRNG (xorshift32, seeded per node from
+ * the radio RNG and the unique id at MESHNETWORK_vInit). For callers on other
+ * tasks that need a per-node random number: SUBGRF_GetRandom touches radio
+ * state and must stay on the radio task, and newlib rand() is per FreeRTOS
+ * task and unseeded unless that task seeds it. Not for anything secret. */
+uint32_t MESHNETWORK_u32Random(void);
 
 /* Primary: the highest wave number that has discovered anything this campaign,
  * i.e. how many rings deep the herd has PROVEN to be; 0 before anything

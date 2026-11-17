@@ -1,23 +1,13 @@
 /*
  * FrKernel_Config.h
  *
- * Compile-time configuration for the FrKernel command interface.
- * Transport is selected in fr_app/inc/config/build_config.h — either or
- * both of:
- *   FRKERNEL_INTERFACE_UART        — debug UART (bench use)
- *   FRKERNEL_INTERFACE_LORA        — LoRa radio (deployed device)
- * Defining both lets the same build answer "tag <cmd>" over UART and
- * "tag <ID> <cmd>" over the mesh at the same time, sharing one session
- * (FRKERNEL_bIsConnected()/inactivity timer aren't per-transport — a
- * command on either side keeps the device awake and extends the timeout).
- *
- * Or, mutually exclusive with both of the above:
- *   FRKERNEL_INTERFACE_LORA_BRIDGE — UART<->LoRa relay (bench test rig: a
- *                                    primary that forwards whatever's typed
- *                                    over UART out as a LoRa FrKernel command
- *                                    and prints whatever comes back. Also
- *                                    skips DeviceDiscovery/Farmranger/GPS —
- *                                    see init.c)
+ * Compile-time tuning for the FrKernel command interface (kernelV2). WHICH
+ * transport is built is decided in fr_app/inc/config/build_config.h:
+ *   FRKERNEL_INTERFACE_UART          tag, single-letter commands on the debug UART
+ *   FRKERNEL_INTERFACE_LORA          tag, v2 frames over LoRa
+ *   FRKERNEL_INTERFACE_LORA_CONSOLE  the operator console rig (FrKernelConsole.c)
+ * UART and LORA may be combined; they then share one session. The console is
+ * exclusive of both.
  */
 
 #ifndef WORKER_FRKERNEL_FRKERNEL_CONFIG_H_
@@ -25,19 +15,104 @@
 
 #include "build_config.h"
 
-#define FRKERNEL_CMD_PREFIX             "tag"
-/* 128 -> 64: the longest recognized command is "discovery schedule " (19
- * chars) plus a numeric arg and the "tag " / "tag <ID> " prefix - under 32
- * chars even addressed over LoRa. 64 keeps 2x headroom over that while
- * freeing RAM on a part that is byte-exact full (see FRKERNEL_INTERFACE_UART
- * in build_config.h - it was the straw that overflowed it). Safe on the LoRa
- * side too: MESHNETWORK_vOnFrKernelPacket already clamps an over-length
- * packet to sizeof(pkt.data)-1 rather than overflowing, so shrinking this
- * only tightens that existing truncation bound, it doesn't introduce one. */
-#define FRKERNEL_LINE_BUF_LEN           64U    /* max command line length (bytes)        */
-#define FRKERNEL_RESP_BUF_LEN          256U    /* max response string (bytes)            */
-#define FRKERNEL_LORA_QUEUE_LEN          4U    /* LoRa path: inbound queue depth         */
-#define FRKERNEL_INACTIVITY_TIMEOUT_MS  (5U * 60U * 1000U)   /* auto-release after 5 min */
-#define FRKERNEL_POLL_INTERVAL_MS       10000U /* inactivity check cadence (ms)          */
+/* ---- Tag: session and connect windows ---------------------------------- */
+
+/* A session ends after this long without a command addressed to the tag
+ * (single or bulk). Outbound traffic the operator is waiting on - a log
+ * stream, an OTA receive or distribute, a listening radio test - counts as
+ * activity while it runs, so a long download is never cut off by its own
+ * silence. A bulk console's repeated CONNECT beacon deliberately does NOT
+ * count: a console left on would otherwise hold a whole herd out of its
+ * schedule indefinitely. */
+#define FRKERNEL_INACTIVITY_TIMEOUT_MS  (5U * 60U * 1000U)
+
+/* How long the shake sequence keeps the tag listening for a CONNECT before it
+ * gives up and goes back to its schedule. */
+#define FRKERNEL_SHAKE_WINDOW_MS        (2U * 60U * 1000U)
+
+/* How long every discovery wake listens for a CONNECT before the campaign.
+ * It must fit inside APP_WAKEUP_BUFFER_MS (DeviceDiscovery.h; checked by a
+ * _Static_assert there): that buffer is the quiet part of every wake, before
+ * the primary's first DReq, so a CONNECT is not competing with campaign
+ * traffic and costs the campaign nothing when no console is about. */
+#define FRKERNEL_WAKE_WINDOW_MS         5000U
+
+/* Task poll while a session is active (inactivity check). Idle, the task
+ * blocks until a command arrives - the v1 task woke every 10 s forever. */
+#define FRKERNEL_POLL_INTERVAL_MS       1000U
+
+/* Upper bound on the random back-off before a SCAN answer, so several shaken
+ * tags do not answer on top of each other. Drawn from MESHNETWORK_u32Random
+ * (per-node seeded): v1 used rand(), which FreeRTOS's per-task newlib reent
+ * left unseeded on the FrKernel task, so every tag drew the SAME delay and
+ * collided anyway. */
+#define FRKERNEL_SCAN_JITTER_MAX_MS     1500U
+
+/* Before giving the device back after a final reply ("x", a timeout notice, a
+ * sleep command), wait up to this long for that reply to actually leave the
+ * radio. v1 cleared the session first and the AppTask then deep-slept the
+ * radio with the reply still in carrier sense. */
+#define FRKERNEL_TX_DRAIN_MAX_MS        3000U
+
+/* ---- Tag: RX path ------------------------------------------------------- */
+
+/* Longest command frame a tag accepts: header + letter + space + argument.
+ * The longest argument is "park 10000". Frames are filtered by version,
+ * direction and address in the parser callback BEFORE they are queued, so
+ * other tags' replies and log streams never occupy these slots. */
+#define FRKERNEL_RX_ITEM_LEN            40U
+#define FRKERNEL_LORA_QUEUE_LEN          4U
+
+/* UART command line ("z park 10000" is the longest). */
+#define FRKERNEL_LINE_BUF_LEN           32U
+#define FRKERNEL_RESP_BUF_LEN          256U
+
+/* ---- Tag: log stream ---------------------------------------------------- */
+
+/* Longest a stream frame may wait for room in the radio TX queue. When it
+ * cannot get in, the session or the radio has gone away and the stream stops
+ * rather than blocking the DbgLog consumer (and so all logging) forever. */
+#define FRKERNEL_STREAM_TX_WAIT_MS      10000U
+
+/* Quiet time after each stream frame's transmission before the next flash
+ * read. The stream used to refill the TX queue the instant a slot opened, so
+ * every log read ran right on top of a PA pulse - the condition under which
+ * frtag2 measured corrupt NOR reads that even a back-to-back re-read did not
+ * catch (OTA_LORA_CHUNK_GAP_MS, Fota_Config.h, same 100 ms). It also kept one
+ * stream frame at most in the TX queue, so a reply to "s" (stop) is not stuck
+ * behind eight of them. Costs throughput (~0.7 KB/s instead of ~1 KB/s at
+ * SF7/BW250), which is what the half/quarter/tenth stream commands are for. */
+#define FRKERNEL_STREAM_READ_SETTLE_MS  100U
+
+/* ---- Console ------------------------------------------------------------ */
+
+/* CONNECT repeat period while connecting. At 1 s a tag's 5 s wake window hears
+ * four or five of them; a ~15 B frame at SF7/BW250 is ~20 ms of air. */
+#define FRKERNEL_CON_CONNECT_PERIOD_MS  1000U
+
+/* A bulk console stops repeating CONNECT after this long without operator
+ * input, so a forgotten console cannot keep pulling a herd into the kernel at
+ * every discovery wake. Matches the tag-side inactivity timeout. */
+#define FRKERNEL_CON_BULK_IDLE_MS       FRKERNEL_INACTIVITY_TIMEOUT_MS
+
+/* Single connection: resend an unanswered command (same seq, so the tag never
+ * runs it twice) after this long, up to this many attempts in total. */
+#define FRKERNEL_CON_REPLY_TIMEOUT_MS   2500U
+#define FRKERNEL_CON_CMD_TRIES          3U
+
+/* Bulk: there is no reply to retry on, so every command is sent this many
+ * times, this far apart. The tags dedupe on seq. */
+#define FRKERNEL_CON_BULK_REPEATS       3U
+#define FRKERNEL_CON_BULK_GAP_MS        400U
+
+/* Log stream on the console: no stream frame for this long ends stream mode
+ * (the END frame can be lost like any other) with an "incomplete" notice. */
+#define FRKERNEL_CON_STREAM_IDLE_MS     8000U
+
+/* Status line cadence while waiting for a single tag to answer CONNECT. */
+#define FRKERNEL_CON_WAIT_NOTE_MS       30000U
+
+/* Console inbound frame queue (largest frame is a full stream frame). */
+#define FRKERNEL_CON_RX_QUEUE_LEN       8U
 
 #endif /* WORKER_FRKERNEL_FRKERNEL_CONFIG_H_ */

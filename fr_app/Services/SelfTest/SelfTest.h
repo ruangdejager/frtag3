@@ -4,7 +4,7 @@
  * Boot-time peripheral smoke tests. Called once from INIT_vInitialization
  * after all normal bring-up is done. Each check is memoized; a failure is
  * indicated live on the green LED (see SELFTEST_vRunAndReport) and can
- * also be queried later over FrKernel ("tag <ID> selftest [gps|acc|flash]").
+ * also be queried later over FrKernel (kernel command 'e').
  *
  * Never fatal: init always proceeds to the normal run state whatever the
  * test outcome. The point is a visual "this unit has a hardware problem"

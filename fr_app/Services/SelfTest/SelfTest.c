@@ -198,7 +198,7 @@ bool SELFTEST_bAccOk(void)   { return bAccOk;   }
 /* Live, not memoized — deliberately unlike its two neighbours. The flash gate
  * can now both close and re-open at run time (see FLASH_bEnsurePresent), so a
  * boot-time snapshot answers a question nobody is asking: an operator running
- * "tag <ID> selftest" wants to know whether the log and FOTA staging work NOW.
+ * kernel command 'e' wants to know whether the log and FOTA staging work NOW.
  * Answering from a cached boot result is the same mistake that let a gated-off
  * tag report flash=OK for 18 h. */
 bool SELFTEST_bFlashOk(void)
@@ -212,14 +212,14 @@ bool SELFTEST_bGpsApplicable(void)
 }
 
 /* Same rule as GPS: the accelerometer is fitted on a secondary only, and the
- * FRKERNEL_INTERFACE_LORA_BRIDGE build never starts SPI1 or runs ACC_vInit on
+ * FRKERNEL_INTERFACE_LORA_CONSOLE build never starts SPI1 or runs ACC_vInit on
  * either role (init.c), so a WHO_AM_I read there could only fail - n/a, as
  * GPS_bSelfTest reports for the same build. Also what SELFTEST_vRunAndReport
  * uses to decide whether to run the WHO_AM_I test, so the boot run and
  * FrKernel's later "n/a" cannot disagree. */
 bool SELFTEST_bAccApplicable(void)
 {
-#ifdef FRKERNEL_INTERFACE_LORA_BRIDGE
+#ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
     return false;
 #else
     return DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY;
