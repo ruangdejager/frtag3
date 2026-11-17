@@ -33,7 +33,7 @@ static void LORARADIO_DRIVER_vRadioOnDioIrq(RadioIrqMasks_t radioIrq);
 /* --------------------------------------------------------------------------
  * LORARADIO_DRIVER_vInit
  * -------------------------------------------------------------------------- */
-void LORARADIO_DRIVER_vInit(uint8_t *pUniqueID)
+void LORARADIO_DRIVER_vInit(void)
 {
     PacketParams_t packetParams;
 
@@ -87,9 +87,6 @@ void LORARADIO_DRIVER_vInit(uint8_t *pUniqueID)
                            IRQ_TX_DONE | IRQ_RX_TX_TIMEOUT,
                            IRQ_RX_DONE | IRQ_CRC_ERROR    | IRQ_HEADER_ERROR,
                            IRQ_RADIO_NONE);
-
-    if (pUniqueID != NULL)
-        HAL_SUBGHZ_vSetUniqueId(pUniqueID);
 }
 
 /* --------------------------------------------------------------------------
@@ -276,7 +273,7 @@ void LORARADIO_DRIVER_vEnterDeepSleep(void)
 
 void LORARADIO_DRIVER_vWakeUp(void)
 {
-    LORARADIO_DRIVER_vInit(NULL);
+    LORARADIO_DRIVER_vInit();
     LORARADIO_DRIVER_vEnterRxMode(0x00);
 }
 

@@ -95,6 +95,7 @@ void FRKERNEL_vEndSession(const char *pcReason) { (void)pcReason; }
 #include "Fota.h"
 #include "Flash.h"             /* flash health query / on-demand recovery   */
 #include "Flash_SelfTest.h"    /* flash self-test + stress harness          */
+#include "Identity.h"          /* serial number: 'n', 'N', status line      */
 
 #ifdef FRKERNEL_INTERFACE_UART
 #  include "Debug.h"
@@ -644,15 +645,16 @@ static const char *FRKERNEL_pcProdState(void)
 
 /* One line that answers most first questions about a tag. Also the reply to a
  * single CONNECT, so the operator learns what they connected to without
- * spending a command on it. The 96-bit UID is included because the 16-bit
- * kernel/mesh id is folded from the die's wafer coordinates and can collide
- * between tags; two tags answering one id show up here as two UIDs. */
+ * spending a command on it. The 96-bit UID is included so that what the radio
+ * id was derived from (see LORARADIO_u32GetUniqueId) is on record, and so two
+ * tags answering one 16-bit id show up as two UIDs. */
 static void FRKERNEL_vFormatStatus(char *resp, size_t szResp)
 {
     (void)snprintf(resp, szResp,
-                   "%04" PRIX32 " %s fw=v%u.%u.%u bl=v%lu bat=%umV sol=%umV "
+                   "%08" PRIX32 " sn=%lu %s fw=v%u.%u.%u bl=v%lu bat=%umV sol=%umV "
                    "state=%s int=%umin log=%u%% uid=%08lX%08lX%08lX\r\n",
                    LORARADIO_u32GetUniqueId(),
+                   (unsigned long)IDENTITY_u32GetSerial(),
                    (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY) ? "PRIMARY" : "secondary",
                    (unsigned)VERSION_SW_MAJOR, (unsigned)VERSION_SW_MINOR,
                    (unsigned)VERSION_SW_PATCH,
@@ -714,6 +716,67 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         FRKERNEL_vFormatStatus(resp, sizeof(resp));
         FRKERNEL_vReply(pCtx, resp);
         break;
+
+    case 'n':
+    {
+        Identity_Status_t tId;
+        IDENTITY_vGetStatus(&tId);
+        if (tId.eSource == IDENTITY_SRC_NONE)
+            (void)snprintf(resp, sizeof(resp), "serial: none  id=%08lX  otp free=%u\r\n",
+                           (unsigned long)LORARADIO_u32GetUniqueId(), (unsigned)tId.u8OtpFree);
+        else
+            (void)snprintf(resp, sizeof(resp),
+                           "serial: %lu  id=%08lX  src=%s  otp slot=%u free=%u  mirror=%s%s\r\n",
+                           (unsigned long)tId.u32Serial,
+                           (unsigned long)LORARADIO_u32GetUniqueId(),
+                           IDENTITY_pcSourceText(tId.eSource),
+                           (unsigned)tId.u8OtpSlot, (unsigned)tId.u8OtpFree,
+                           tId.bMirrorOk ? "ok" : "BAD",
+                           tId.bRadioIdMatch ? "" : "  RADIO-ID-MISMATCH");
+        FRKERNEL_vReply(pCtx, resp);
+        break;
+    }
+
+    case 'N':
+    {
+        /* N <serial, decimal> <radio id, hex> [fix]
+         *
+         * The radio id is required, not optional, and must be the full 8-digit
+         * one: it is what stops a production station from serialising the
+         * wrong unit when more than one can hear it. The reply echoes all of it
+         * so the station can log exactly what this unit accepted. */
+        char       *pcEnd;
+        const char *pc        = pcArg;
+        uint32_t    u32Serial = (uint32_t)strtoul(pc, &pcEnd, 10);
+        bool        bParsed   = (pcEnd != pc) && (*pcEnd == ' ');
+
+        pc = pcEnd;
+        while (*pc == ' ') pc++;
+        uint32_t u32Id = (uint32_t)strtoul(pc, &pcEnd, 16);
+        bParsed = bParsed && (pcEnd != pc);
+
+        pc = pcEnd;
+        while (*pc == ' ') pc++;
+        bool bFix = false;
+        if (strcmp(pc, "fix") == 0) bFix = true;
+        else if (*pc != '\0')       bParsed = false;
+
+        if (!bParsed)
+        {
+            FRKERNEL_vReply(pCtx, "usage: N <serial> <radio id> [fix]  e.g. N 2611000123 0A3C1A2B\r\n");
+            break;
+        }
+
+        Identity_SetResult_e eRes = IDENTITY_eSetSerial(u32Serial, u32Id, bFix);
+        Identity_Status_t tId;
+        IDENTITY_vGetStatus(&tId);
+        (void)snprintf(resp, sizeof(resp), "N %lu %08lX: %s (serial now %lu, otp free=%u)\r\n",
+                       (unsigned long)u32Serial, (unsigned long)u32Id,
+                       IDENTITY_pcSetResultText(eRes),
+                       (unsigned long)tId.u32Serial, (unsigned)tId.u8OtpFree);
+        FRKERNEL_vReply(pCtx, resp);
+        break;
+    }
 
     case 'e':
         /* GPS and ACC answer from the memoized boot-time run; flash is live
@@ -1039,7 +1102,9 @@ static void FRKERNEL_vHandleFrame(const uint8_t *pu8, uint8_t u8Len)
     const FrkKind_e eKind  = (FrkKind_e)pu8[FRK_OFS_KIND];
     const uint32_t  u32Id  = FRK_u32GetU32(&pu8[FRK_OFS_ID]);
     const uint8_t   u8Seq  = pu8[FRK_OFS_SEQ];
-    const bool      bForMe = (u32Id == LORARADIO_u32GetUniqueId());
+    /* LORARADIO_bIsOwnId, not equality: a console can address a tag by the
+     * 16-bit id an operator reads off an older label or log. */
+    const bool      bForMe = LORARADIO_bIsOwnId(u32Id);
     char            resp[48];
 
     switch (eKind)
@@ -1155,7 +1220,7 @@ void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
         return;
 
     const uint32_t u32Id = FRK_u32GetU32(&buf[FRK_OFS_ID]);
-    if ((u32Id != LORARADIO_u32GetUniqueId()) && (u32Id != FRK_ID_BULK))
+    if (!LORARADIO_bIsOwnId(u32Id) && (u32Id != FRK_ID_BULK))
         return;
 
     /* Cheap pre-filter so an idle tag does not wake its task for every

@@ -444,8 +444,9 @@
 /* --------------------------------------------------------------------------
  * Self-test scratch sector
  *
- * The device is otherwise fully allocated (see Fota_Config.h): OTA scratchpad
- * 0x00000-0x3AFFF, OTA metadata 0x3B000, text log 0x3C000-0x7FFFF. The boot
+ * The device is otherwise fully allocated (full map in SettingsStore_Config.h):
+ * OTA scratchpad 0x00000-0x3AFFF, OTA metadata 0x3B000, settings and identity
+ * 0x3C000-0x3FFFF, text log 0x40000-0x7EFFF. The boot
  * self-test needs somewhere it can erase and program destructively, and
  * neither the staged firmware image nor the field-collected log can be it.
  *

@@ -10,10 +10,9 @@
 #include "Movement_Config.h"
 #include "time_config.h"
 
-Settings_EE settings_def =
+const Settings_EE settings_def =
 {
     .utcTime      = 1,
-    .serialNumber = "700000",
 
     .time.timezoneAdjust  = TIME_TZ_GMT_ADJ_DEF,
     .time.summerStartMonth = SUMMER_START_MON_DEF,

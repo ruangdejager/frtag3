@@ -39,6 +39,7 @@
 #include "hal_adc.h"
 #include "hal_wdt.h"
 #include "settings.h"
+#include "Identity.h"
 #include "main.h"
 
 #include "Gps.h"
@@ -219,6 +220,9 @@ void INIT_vInitialization(void *parameters)
      * exists when the first RTC wakeup ISR fires. */
     PLATFORM_vInit();
     SETTINGS_vInit();
+    /* After FLASH_vInit (the mirror lives on the NOR) and before anything that
+     * reports the serial number. */
+    IDENTITY_vInit();
 
     HAL_RTC_vInit();
 

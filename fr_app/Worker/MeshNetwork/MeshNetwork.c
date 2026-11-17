@@ -44,6 +44,7 @@
 #define MESH_BEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
 #define MESH_BEACON_FLAG_GPS_VALID  0x02U   /* bit1: 1 = lat/lon present   */
 #define MESH_BEACON_FLAG_RSSI_SRC   0x04U   /* bit2: 1 = best-RSSI src id present */
+#define MESH_BEACON_FLAG_ID_HI      0x08U   /* bit3: 1 = device id high half present */
 
 /* ---- BasicBeacon flags byte (byte 11) ---- */
 #define MESH_BBEACON_FLAG_STILL      0x01U   /* bit0: 1 = still, 0 = moving */
@@ -88,6 +89,8 @@ static uint16_t            u16BasicNeighborCount = 0U;
  *   [21..24]  i32LonUDeg     (only if GPS_VALID)
  *   [17..18]  u16BestRssiSrcId  (only if RSSI_SRC and NOT GPS_VALID)
  *   [25..26]  u16BestRssiSrcId  (only if RSSI_SRC and GPS_VALID)
+ *   [+0..+1]  u16DeviceIdHi     (only if ID_HI; straight after whatever of the
+ *                                above is present, i.e. at 17, 19, 25 or 27)
  *
  * A decoder that sees fewer than MESH_BEACON_LEN_BASE bytes (an older peer
  * that hasn't been updated yet) still parses cleanly — see the length-guarded
@@ -98,7 +101,18 @@ static uint16_t            u16BasicNeighborCount = 0U;
  * shifting lat/lon to [19..26] would be read by an un-updated peer at the old
  * fixed offsets — those are hardcoded literals in both encoder and decoder —
  * and yield a plausible but wrong position. A field that only ever lands past
- * everything an older decoder reads can be ignored by it instead. */
+ * everything an older decoder reads can be ignored by it instead.
+ *
+ * The device id high half follows the same rule, for the same reason. A beacon
+ * never carried its sender's id as a field: the receiver took the top half of
+ * BeaconMsgId, which is the 16-bit id. Widening the id to 32 bits (see
+ * LORARADIO_u32GetUniqueId) needs only the other 16 bits on the wire, so they
+ * ride at the very end under their own flag. An older decoder ignores both the
+ * flag bit and the two trailing bytes and keeps reading the 16-bit id, which is
+ * still the low half of the 32-bit one. An older FORWARDER re-encodes from its
+ * decoded struct and so drops them; the primary then knows only the 16 bits,
+ * stores the id with a high half of 0, and NEIGHBOR_vAddOrUpdate and the
+ * secondary's ack match treat that as "same tag" via LORARADIO_bSameDevice. */
 #define MESH_BEACON_LEN_BASE        17U     /* through the FwPatch byte    */
 #define MESH_BEACON_LEN_GPS         25U     /* with lat/lon appended       */
 #define MESH_BEACON_LEN_BASE_SRC    19U     /* base + src id, no GPS       */
@@ -112,6 +126,12 @@ static uint16_t            u16BasicNeighborCount = 0U;
  *   [5]      SenderHopCount
  *   [6]      WaveCnt
  *   [7..8]   u16SenderId     (this hop's own device id — see below)
+ *
+ * Both ids here are the legacy 16-bit id (LORARADIO_u16GetShortId), on purpose:
+ * DreqId and the sender id only ever name a primary or a relaying neighbour,
+ * and are used to say "same campaign" and "who was loudest", not to address a
+ * tag. Widening them would change the DReq layout that every older peer reads
+ * at fixed offsets.
  *
  * The sender id is what makes a beacon's best-RSSI source reportable. DreqId
  * names the primary that STARTED the campaign, and every relay re-emits it
@@ -137,7 +157,7 @@ static uint16_t            u16BasicNeighborCount = 0U;
 
 /* ---- TX queue item ----
  * Item buffer 64 (was 128): the largest mesh frame is a full D-Ack at
- * 10 + 12*4 = 58 B (beacon 27, DReq 9, TimeSync 11); FrKernel responses bypass
+ * 10 + 12*4 = 58 B (beacon 29, DReq 9, TimeSync 11); FrKernel responses bypass
  * this queue entirely. 24 x 64 B saves ~1.5 KB of heap vs 128. */
 #define MESH_TX_QUEUE_LEN        24
 #define MESH_TX_MAX_PACKET_SIZE  64
@@ -655,8 +675,17 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
     {
         for (uint16_t i = 0; i < u16NeighborCount; i++)
         {
-            if (tNeighborTable[i].u32DeviceId == ptBeacon->u32DeviceId)
+            /* Same-tag test, not equality: a tag heard directly arrives with its
+             * full 32-bit id, the same tag relayed by an older forwarder arrives
+             * with only the low 16 bits (high half 0). Equality would give it
+             * two rows and two places in the upload. The price is the old one:
+             * two tags sharing the low 16 bits, both relayed by older
+             * forwarders, still look like one tag. */
+            if (LORARADIO_bSameDevice(tNeighborTable[i].u32DeviceId, ptBeacon->u32DeviceId))
             {
+                /* Learn the high half the first time the full id is heard. */
+                if ((tNeighborTable[i].u32DeviceId >> 16) == 0U)
+                    tNeighborTable[i].u32DeviceId = ptBeacon->u32DeviceId;
                 tNeighborTable[i].u8HopCount           = ptBeacon->u8HopCount;
                 tNeighborTable[i].u16BatMv             = ptBeacon->u16BatMv;
                 tNeighborTable[i].i16Rssi              = ptBeacon->i16Rssi;
@@ -721,9 +750,9 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
          * or the flash log, and the neighbour mutex is taken on the receive
          * path for every beacon the campaign hears. */
         if (bTableFullDrop)
-            DBG_LOG("MeshNetwork: neighbour table FULL (%u) - node %04X dropped from union\r\n",
+            DBG_LOG("MeshNetwork: neighbour table FULL (%u) - node %08lX dropped from union\r\n",
                     (unsigned)MESH_MAX_NEIGHBORS,
-                    (unsigned)(ptBeacon->u32DeviceId & 0xFFFFU));
+                    (unsigned long)ptBeacon->u32DeviceId);
     }
 }
 
@@ -741,7 +770,7 @@ static void NEIGHBOR_vClearAll(void)
  * Packet encoders
  * -------------------------------------------------------------------------- */
 /* u16SenderId is THIS hop's own device id, not the campaign originator's —
- * every caller passes LORARADIO_u32GetUniqueId(). See MESH_DREQ_LEN_SRC. */
+ * every caller passes LORARADIO_u16GetShortId(). See MESH_DREQ_LEN_SRC. */
 static bool MESHNETWORK_bEncodeDReq(uint32_t u32DreqId,
                                      uint8_t u8SenderHopCount,
                                      uint8_t u8WaveCnt,
@@ -768,6 +797,10 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     size_t u32Needed = ptBeacon->bGpsValid ? MESH_BEACON_LEN_GPS
                                             : MESH_BEACON_LEN_BASE;
     if (ptBeacon->bBestRssiSrcValid) u32Needed += 2U;
+    /* Offset of the id high half: after everything else that is present. */
+    const size_t   u32IdHiOff = u32Needed;
+    const uint16_t u16IdHi    = (uint16_t)(ptBeacon->u32DeviceId >> 16);
+    if (u16IdHi != 0U) u32Needed += 2U;
     if (u32BufLen < u32Needed) return false;
 
     pBuf[0] = (uint8_t)MeshPktType_DBeacon;
@@ -783,6 +816,7 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     if (ptBeacon->u8MoveState != 0U)  u8Flags |= MESH_BEACON_FLAG_STILL;
     if (ptBeacon->bGpsValid)          u8Flags |= MESH_BEACON_FLAG_GPS_VALID;
     if (ptBeacon->bBestRssiSrcValid)  u8Flags |= MESH_BEACON_FLAG_RSSI_SRC;
+    if (u16IdHi != 0U)                u8Flags |= MESH_BEACON_FLAG_ID_HI;
     pBuf[15] = u8Flags;
     pBuf[16] = ptBeacon->u8FwPatch;
 
@@ -798,6 +832,12 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
         write_u32_be(&pBuf[17], (uint32_t)ptBeacon->i32LatUDeg);
         write_u32_be(&pBuf[21], (uint32_t)ptBeacon->i32LonUDeg);
     }
+
+    /* A high half of 0 means the id is only known as 16 bits (relayed to us
+     * by an older forwarder); leave the field out rather than send a zero
+     * that a receiver would have to special-case anyway. */
+    if (u16IdHi != 0U)
+        write_u16_be(&pBuf[u32IdHiOff], u16IdHi);
 
     *pu32Written = u32Needed;
     return true;
@@ -1016,7 +1056,9 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
 
     MeshPktDBeacon_t tBeacon;
     tBeacon.u32DreqId      = u32NodeBeaconDreqId;
-    tBeacon.u32DeviceId    = 0;   /* derived from BeaconMsgId on receive */
+    /* Low half goes out inside BeaconMsgId as always; the encoder appends the
+     * high half under MESH_BEACON_FLAG_ID_HI. */
+    tBeacon.u32DeviceId    = LORARADIO_u32GetUniqueId();
     tBeacon.u16BatMv       = BAT_u16GetVoltage();
     tBeacon.u8HopCount     = u8NodeHopCount;
     tBeacon.u32BeaconMsgId = MESHNETWORK_u32GenerateGlobalMsgID();
@@ -1118,7 +1160,7 @@ static void MESHNETWORK_vQueueKeepAlive(void)
 {
     MeshPktDAck_t tAck;
     memset(&tAck, 0, sizeof(tAck));
-    tAck.u32AckMsgId = ((LORARADIO_u32GetUniqueId() & 0xFFFFU) << 16) |
+    tAck.u32AckMsgId = ((uint32_t)LORARADIO_u16GetShortId() << 16) |
                        MESH_KEEPALIVE_COUNTER;
     /* Names this campaign so the frame is not obviously synthetic in a sniffer
      * log; no receiver reads it on a zero-id ack (2.1.3 dedups out before the
@@ -1375,7 +1417,10 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
     FLASHLOG_vEncodeRXLogValue(&u32LogValue, (uint16_t)u32OriginId, s16Rssi, u8WaveCnt);
     EVTLOG(LOG_RX_DREQ, u32LogValue);
 
-    if (u32OriginId == LORARADIO_u32GetUniqueId()) return;
+    /* DreqId carries the origin's 16-bit id (see MESH_DREQ_LEN_SRC), so compare
+     * against ours at the same width - the 32-bit id would never match and a
+     * primary would treat its own echoed DReqs as foreign. */
+    if (u32OriginId == (uint32_t)LORARADIO_u16GetShortId()) return;
 
     /* Density signal for MESHNETWORK_u32GetTxJitterCeilingMs(): must count only
      * foreign traffic. Counting above the self-origin guard let a primary
@@ -1464,7 +1509,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                 if (MESHNETWORK_bEncodeDReq(u32DreqId,
                                             (uint8_t)(u8SenderHopCount + 1),
                                             u8WaveCnt,
-                                            (uint16_t)LORARADIO_u32GetUniqueId(),
+                                            LORARADIO_u16GetShortId(),
                                             u8Out, sizeof(u8Out), &u32OutLen))
                 {
                     MESHNETWORK_bSendPacketDelayed(u8Out, u32OutLen,
@@ -1530,7 +1575,7 @@ static void MESHNETWORK_vHandleDReq(const uint8_t *pBuf,
                 if (MESHNETWORK_bEncodeDReq(u32DreqId,
                                             (uint8_t)(u8SenderHopCount + 1),
                                             u8WaveCnt,
-                                            (uint16_t)LORARADIO_u32GetUniqueId(),
+                                            LORARADIO_u16GetShortId(),
                                             u8Out, sizeof(u8Out), &u32OutLen))
                 {
                     MESHNETWORK_bSendPacketDelayed(u8Out, u32OutLen,
@@ -1606,6 +1651,7 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     tBeacon.u8HopCount     = pBuf[7];
     tBeacon.i16Rssi        = read_s16_be(&pBuf[8]);
     tBeacon.u32BeaconMsgId = read_u32_be(&pBuf[10]);
+    /* Low half only, until the ID_HI field below supplies the rest. */
     tBeacon.u32DeviceId    = tBeacon.u32BeaconMsgId >> 16;
     tBeacon.dreqWaveDisc   = pBuf[14];
 
@@ -1645,9 +1691,21 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
             tBeacon.u16BestRssiSrcId  = read_u16_be(&pBuf[u32SrcOff]);
             tBeacon.bBestRssiSrcValid = true;
         }
+
+        /* Device id high half, after the src id when the FLAG says one is
+         * there (same reasoning as the src offset above). A frame too short to
+         * carry it keeps the 16-bit id rather than reading a neighbour's
+         * bytes as one. */
+        size_t u32IdHiOff = u32SrcOff +
+                            ((u8Flags & MESH_BEACON_FLAG_RSSI_SRC) ? 2U : 0U);
+        if ((u8Flags & MESH_BEACON_FLAG_ID_HI) &&
+            (u32Len >= u32IdHiOff + 2U))
+        {
+            tBeacon.u32DeviceId |= (uint32_t)read_u16_be(&pBuf[u32IdHiOff]) << 16;
+        }
     }
 
-    DBG("MeshNetwork: Beacon: dev=%04X dreq=%08X hop=%u wave=%X bat=%u rssi=%d rsrc=%04X move=%u gps=%u fwp=%u\r\n",
+    DBG("MeshNetwork: Beacon: dev=%08X dreq=%08X hop=%u wave=%X bat=%u rssi=%d rsrc=%04X move=%u gps=%u fwp=%u\r\n",
         tBeacon.u32DeviceId, tBeacon.u32DreqId, tBeacon.u8HopCount,
         tBeacon.dreqWaveDisc, tBeacon.u16BatMv, tBeacon.i16Rssi,
         tBeacon.u16BestRssiSrcId,
@@ -1959,10 +2017,13 @@ static void MESHNETWORK_vHandleDAck(const uint8_t *pBuf,
     const bool bWasForwarder = (MESHNETWORK_eGetRole() == NODE_ROLE_FORWARDER);
     if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY)
     {
-        uint32_t u32MyId = LORARADIO_u32GetUniqueId();
+        /* Same-tag test rather than equality: a primary lists this tag by
+         * the id it learned from our beacons, which is only the low 16 bits
+         * when that primary runs older firmware or our beacons reached it
+         * through an older forwarder. See LORARADIO_bSameDevice. */
         for (uint8_t i = 0; i < u8AckCount; i++)
         {
-            if (u32Ids[i] == u32MyId)
+            if (LORARADIO_bIsOwnId(u32Ids[i]))
             {
                 /* I1: match on the ack's origin primary, not the exact dreq —
                  * the primary issues a new dreq per wave, and an ack carrying
@@ -2394,7 +2455,9 @@ void MESHNETWORK_vInit(void)
 uint32_t MESHNETWORK_u32GenerateGlobalMsgID(void)
 {
     u16MsgCounter++;
-    uint32_t u32Hi = (LORARADIO_u32GetUniqueId() & 0xFFFF);
+    /* 16-bit id on purpose: every receiver, old and new, reads a beacon's
+     * sender (low half of its id) from the top of this value. */
+    uint32_t u32Hi = (uint32_t)LORARADIO_u16GetShortId();
     return (u32Hi << 16) | (uint32_t)u16MsgCounter;
 }
 
@@ -2407,7 +2470,7 @@ bool MESHNETWORK_bStartDiscoveryRound(uint32_t u32DreqId)
     /* hop 0 and our own id: for a DReq straight off the primary the immediate
      * sender IS the origin, so the two agree by construction. */
     if (!MESHNETWORK_bEncodeDReq(u32DreqId, 0, u8PrimaryDreqWaveCnt,
-                                  (uint16_t)LORARADIO_u32GetUniqueId(),
+                                  LORARADIO_u16GetShortId(),
                                   u8Out, sizeof(u8Out), &u32Len))
         return false;
 

@@ -64,7 +64,25 @@ bool     LORARADIO_bTxPacket(LoraRadio_Packet_t *packet);
 bool     LORARADIO_bTxPacketWait(LoraRadio_Packet_t *packet, uint32_t timeoutMs);
 
 void     LORARADIO_vRadioTask(void *arg);
+/* This tag's 32-bit radio id: wafer number and lot hash in the high half, the
+ * original 16-bit id in the low half. See the comment above the definition in
+ * LoraRadio.c for the layout and why. Never 0 and never 0xFFFFFFFF. */
 uint32_t LORARADIO_u32GetUniqueId(void);
+
+/* The legacy 16-bit id, i.e. the low half of LORARADIO_u32GetUniqueId(). Only
+ * for the places that are 16 bits on the air and must stay so for older peers:
+ * the top half of mesh message ids and DReq ids, and the DReq sender id. Never
+ * use it to decide whether a packet is addressed to this tag. */
+uint16_t LORARADIO_u16GetShortId(void);
+
+/* True when two ids can name the same tag: equal, or the same low half where
+ * one side's high half is 0. A high half of 0 means the id came from (or was
+ * relayed by) firmware that only knew the 16-bit id, so "same 16 bits" is the
+ * most that can be said - exactly the match every tag made before the id was widened. */
+bool     LORARADIO_bSameDevice(uint32_t u32A, uint32_t u32B);
+
+/* LORARADIO_bSameDevice(u32Id, LORARADIO_u32GetUniqueId()). */
+bool     LORARADIO_bIsOwnId(uint32_t u32Id);
 
 /* Switch channel noise-floor sampling on or off. Off by default, and left off
  * in normal operation: when on, the radio task issues one extra SUBGRF RSSI

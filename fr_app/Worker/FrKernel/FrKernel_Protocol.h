@@ -84,8 +84,10 @@
  * the same bound every other FrKernel LoRa sender has always used. */
 #define FRK_MAX_PAYLOAD        ((uint16_t)(LORA_MAX_PACKET_SIZE - 3 - FRK_HDR_LEN))
 
-/* "Every tag that hears this". No real tag id is all-ones: ids are the low
- * 16 bits of the radio's unique id (see LORARADIO_u32GetUniqueId). */
+/* "Every tag that hears this". No real tag id is all-ones: the low half of a
+ * radio id is BCD die coordinates, never 0xFFFF (see LORARADIO_u32GetUniqueId).
+ * A tag also accepts a frame addressed by its 16-bit id alone, i.e. with a high
+ * half of 0 (see LORARADIO_bIsOwnId). */
 #define FRK_ID_BULK            0xFFFFFFFFUL
 
 typedef enum {

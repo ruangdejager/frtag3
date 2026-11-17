@@ -29,6 +29,7 @@ crossing). See `Hal/hal_bsp.h` for the pin map.
 | `Platform/` | OS-level services above `Hal/`: heartbeat scheduler, settings engine, RTC/datetime, string helpers. |
 | `fr_app/` | The Farmranger application. |
 | `build_scripts/` | `create_release_hex_files.ps1`, the CubeIDE post-build packaging and publish step. |
+| `production/` | `provision_tag.ps1`: per-unit production step — reads the UID over SWD, derives the radio id, checks the CSV unit database, writes the serial with kernel `N` over the debug UART, verifies OTP over SWD. |
 
 ### Layering
 
@@ -204,6 +205,18 @@ translation unit. Put explanatory notes above the line.
 field has a paired `has_<field>` bool so validation can distinguish "explicitly set" from
 "defaulted". `settings_default.c` supplies the seed values used on first boot or after a
 failed integrity check.
+
+Persistence: `fr_app/settings/SettingsStore.c` implements the engine's weak storage hooks
+on the external NOR (two 4 KB banks at 0x3D000/0x3E000, 512 B CRC-32 records, newest valid
+sequence wins; full NOR map in `SettingsStore_Config.h`). `SETTINGS_bCommit()` writes only
+when RAM differs from the stored record. `Settings_EE` is stored as raw bytes, so fields may
+only be appended; any other change bumps `SETTINGS_LAYOUT_VERSION`.
+
+The serial number is not a setting. `fr_app/settings/Identity.c` keeps it write-once in MCU
+OTP (first 512 B, 32 correction slots; the rest of OTP is unallocated) with a mirror in the NOR
+identity sector at 0x3C000, as a 16-byte record holding serial, radio id and a CRC-32 that
+folds in the 96-bit UID. It is written only by the kernel command `N <serial> <radio id> [fix]`
+and read with `n`.
 
 ## House style
 

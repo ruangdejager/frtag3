@@ -1,0 +1,3 @@
+# The production database (provision_tag.ps1 -Database) is a record of real
+# units, not source. Keep it on the production station or a shared drive.
+*.csv

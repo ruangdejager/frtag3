@@ -277,7 +277,9 @@ void LOG_vErase(void)
 void LOG_vEraseAll(void)
 {
     /* Whole-device erase: also wipes the OTA scratchpad + metadata sectors
-     * below LOG_FLASH_START_ADDR — deliberate, see Log.h. FLASH_vChipErase
+     * and the stored settings below LOG_FLASH_START_ADDR — deliberate, see
+     * Log.h; the settings store copes with its banks vanishing under it and
+     * rewrites on the next commit. FLASH_vChipErase
      * blocks until the device reports done (a full 512 KB erase takes
      * several seconds); Flash.c's own mutex keeps this safe against the
      * DbgLog consumer's other flash traffic, but this function is still

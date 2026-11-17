@@ -43,7 +43,9 @@
  *   0x00000 - 0x3AFFF   OTA image scratchpad (sectors 0-58, 236 KB;
  *                       scratch offset N maps to OTA_APP_BASE_ADDR + N)
  *   0x3B000 - 0x3BFFF   OTA metadata (sector 59)
- *   0x3C000 - 0x7EFFF   text log (sectors 60-126; see Services/Log/Log.h)
+ *   0x3C000 - 0x3FFFF   unit identity + settings (sectors 60-63; see
+ *                       settings/SettingsStore_Config.h)
+ *   0x40000 - 0x7EFFF   text log (sectors 64-126; see Services/Log/Log.h)
  *   0x7F000 - 0x7FFFF   flash self-test scratch (sector 127; see
  *                       Device/Flash/Flash_Config.h). Not part of the
  *                       app/bootloader contract - the bootloader never

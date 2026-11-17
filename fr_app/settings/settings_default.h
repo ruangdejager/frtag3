@@ -87,9 +87,26 @@ typedef struct _Settings_EE_MovementAlarm {
     uint8_t  slowMoveMaxWindow;
 } Settings_EE_MovementAlarm;
 
+/* Layout version of Settings_EE as stored on flash (SettingsStore.c).
+ *
+ * The struct is persisted as raw bytes, so its layout IS the storage format.
+ * Rules:
+ *  - New fields go at the END of Settings_EE only. A stored record from older
+ *    firmware then loads as a prefix and the new fields keep their defaults
+ *    with has_<field> false. No version bump needed.
+ *  - Anything else - removing, reordering, retyping or resizing a field,
+ *    including inside a nested struct - changes where existing bytes land.
+ *    Bump this, and every unit drops its stored settings once and runs on
+ *    defaults until the next commit, rather than misreading them.
+ *
+ * The serial number is deliberately not here. It used to be (serialNumber[9],
+ * a legacy of the fr9's struct), but settings are user data that a factory
+ * reset, a layout bump or a corrupt record puts back to defaults; the unit's
+ * identity must survive all three, so it gets a store of its own. */
+#define SETTINGS_LAYOUT_VERSION     1U
+
 typedef struct _Settings_EE {
     uint32_t utcTime;
-    char     serialNumber[9];
     bool     has_time;
     Settings_EE_Time time;
     bool     has_dayTimeZone;

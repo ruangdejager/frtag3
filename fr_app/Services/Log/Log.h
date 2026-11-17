@@ -14,10 +14,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Log partition: 0x3C000-0x7EFFF, 268 KB of the 512 KB device.
+/* Log partition: 0x40000-0x7EFFF, 252 KB of the 512 KB device.
  *
- * The region below (0x00000-0x3BFFF) belongs to the OTA image scratchpad +
- * metadata — see fr_app/Worker/Fota/Fota_Config.h for the full partition map.
+ * The region below belongs to the OTA image scratchpad + metadata
+ * (0x00000-0x3BFFF, fr_app/Worker/Fota/Fota_Config.h) and the unit's settings
+ * and identity (0x3C000-0x3FFFF). The full NOR map is in
+ * fr_app/settings/SettingsStore_Config.h.
+ *
+ * The log used to start at 0x3C000; its bottom 16 KB went to the settings
+ * partition, because both flashes were otherwise fully allocated and the log
+ * is the one region whose size is not a contract with the bootloader. On a
+ * unit that ran older firmware the old log text left in 0x3C000-0x3FFFF is
+ * not mistaken for settings - it carries no valid record header - and is
+ * erased the first time the settings store rotates into each bank.
  *
  * The region ABOVE - the last 4 KB sector, 0x7F000 - was taken off the log and
  * given to the flash self-test, which needs somewhere it can erase and program
@@ -28,7 +37,7 @@
  *
  * The bootloader is unaffected: it only ever reads the scratchpad and the
  * metadata sector, both far below this boundary. */
-#define LOG_FLASH_START_ADDR    0x03C000UL
+#define LOG_FLASH_START_ADDR    0x040000UL
 #define LOG_FLASH_END_ADDR      0x07F000UL
 #define LOG_FLASH_SIZE_BYTES    (LOG_FLASH_END_ADDR - LOG_FLASH_START_ADDR)
 

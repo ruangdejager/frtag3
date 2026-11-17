@@ -247,10 +247,15 @@ static void CON_vConnectCmd(const char *pcArg)
     }
 
     char *pcEnd;
+    /* 4 digits (the legacy id, still printed on older tags and labels) or 8
+     * (the full id). A 4-digit target reaches every tag sharing those 16 bits;
+     * the first one to answer pins the connection to its full id - see
+     * CON_vHandleFrame. */
     uint32_t u32Id = (uint32_t)strtoul(pcArg, &pcEnd, 16);
-    if ((pcEnd == pcArg) || (*pcEnd != '\0') || (u32Id > 0xFFFFUL))
+    if ((pcEnd == pcArg) || (*pcEnd != '\0') || (strlen(pcArg) > 8U) ||
+        (u32Id == FRK_ID_BULK))
     {
-        CON_vPut("tag id is 4 hex digits, e.g. c 1A2B\r\n");
+        CON_vPut("tag id is 4 or 8 hex digits, e.g. c 1A2B or c 0A3C1A2B\r\n");
         return;
     }
 
@@ -439,8 +444,10 @@ static void CON_vHandleFrame(const ConFrame_t *pF)
     }
     acText[u16N] = '\0';
 
+    /* Same-tag test, not equality: the operator may have typed only the 16-bit
+     * id, and a tag on newer firmware answers with its full 32-bit one. */
     const bool bFromTarget = (s_eMode != CON_IDLE) && (s_eMode != CON_BULK) &&
-                             (u32Id == s_u32Target);
+                             LORARADIO_bSameDevice(u32Id, s_u32Target);
 
     switch (eKind)
     {
@@ -448,6 +455,11 @@ static void CON_vHandleFrame(const ConFrame_t *pF)
     {
         if ((s_eMode == CON_CONNECTING) && bFromTarget)
         {
+            /* Pin to the full id of whichever tag answered first. Commands
+             * addressed by a 16-bit id would reach every tag that shares it;
+             * after this they reach only the one actually connected, and a
+             * second tag with the same low half no longer passes bFromTarget. */
+            s_u32Target = u32Id;
             s_eMode = CON_SINGLE;
             char acMsg[FRK_MAX_PAYLOAD + 24U];
             (void)snprintf(acMsg, sizeof(acMsg), "[%04" PRIX32 "] %s", u32Id, acText);

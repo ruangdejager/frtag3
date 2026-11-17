@@ -16,7 +16,10 @@
 #include "LoraRadio.h"
 #include "radio_driver.h"
 
-void     LORARADIO_DRIVER_vInit(uint8_t *pUniqueID);
+void     LORARADIO_DRIVER_vInit(void);
+
+/* The MCU's 96-bit unique ID, which the radio id is derived from. */
+#define  LORARADIO_DRIVER_vGetUid96(pau32Uid)   HAL_SUBGHZ_vGetUid96(pau32Uid)
 bool     LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length);
 bool     LORARADIO_DRIVER_bReceivePayload(LoraRadio_Packet_t *rxParams);
 void     LORARADIO_DRIVER_vEnterRxMode(uint32_t u32RxTimeout);

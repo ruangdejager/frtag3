@@ -147,8 +147,6 @@ static volatile uint32_t u32LastTxDoneTick = 0U;
  * into that TX. */
 static volatile bool bTxInFlight = false;
 
-static uint8_t u8DevEUI[8];
-
 /* -------------------------------------------------------------------------- */
 
 static uint8_t LORARADIO_u8CRC8_Calculate(const uint8_t *data, uint16_t len);
@@ -186,10 +184,10 @@ void LORARADIO_vInit(void)
      * the scheduler running it before we reach vEnterDeepSleep() here,
      * leaving the radio awake while the task has already passed vWakeUp().
      */
-    LORARADIO_DRIVER_vInit(u8DevEUI);
+    LORARADIO_DRIVER_vInit();
     LORARADIO_vEnterDeepSleep();
 
-    DBG("\r\nLoraradio: Device ID %lX\r\n", LORARADIO_u32GetUniqueId());
+    DBG("\r\nLoraradio: Device ID %08lX\r\n", (unsigned long)LORARADIO_u32GetUniqueId());
 
     static const osThreadAttr_t radioTask_attr = {
         .name       = "LoRaRadioTask",
@@ -454,9 +452,105 @@ bool LORARADIO_bTxInProgress(void)
     return bTxInProgress;
 }
 
+/* --------------------------------------------------------------------------
+ * Radio device id
+ *
+ * Built from the MCU's 96-bit unique ID. RM0461 lays that ID out as:
+ *   w0[31:16] X and w0[15:0] Y position of the die on its wafer, BCD
+ *   w1[7:0]   wafer number
+ *   w1[31:8]  + w2[31:0]   lot number, 7 ASCII characters
+ *
+ * The id used to be 16 bits: the low byte of X and the low byte of Y.
+ * That is a die POSITION, and every wafer has the same set of positions, so
+ * two tags cut from the same spot on two different wafers have always shared
+ * an id. Being BCD it also has at most 100 x 100 values. This was never going
+ * to be "running out of numbers" - it was collisions from the first batch on.
+ *
+ * The id is now 32 bits:
+ *   [31:24] wafer number
+ *   [23:16] CRC-8 of the lot number (see LORA_ID_CRC8_POLY for the exact
+ *           algorithm and byte order)
+ *   [15:0]  the old 16-bit id, unchanged
+ *
+ * Keeping the old id as the low half is deliberate. Every tag keeps its old
+ * number as (uint16_t)id, the fields that stayed 16 bits on air (the top half
+ * of every mesh message id, the DReq sender id) still carry it, and a peer on
+ * older firmware that only knows the 16 bits can still be matched against us
+ * - see LORARADIO_bSameDevice.
+ *
+ * Within one lot the id is unique by construction: X, Y and wafer number
+ * together name exactly one die. Across lots two tags collide only if they sit
+ * at the same position on same-numbered wafers AND their lots hash to the same
+ * byte. That is rare, not impossible; the production station is what turns it
+ * into a guarantee, by refusing a unit whose id is already in its database.
+ *
+ * The UID64 "UDN" at 0x1FFF7580 would have been unique outright, but it is a
+ * separate number and would have thrown away every tag's existing id.
+ *
+ * Computed on first use and cached: the inputs are fixed silicon, so a race
+ * between two first callers just computes the same value twice. Zero means
+ * "not computed yet"; a real id is never zero because its high half is not.
+ * -------------------------------------------------------------------------- */
+static uint32_t s_u32UniqueId = 0U;
+
+static uint8_t LORARADIO_u8IdCrc8(const uint8_t *pu8, uint8_t u8Len)
+{
+    uint8_t u8Crc = 0x00U;
+    for (uint8_t i = 0U; i < u8Len; i++)
+    {
+        u8Crc ^= pu8[i];
+        for (uint8_t b = 0U; b < 8U; b++)
+            u8Crc = (u8Crc & 0x80U) ? (uint8_t)((u8Crc << 1) ^ LORA_ID_CRC8_POLY)
+                                    : (uint8_t)(u8Crc << 1);
+    }
+    return u8Crc;
+}
+
 uint32_t LORARADIO_u32GetUniqueId(void)
 {
-    return (((uint32_t)u8DevEUI[1] << 24) | ((uint32_t)u8DevEUI[3] << 16)) >> 16;
+    if (s_u32UniqueId != 0U)
+        return s_u32UniqueId;
+
+    uint32_t au32Uid[3];
+    LORARADIO_DRIVER_vGetUid96(au32Uid);
+
+    const uint16_t u16Lo = (uint16_t)((((au32Uid[0] >> 16) & 0xFFU) << 8) |
+                                      (au32Uid[0] & 0xFFU));
+
+    const uint8_t au8Lot[7] = {
+        (uint8_t)(au32Uid[1] >>  8), (uint8_t)(au32Uid[1] >> 16),
+        (uint8_t)(au32Uid[1] >> 24),
+        (uint8_t)(au32Uid[2]      ), (uint8_t)(au32Uid[2] >>  8),
+        (uint8_t)(au32Uid[2] >> 16), (uint8_t)(au32Uid[2] >> 24),
+    };
+    uint16_t u16Hi = (uint16_t)(((au32Uid[1] & 0xFFU) << 8) |
+                                LORARADIO_u8IdCrc8(au8Lot, sizeof(au8Lot)));
+    if (u16Hi == 0U)
+        u16Hi = LORA_ID_HI_ZERO_SUBST;
+
+    s_u32UniqueId = ((uint32_t)u16Hi << 16) | u16Lo;
+    return s_u32UniqueId;
+}
+
+uint16_t LORARADIO_u16GetShortId(void)
+{
+    return (uint16_t)LORARADIO_u32GetUniqueId();
+}
+
+bool LORARADIO_bSameDevice(uint32_t u32A, uint32_t u32B)
+{
+    if (u32A == u32B)
+        return true;
+    if ((uint16_t)u32A != (uint16_t)u32B)
+        return false;
+    /* Same legacy id, different high halves: the same tag only if one side
+     * does not know its high half. */
+    return ((u32A >> 16) == 0U) || ((u32B >> 16) == 0U);
+}
+
+bool LORARADIO_bIsOwnId(uint32_t u32Id)
+{
+    return LORARADIO_bSameDevice(u32Id, LORARADIO_u32GetUniqueId());
 }
 
 void LORARADIO_vEventRxDone(void)      { LORARADIO_vNotifyFromISR(RADIO_EVT_RX_DONE);      }

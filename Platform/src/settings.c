@@ -6,9 +6,9 @@
  * held in RAM.  Accessor functions operate on raw byte offsets so the
  * storage layout can be changed by updating settings_default.h alone.
  *
- * Persistent storage (flash/EEPROM) is mediated through weak HAL stubs
- * HAL_STORAGE_vReadSettings / HAL_STORAGE_vWriteSettings which the
- * application can override.
+ * Persistent storage is mediated through the weak hooks
+ * SETTINGS_bStorageLoad / SETTINGS_bStorageSave, which the application
+ * overrides (fr_app/settings/SettingsStore.c).
  */
 
 #include "settings.h"
@@ -29,6 +29,20 @@ void SETTINGS_vInit(void)
 void SETTINGS_vReadValues(void)
 {
     currentSettings = settings_def;
+    if (!SETTINGS_bStorageLoad(&currentSettings, (uint16_t)sizeof(currentSettings),
+                               SETTINGS_LAYOUT_VERSION))
+        currentSettings = settings_def;   /* a failed load may have written part */
+}
+
+bool SETTINGS_bCommit(void)
+{
+    return SETTINGS_bStorageSave(&currentSettings, (uint16_t)sizeof(currentSettings),
+                                 SETTINGS_LAYOUT_VERSION);
+}
+
+void SETTINGS_vRestoreDefaults(void)
+{
+    currentSettings = settings_def;
 }
 
 /* ---- uint8_t ------------------------------------------------------------- */
@@ -45,7 +59,7 @@ void SETTINGS_vSetByteAtOffset(uint32_t offset, uint8_t value)
 void SETTINGS_vResetByteAtOffset(uint32_t offset)
 {
     *(uint8_t *)((uint8_t *)&currentSettings + offset) =
-        *(uint8_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
+        *(const uint8_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
 }
 
 /* ---- uint16_t ------------------------------------------------------------ */
@@ -62,7 +76,7 @@ void SETTINGS_vSetShortAtOffset(uint32_t offset, uint16_t value)
 void SETTINGS_vResetShortAtOffset(uint32_t offset)
 {
     *(uint16_t *)((uint8_t *)&currentSettings + offset) =
-        *(uint16_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
+        *(const uint16_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset);
 }
 
 /* ---- uint32_t ------------------------------------------------------------ */
@@ -79,7 +93,7 @@ void SETTINGS_vSetWordAtOffset(uint32_t offset, uint32_t extra, uint32_t value)
 void SETTINGS_vResetWordAtOffset(uint32_t offset, uint32_t extra)
 {
     *(uint32_t *)((uint8_t *)&currentSettings + offset + extra) =
-        *(uint32_t *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
+        *(const uint32_t *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
 }
 
 /* ---- strings ------------------------------------------------------------- */
@@ -114,7 +128,7 @@ bool SETTINGS_bCheckStringAtOffset(uint32_t offset, size_t length_at_offset, boo
 
 void SETTINGS_vResetStringAtOffset(uint32_t offset, size_t length)
 {
-    uint8_t *source = (uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset;
+    const uint8_t *source = (const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset;
     uint8_t *dest   = (uint8_t *)&currentSettings + offset;
     memset(dest, 0, length);
     memcpy(dest, source, length);
@@ -134,7 +148,7 @@ bool SETTINGS_bGetBoolAtOffset(uint32_t offset, uint32_t extra)
 void SETTINGS_vResetBoolAtOffset(uint32_t offset, uint32_t extra)
 {
     *(bool *)((uint8_t *)&currentSettings + offset + extra) =
-        *(bool *)((uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
+        *(const bool *)((const uint8_t *)&SETTINGS_CONF_DEFAULT_STRUCT + offset + extra);
 }
 
 /* ---- struct pointer ------------------------------------------------------ */
@@ -148,15 +162,16 @@ settings_struct_t *SETTINGS_pGetSettingsStruct(void)
     return &currentSettings;
 }
 
-/* ---- Weak HAL storage stubs --------------------------------------------- */
-uint32_t __attribute__((weak)) HAL_STORAGE_vReadSettings(uint32_t *length)
+/* ---- Weak storage hooks --------------------------------------------------
+ * RAM-only defaults; the application overrides both (see settings.h). */
+bool __attribute__((weak)) SETTINGS_bStorageLoad(void *pvDst, uint16_t u16Size, uint16_t u16Layout)
 {
-    (void)length;
-    return 0;
+    (void)pvDst; (void)u16Size; (void)u16Layout;
+    return false;
 }
 
-uint32_t __attribute__((weak)) HAL_STORAGE_vWriteSettings(uint32_t length)
+bool __attribute__((weak)) SETTINGS_bStorageSave(const void *pvSrc, uint16_t u16Size, uint16_t u16Layout)
 {
-    (void)length;
-    return 0;
+    (void)pvSrc; (void)u16Size; (void)u16Layout;
+    return false;
 }

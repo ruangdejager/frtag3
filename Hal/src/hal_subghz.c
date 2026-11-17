@@ -46,22 +46,17 @@ void HAL_SUBGHZ_MspDeInit(SUBGHZ_HandleTypeDef *subghzHandle)
 }
 
 /* --------------------------------------------------------------------------
- * HAL_SUBGHZ_vSetUniqueId
- * Writes the first 8 bytes of the 96-bit device unique ID into id[].
+ * HAL_SUBGHZ_vGetUid96
+ * Copies the three words of the 96-bit device unique ID.
+ *
+ * This used to be HAL_SUBGHZ_vSetUniqueId, which packed UID words 0 and 1 into
+ * an 8-byte "DevEUI" buffer that LoraRadio then picked two bytes out of. The
+ * radio id now also needs word 2 (the rest of the lot number), and the byte
+ * picking is an identity policy that belongs with the radio id, not in Hal.
  * -------------------------------------------------------------------------- */
-void HAL_SUBGHZ_vSetUniqueId(uint8_t *id)
+void HAL_SUBGHZ_vGetUid96(uint32_t pau32Uid[3])
 {
-    uint32_t uid[3];
-    uid[0] = HAL_GetUIDw0();
-    uid[1] = HAL_GetUIDw1();
-    uid[2] = HAL_GetUIDw2();
-
-    id[0] = (uid[0] >> 24) & 0xFF;
-    id[1] = (uid[0] >> 16) & 0xFF;
-    id[2] = (uid[0] >>  8) & 0xFF;
-    id[3] = (uid[0]      ) & 0xFF;
-    id[4] = (uid[1] >> 24) & 0xFF;
-    id[5] = (uid[1] >> 16) & 0xFF;
-    id[6] = (uid[1] >>  8) & 0xFF;
-    id[7] = (uid[1]      ) & 0xFF;
+    pau32Uid[0] = HAL_GetUIDw0();
+    pau32Uid[1] = HAL_GetUIDw1();
+    pau32Uid[2] = HAL_GetUIDw2();
 }

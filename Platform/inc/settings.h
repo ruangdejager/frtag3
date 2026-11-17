@@ -2,9 +2,11 @@
  * settings.h
  *
  * Runtime settings module.
- * Settings live in RAM and are initialised from the compile-time defaults
- * in settings_default.h.  Accessor macros translate field names to byte
- * offsets so the underlying storage can be changed without touching callers.
+ * Settings live in RAM, are initialised from the compile-time defaults in
+ * settings_default.h, and are then overlaid with the stored record if the
+ * application's storage hook has one (fr_app/settings/SettingsStore.c keeps it
+ * on the external NOR). Accessor macros translate field names to byte offsets
+ * so the underlying storage can be changed without touching callers.
  */
 
 #ifndef SETTINGS_H_
@@ -16,12 +18,43 @@
 
 typedef Settings_EE settings_struct_t;
 
-extern Settings_EE settings_def;
+/* const: lives in flash, not .data. RAM on this part is nearly full, and the
+ * defaults are only ever copied from. */
+extern const Settings_EE settings_def;
 
 #define SETTINGS_CONF_DEFAULT_STRUCT    settings_def
 
+/* Load: compiled-in defaults first, then whatever the storage hook can supply
+ * on top of them (see SETTINGS_bStorageLoad). Called once at boot. */
 void SETTINGS_vInit(void);
 void SETTINGS_vReadValues(void);
+
+/* Persist the current RAM settings through the storage hook. Returns true when
+ * the stored copy matches RAM afterwards, including when nothing had changed
+ * and no write was needed - so it is cheap to call after every batch of
+ * SETTINGS_vSet*() calls. Call it from one task at a time per batch: setters
+ * write RAM unlocked, so a commit racing a setter can store a half-applied
+ * batch (it would still be a consistent record, just not the intended one). */
+bool SETTINGS_bCommit(void);
+
+/* Put every field back to its compiled-in default, in RAM only; follow with
+ * SETTINGS_bCommit() to make it stick. */
+void SETTINGS_vRestoreDefaults(void);
+
+/* ---- Storage hooks ----
+ * The engine keeps no knowledge of where settings are stored. The application
+ * provides these two; the weak defaults in settings.c store nothing, which
+ * leaves a RAM-only engine running on its defaults.
+ *
+ * SETTINGS_bStorageLoad: fill pvDst with up to u16Size bytes of the stored
+ *   record if one exists whose layout version equals u16Layout, and return
+ *   true. pvDst already holds the defaults; a stored record shorter than
+ *   u16Size leaves the remainder untouched. On false, pvDst may have been
+ *   partly overwritten and the caller restores the defaults.
+ * SETTINGS_bStorageSave: store u16Size bytes from pvSrc tagged with u16Layout.
+ *   True when stored (or already stored unchanged). */
+bool SETTINGS_bStorageLoad(void *pvDst, uint16_t u16Size, uint16_t u16Layout);
+bool SETTINGS_bStorageSave(const void *pvSrc, uint16_t u16Size, uint16_t u16Layout);
 
 /* uint8_t */
 uint8_t  SETTINGS_u8GetByteAtOffset(uint32_t offset);

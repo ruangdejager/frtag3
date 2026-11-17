@@ -33,6 +33,7 @@ static const FrkCmd_t s_atCmds[] = {
     { 'e', FRK_CMDF_SINGLE,                 "",          "self-test results (gps/acc/flash + boot detail)" },
     { 'f', FRK_CMDF_SINGLE,                 "",          "ext-flash health (gate, id, fault counters)" },
     { 'k', FRK_CMDF_SINGLE,                 "",          "ext-flash read-verify counters (reading clears them)" },
+    { 'n', FRK_CMDF_SINGLE,                 "",          "serial number, radio id and where the serial is stored" },
 
     /* ---- log streaming ---- */
     { 'a', FRK_CMDF_SINGLE,                 "",          "stream the whole ext-flash log" },
@@ -64,6 +65,9 @@ static const FrkCmd_t s_atCmds[] = {
     { 'R', FRK_CMDF_SINGLE,                 "",          "radio range test (secondary beacons, shake to end;"
                                                          " primary listens)" },
     { 'Q', 0U,                              "",          "quit a radio range test (listening primary)" },
+    { 'N', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "<serial> <radio id> [fix]",
+                                                         "WRITE the serial number to OTP - permanent;"
+                                                         " 'fix' replaces a wrong one" },
 };
 
 const FrkCmd_t *FRK_ptFindCmd(char cLetter)
