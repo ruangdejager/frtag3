@@ -41,8 +41,14 @@
  *
  * See fr_app/Worker/FrKernel/FrKernel.h for the session model and
  * FrKernel_Commands.c for the command letters.
+ *
+ * Release images carry UART as well as LORA: the production station
+ * (production/provision_tag.ps1) tests and serialises every unit through the
+ * debug UART on the ST-LINK's virtual COM port. Without UART the station cannot
+ * talk to the tag, and DeviceDiscovery does not hold the MCU awake in the boot
+ * window (APP_BOOT_WINDOW_MS) because nothing could use it.
  * -------------------------------------------------------------------------- */
-// #define FRKERNEL_INTERFACE_UART           /* tag: debug UART (bench use) */
+#define FRKERNEL_INTERFACE_UART           /* tag: debug UART (bench + production station) */
  #define FRKERNEL_INTERFACE_LORA           /* tag: LoRa (deployed tag)    */
 // #define FRKERNEL_INTERFACE_LORA_CONSOLE   /* operator console rig        */
 

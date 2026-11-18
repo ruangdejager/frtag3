@@ -29,7 +29,7 @@ crossing). See `Hal/hal_bsp.h` for the pin map.
 | `Platform/` | OS-level services above `Hal/`: heartbeat scheduler, settings engine, RTC/datetime, string helpers. |
 | `fr_app/` | The Farmranger application. |
 | `build_scripts/` | `create_release_hex_files.ps1`, the CubeIDE post-build packaging and publish step. |
-| `production/` | `provision_tag.ps1`: per-unit production step — reads the UID over SWD, derives the radio id, checks the CSV unit database, writes the serial with kernel `N` over the debug UART, verifies OTP over SWD. |
+| `production/` | `provision_tag.ps1`: the production station. Flashes over SWD (ST-LINK), talks to the tag on the ST-LINK VCP (debug UART), runs the kernel `u` production test, writes the serial (`N`), puts a secondary in production sleep (`P`) and logs every run to a CSV test log. With an Otii Arc (driven through `otii_agent.lua` under `otiicli`) it also power-cycles the board and measures sleep / all-on / sleep current; without one it carries on without power data. |
 
 ### Layering
 
@@ -217,6 +217,11 @@ OTP (first 512 B, 32 correction slots; the rest of OTP is unallocated) with a mi
 identity sector at 0x3C000, as a 16-byte record holding serial, radio id and a CRC-32 that
 folds in the 96-bit UID. It is written only by the kernel command `N <serial> <radio id> [fix]`
 and read with `n`.
+
+Production sleep is persisted: `Settings_EE.inService` is false until a secondary is woken by
+solar or a shake, and kernel `P` clears it again. Every boot holds the MCU awake for
+`APP_BOOT_WINDOW_MS` (30 s) so the station can open a UART kernel session; after that a secondary
+that is not in service enters production sleep, so a freshly programmed unit comes up asleep.
 
 ## House style
 

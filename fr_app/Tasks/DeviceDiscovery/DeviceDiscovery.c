@@ -40,6 +40,7 @@
 
 #include "Fota.h"
 #include "version_config.h"
+#include "settings.h"        /* inService: persisted production-sleep state */
 
 /* ---- Private defines ---- */
 #define APP_TASK_STACK_SIZE     (configMINIMAL_STACK_SIZE * 10)
@@ -74,8 +75,16 @@ static volatile bool bSolarWakeDisabled = false;
  * 2-minute window on the next pass. */
 static volatile bool bShakePending = false;
 
+/* Boot window (APP_BOOT_WINDOW_MS): start tick, whether it has run out, and
+ * whether this module holds the sleep lock that keeps the debug UART alive
+ * through it. Only the schedule task touches these after vInit. */
+static uint32_t u32BootTick       = 0U;
+static bool     bBootWindowDone   = false;
+static bool     bBootWindowLocked = false;
+
 /* ---- Forward declarations ---- */
 static bool DEVICE_DISCOVERY_bEnterSleepMode(bool bAllowSolarWake);
+static void DEVICE_DISCOVERY_vSetInService(bool bInService);
 static void DEVICE_DISCOVERY_vSendTS(void);
 static bool DEVICE_DISCOVERY_bBasicLogAndClear(const char *pacReason);
 static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters);
@@ -117,6 +126,17 @@ void DEVICE_DISCOVERY_vInit(void)
         .stack_size = configMINIMAL_STACK_SIZE * 2 * sizeof(StackType_t),
         .priority   = osPriorityNormal,
     };
+
+    /* Boot window - see APP_BOOT_WINDOW_MS. The lock is only worth holding
+     * when something can use the awake UART. The pins may already have been
+     * parked by a STOP2 during the init sequence's delays, so re-arm them. */
+    u32BootTick = osKernelGetTickCount();
+#ifdef FRKERNEL_INTERFACE_UART
+    SYSTEM_vSleepLockAcquire();
+    bBootWindowLocked = true;
+    HAL_UART_vInit();
+    DEBUG_vInit();
+#endif
 
     DeviceDiscoveryAppTask_handle =
         osThreadNew(DEVICE_DISCOVERY_vAppTask, NULL, &app_attr);
@@ -1394,6 +1414,36 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             continue;
         }
 
+        /* ---- Boot window end ----
+         * Placed after the kernel-holds check on purpose: while a session is
+         * open (a production station running its tests) this does not run, so
+         * production sleep is never entered underneath it. It runs on the first
+         * heartbeat after the session ends instead.
+         *
+         * A secondary that is not in service goes back to production sleep
+         * here. That is what makes a freshly programmed unit come up asleep -
+         * inService defaults to false - and what keeps a unit in its box asleep
+         * through a reset or brown-out after it was put to sleep with 'P'. */
+        if (!bBootWindowDone &&
+            ((osKernelGetTickCount() - u32BootTick) >= APP_BOOT_WINDOW_MS))
+        {
+            bBootWindowDone = true;
+            if (bBootWindowLocked)
+            {
+                bBootWindowLocked = false;
+                SYSTEM_vSleepLockRelease();
+            }
+
+            if ((eDeviceRole == DEVICE_ROLE_SECONDARY) &&
+                (eProductionState == PRODUCTION_READY) &&
+                !SETTINGS_bGetBool(inService))
+            {
+                DBG_LOG("DeviceDiscovery: not in service yet - entering ProductionSleep\r\n");
+                (void)DEVICE_DISCOVERY_bEnterProductionSleep();
+                continue;
+            }
+        }
+
         /* ---- ProductionSleep: secondary only — primary has no solar panel ---- */
         if (eDeviceRole == DEVICE_ROLE_SECONDARY && eProductionState == PRODUCTION_SLEEP)
         {
@@ -1411,6 +1461,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
             if (SOLAR_u16GetVSolarMV() >= SOLAR_ACTIVATION_VSOLAR_MV)
             {
                 eProductionState = PRODUCTION_ACTIVE;
+                DEVICE_DISCOVERY_vSetInService(true);
                 /* Swap the STOP2-indicator LED back to red now that we're
                  * no longer in ProductionSleep — see the setter's docs. */
                 HAL_SYSTEM_vSetSleepIndicatorLed(HAL_SYSTEM_SLEEP_LED_RED);
@@ -1813,6 +1864,7 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
         bool bWasSolarSleep = bSolarWakeDisabled;
 
         eProductionState   = PRODUCTION_ACTIVE;
+        DEVICE_DISCOVERY_vSetInService(true);
         /* Shake is the ONLY exit from SolarSleep — clear the flag here or the
          * next ordinary production sleep would inherit it and ignore solar. */
         bSolarWakeDisabled = false;
@@ -1963,7 +2015,25 @@ static bool DEVICE_DISCOVERY_bEnterSleepMode(bool bAllowSolarWake)
  * -------------------------------------------------------------------------- */
 bool DEVICE_DISCOVERY_bEnterProductionSleep(void)
 {
-    return DEVICE_DISCOVERY_bEnterSleepMode(true);
+    if (!DEVICE_DISCOVERY_bEnterSleepMode(true))
+        return false;
+    /* Persisted, unlike SolarSleep: a unit put back into production sleep must
+     * stay there through a reset until solar or a shake brings it out. */
+    DEVICE_DISCOVERY_vSetInService(false);
+    return true;
+}
+
+/* --------------------------------------------------------------------------
+ * DEVICE_DISCOVERY_vSetInService — persist the production-sleep state.
+ * SETTINGS_bCommit() writes nothing when the value is already stored, so the
+ * boot-time re-entry of an unchanged state costs no flash wear.
+ * -------------------------------------------------------------------------- */
+static void DEVICE_DISCOVERY_vSetInService(bool bInService)
+{
+    SETTINGS_vSetBool(inService, bInService);
+    SETTINGS_vSetBool(has_inService, true);
+    if (!SETTINGS_bCommit())
+        DBG_LOG("DeviceDiscovery: could not persist inService=%u\r\n", (unsigned)bInService);
 }
 
 /* --------------------------------------------------------------------------

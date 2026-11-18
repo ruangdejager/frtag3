@@ -90,6 +90,12 @@ bool     LORARADIO_bIsOwnId(uint32_t u32Id);
  * on, so production timing and SPI traffic are untouched until they do. */
 void     LORARADIO_vSetNoiseFloorSampling(bool bEnable);
 
+/* Latest noise-floor sample in dBm, LORA_NOISE_FLOOR_INVALID when sampling is
+ * off or has not produced a reading yet. Needs the radio awake in RX: the
+ * sample is taken on the radio task's idle passes. The production test uses it
+ * as proof that the SUBGHZ SPI and the receiver front end work. */
+int16_t  LORARADIO_i16GetNoiseFloor(void);
+
 /* Packets currently sitting in the TX queue, waiting for the radio task to
  * even start on them. Read-only, non-blocking.
  *

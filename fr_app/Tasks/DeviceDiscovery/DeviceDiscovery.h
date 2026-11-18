@@ -23,6 +23,19 @@
 #define APP_WAKEUP_BUFFER_MS                (5  * 1000)   /* buffer after sync wake-up   */
 #define APP_DISCOVERY_WINDOW_TIMEOUT_MS     (205 * 1000)  /* hard cap on a campaign      */
 
+/* Boot window: for this long after boot the MCU is held out of STOP2 (when the
+ * debug-UART kernel is built in), so a production station or a bench operator
+ * can open a UART kernel session before the unit goes to sleep - STOP2 parks
+ * the debug UART pins, and a sleeping unit cannot hear the first command.
+ * Once a session is open the kernel holds the device on its own.
+ *
+ * At the end of the window a secondary that is not yet in service (settings
+ * field inService) enters production sleep. 30 s covers a cold boot - the GPS
+ * and flash self-tests alone take a few seconds - plus a station that starts
+ * talking only once it has seen the boot banner. It costs a unit in the field
+ * 30 s of being awake per reset, which is noise next to one campaign. */
+#define APP_BOOT_WINDOW_MS                  (30 * 1000)
+
 /* Secondary campaign-end (R3): once the mesh has been silent (no discovery
  * packet from any primary) for this long AND the node is not beaconing, end the
  * campaign instead of waiting out the 205 s hard cap. Polled at this cadence.

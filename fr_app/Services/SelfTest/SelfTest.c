@@ -17,6 +17,14 @@
 #include "Flash.h"                 /* FLASH_bRecoverDevice, health   */
 #include "Flash_Config.h"          /* FLASH_MANUFACTURER_ID          */
 #include "Flash_SelfTest.h"        /* FLASH_eSelfTest                */
+#include "LoraRadio.h"             /* noise floor, radio id          */
+#include "Battery.h"               /* BAT_u16GetVoltage              */
+#include "SolarPower.h"            /* SOLAR_u16GetVSolarMV           */
+#include "Power.h"                 /* POWER_CLASS_NORMAL             */
+#include "Identity.h"              /* serial number                  */
+#include "version_config.h"
+
+#include <stdio.h>
 
 /* Result flags default to true so a not-applicable test naturally reports
  * OK (GPS and ACC on primary). */
@@ -237,4 +245,130 @@ const char *SELFTEST_pcFlashDetail(void)
 bool SELFTEST_bFlashApplicable(void)
 {
     return true;
+}
+
+/* --------------------------------------------------------------------------
+ * Production test - see SELFTEST_bRunProductionTest in SelfTest.h.
+ *
+ * Everything here is measured LIVE, which is the difference from the boot
+ * snapshot behind 'e': a production station must see the board as it is now,
+ * on the station's supply, not as it was at power-up a minute earlier.
+ * -------------------------------------------------------------------------- */
+
+/* GPS: the boot test's 1500 ms is one NMEA epoch with little margin; at the
+ * station a failed unit costs a re-test, so give the module twice that. */
+#define SELFTEST_PROD_GPS_TIMEOUT_MS    3000U
+
+/* Radio: noise-floor samples are taken on the radio task's 50 ms idle passes;
+ * 500 ms is ten of them. A working receiver on a bench reads somewhere around
+ * -120 to -90 dBm; the window below only rejects readings that cannot come
+ * from a live front end (a dead SPI reads 0 or garbage, an RSSI register that
+ * was never updated reads the invalid marker). */
+#define SELFTEST_PROD_NF_SETTLE_MS      500U
+#define SELFTEST_PROD_NF_MIN_DBM        (-140)
+#define SELFTEST_PROD_NF_MAX_DBM        (-40)
+
+bool SELFTEST_bRunProductionTest(uint32_t u32HoldS, SelfTestReply_f pfReply, void *pvCtx)
+{
+    char acLine[200];
+    const bool bSecondary = (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_SECONDARY);
+
+    if (u32HoldS > SELFTEST_PROD_HOLD_MAX_S)
+        u32HoldS = SELFTEST_PROD_HOLD_MAX_S;
+
+    /* ---- flash: live gate, plus the boot detail for the operator ---- */
+    const bool bFlash = SELFTEST_bFlashOk();
+
+    /* ---- accelerometer: fresh WHO_AM_I ---- */
+    bool bAcc = true;
+    if (SELFTEST_bAccApplicable())
+        bAcc = ACC_bDeviceIdOkEx(NULL, NULL);
+
+    /* ---- GPS: NMEA on the wire. Any session is shut first so the test has
+     * the module and its UART to itself. ---- */
+    bool bGps = true;
+    if (SELFTEST_bGpsApplicable())
+    {
+        GPS_vShutdown();
+        bGps = GPS_bSelfTest(SELFTEST_PROD_GPS_TIMEOUT_MS);
+    }
+
+    /* ---- radio: awake, in RX, producing plausible RSSI ---- */
+    LORARADIO_vSetKeepAwake(true);
+    LORARADIO_vWakeUp();
+    LORARADIO_vSetNoiseFloorSampling(true);
+    osDelay(SELFTEST_PROD_NF_SETTLE_MS);
+    const int16_t i16Nf   = LORARADIO_i16GetNoiseFloor();
+    const bool    bRadio  = (i16Nf != LORA_NOISE_FLOOR_INVALID) &&
+                            (i16Nf >= SELFTEST_PROD_NF_MIN_DBM) &&
+                            (i16Nf <= SELFTEST_PROD_NF_MAX_DBM);
+
+    const bool bPass = bFlash && bAcc && bGps && bRadio;
+
+    char acNf[8], acBat[8], acSol[8];
+    if (i16Nf == LORA_NOISE_FLOOR_INVALID) (void)snprintf(acNf, sizeof(acNf), "none");
+    else                                   (void)snprintf(acNf, sizeof(acNf), "%d", (int)i16Nf);
+    if (bSecondary)
+    {
+        (void)snprintf(acBat, sizeof(acBat), "%u", (unsigned)BAT_u16GetVoltage());
+        (void)snprintf(acSol, sizeof(acSol), "%u", (unsigned)SOLAR_u16GetVSolarMV());
+    }
+    else
+    {
+        (void)snprintf(acBat, sizeof(acBat), "na");
+        (void)snprintf(acSol, sizeof(acSol), "na");
+    }
+
+    (void)snprintf(acLine, sizeof(acLine),
+                   "PT v1 role=%s result=%s flash=%s flashdetail=%s acc=%s gps=%s radio=%s "
+                   "nf=%s bat=%s sol=%s sn=%lu id=%08lX fw=%u.%u.%u\r\n",
+                   bSecondary ? "secondary" : "primary",
+                   bPass ? "PASS" : "FAIL",
+                   bFlash ? "ok" : "FAIL",
+                   SELFTEST_pcFlashDetail(),
+                   SELFTEST_bAccApplicable() ? (bAcc ? "ok" : "FAIL") : "na",
+                   SELFTEST_bGpsApplicable() ? (bGps ? "ok" : "FAIL") : "na",
+                   bRadio ? "ok" : "FAIL",
+                   acNf, acBat, acSol,
+                   (unsigned long)IDENTITY_u32GetSerial(),
+                   (unsigned long)LORARADIO_u32GetUniqueId(),
+                   (unsigned)VERSION_SW_MAJOR, (unsigned)VERSION_SW_MINOR,
+                   (unsigned)VERSION_SW_PATCH);
+    pfReply(pvCtx, acLine);
+    DBG_LOG("SelfTest: production test %s\r\n", bPass ? "PASS" : "FAIL");
+
+    /* ---- all-on hold ---- */
+    if (u32HoldS > 0U)
+    {
+        /* GPS powered and acquiring, no auto-shutdown; bForce so a GPS-disabled
+         * system setting cannot leave the module off during the measurement.
+         * GPS_vRequestFix refuses outside POWER_CLASS_NORMAL, which on a
+         * station supply means the supply is set too low - say so, because
+         * the all-on current would then be missing the GPS. */
+        if (bSecondary)
+        {
+            if (POWER_tGetState() & POWER_CLASS_NORMAL)
+                GPS_vRequestFix(false, 0U, true);
+            else
+                pfReply(pvCtx, "PT note gps not powered - supply below POWER_CLASS_NORMAL\r\n");
+        }
+        FLASH_vInhibitDeepPowerDown(true);
+
+        (void)snprintf(acLine, sizeof(acLine), "PT hold %lu s\r\n", (unsigned long)u32HoldS);
+        pfReply(pvCtx, acLine);
+
+        osDelay(u32HoldS * 1000U);
+
+        if (bSecondary)
+            GPS_vShutdown();
+        FLASH_vInhibitDeepPowerDown(false);
+    }
+
+    /* Hand the radio back to its normal owners; the session's end puts it to
+     * sleep the usual way. */
+    LORARADIO_vSetNoiseFloorSampling(false);
+    LORARADIO_vSetKeepAwake(false);
+
+    pfReply(pvCtx, "PT done\r\n");
+    return bPass;
 }

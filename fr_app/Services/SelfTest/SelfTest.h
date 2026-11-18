@@ -15,6 +15,7 @@
 #define SERVICES_SELFTEST_SELFTEST_H_
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Green-LED flash codes. Ordering here is also the order used when
  * multiple failures are reported one after the other. */
@@ -53,5 +54,35 @@ bool SELFTEST_bFlashApplicable(void);
  * whether the flash works NOW; this says what was wrong with it at boot, which
  * is the part an operator can act on. Never NULL. */
 const char *SELFTEST_pcFlashDetail(void);
+
+/* ---- Production test (kernel command 'u') --------------------------------
+ *
+ * Re-runs every hardware check LIVE (not the boot snapshot) and reports the
+ * result as one machine-readable line, then optionally holds everything that
+ * can be powered switched on for u32HoldS seconds so a power analyser can
+ * measure the board's all-on current. production/provision_tag.ps1 parses the
+ * output; keep its format stable and extend it only by adding keys.
+ *
+ * Output lines, in order:
+ *   PT v1 role=<primary|secondary> result=<PASS|FAIL> flash=<ok|FAIL>
+ *      flashdetail=<...> acc=<ok|FAIL|na> gps=<ok|FAIL|na> radio=<ok|FAIL>
+ *      nf=<dBm|none> bat=<mV|na> sol=<mV|na> sn=<serial, 0 = none>
+ *      id=<radio id hex> fw=<M.m.p>
+ *   PT hold <s> s                 (only if u32HoldS > 0; all-on starts)
+ *   PT done                       (all-on ended; everything back to normal)
+ *
+ * All-on means: GPS powered and acquiring, radio held awake in RX, external
+ * NOR held out of deep power-down. The accelerometer runs all the time anyway.
+ * LEDs are left alone so the measured current does not depend on them.
+ *
+ * Blocking for the checks (a few seconds, mostly the GPS NMEA check) plus the
+ * hold. Returns the PASS/FAIL verdict of the checks. pfReply is called once per
+ * output line with pvCtx passed through. */
+typedef void (*SelfTestReply_f)(void *pvCtx, const char *pcLine);
+
+#define SELFTEST_PROD_HOLD_DEFAULT_S    10U
+#define SELFTEST_PROD_HOLD_MAX_S        120U
+
+bool SELFTEST_bRunProductionTest(uint32_t u32HoldS, SelfTestReply_f pfReply, void *pvCtx);
 
 #endif /* SERVICES_SELFTEST_SELFTEST_H_ */

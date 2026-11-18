@@ -442,6 +442,11 @@ void LORARADIO_vSetNoiseFloorSampling(bool bEnable)
     bNoiseFloorSampling = bEnable;
 }
 
+int16_t LORARADIO_i16GetNoiseFloor(void)
+{
+    return i16NoiseFloor;
+}
+
 uint16_t LORARADIO_u16GetTxQueueDepth(void)
 {
     return (uint16_t)osMessageQueueGetCount(xLoRaTxQueue);

@@ -34,6 +34,7 @@ static const FrkCmd_t s_atCmds[] = {
     { 'f', FRK_CMDF_SINGLE,                 "",          "ext-flash health (gate, id, fault counters)" },
     { 'k', FRK_CMDF_SINGLE,                 "",          "ext-flash read-verify counters (reading clears them)" },
     { 'n', FRK_CMDF_SINGLE,                 "",          "serial number, radio id and where the serial is stored" },
+    { 'u', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[hold s]",  "production test: live checks, then all-on for hold s (default 10)" },
 
     /* ---- log streaming ---- */
     { 'a', FRK_CMDF_SINGLE,                 "",          "stream the whole ext-flash log" },

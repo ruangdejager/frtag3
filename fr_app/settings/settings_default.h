@@ -113,6 +113,24 @@ typedef struct _Settings_EE {
     Settings_EE_DayTimeZone dayTimeZone;
     bool     has_movementAlarm;
     Settings_EE_MovementAlarm movementAlarm;
+
+    /* ---- Appended fields: add new ones below, never above (see
+     * SETTINGS_LAYOUT_VERSION). ---- */
+
+    /* Secondary only. False from first programming until the unit is woken
+     * out of production sleep by its solar panel or the shake sequence; set
+     * false again by kernel 'P'. A secondary that boots with this false goes
+     * straight back into production sleep after the boot window (see
+     * DEVICE_DISCOVERY_vCheckWakeupScheduleTask), so a unit sitting in a box
+     * stays asleep through a reset or a battery brown-out instead of starting
+     * to run discovery campaigns. Defaults to false, which is what makes a
+     * freshly programmed unit come up asleep.
+     *
+     * This is device state, not a user preference: a factory reset that should
+     * leave a deployed unit running must save and restore it around
+     * SETTINGS_vRestoreDefaults(). */
+    bool     has_inService;
+    bool     inService;
 } Settings_EE;
 
 typedef struct _DayTimeZoneSchedule {

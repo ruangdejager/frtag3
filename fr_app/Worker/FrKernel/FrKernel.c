@@ -96,6 +96,7 @@ void FRKERNEL_vEndSession(const char *pcReason) { (void)pcReason; }
 #include "Flash.h"             /* flash health query / on-demand recovery   */
 #include "Flash_SelfTest.h"    /* flash self-test + stress harness          */
 #include "Identity.h"          /* serial number: 'n', 'N', status line      */
+#include "SelfTest.h"          /* production test: 'u'                      */
 
 #ifdef FRKERNEL_INTERFACE_UART
 #  include "Debug.h"
@@ -667,6 +668,13 @@ static void FRKERNEL_vFormatStatus(char *resp, size_t szResp)
                    (unsigned long)HAL_GetUIDw0());
 }
 
+/* SelfTestReply_f adapter: the production test streams several lines, each
+ * going back on the transport the command came in on. */
+static void FRKERNEL_vSelfTestReply(void *pvCtx, const char *pcLine)
+{
+    FRKERNEL_vReply((const FrkCtx_t *)pvCtx, pcLine);
+}
+
 /* A command that hands the device to something else ends the session after
  * its reply has gone out. */
 static void FRKERNEL_vTerminal(const char *pcReason)
@@ -734,6 +742,26 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
                            tId.bMirrorOk ? "ok" : "BAD",
                            tId.bRadioIdMatch ? "" : "  RADIO-ID-MISMATCH");
         FRKERNEL_vReply(pCtx, resp);
+        break;
+    }
+
+    case 'u':
+    {
+        /* u [hold s] - production test. Blocks this task for the checks and
+         * the hold; the session stays open throughout, so nothing else can
+         * start on the device meanwhile. */
+        char    *pcEnd;
+        uint32_t u32Hold = SELFTEST_PROD_HOLD_DEFAULT_S;
+        if (*pcArg != '\0')
+        {
+            u32Hold = (uint32_t)strtoul(pcArg, &pcEnd, 10);
+            if ((pcEnd == pcArg) || (*pcEnd != '\0'))
+            {
+                FRKERNEL_vReply(pCtx, "usage: u [hold seconds, 0..120]\r\n");
+                break;
+            }
+        }
+        (void)SELFTEST_bRunProductionTest(u32Hold, FRKERNEL_vSelfTestReply, (void *)pCtx);
         break;
     }
 
