@@ -652,7 +652,7 @@ static const char *FRKERNEL_pcProdState(void)
 static void FRKERNEL_vFormatStatus(char *resp, size_t szResp)
 {
     (void)snprintf(resp, szResp,
-                   "%08" PRIX32 " sn=%lu %s fw=v%u.%u.%u bl=v%lu bat=%umV sol=%umV "
+                   "%08" PRIX32 " sn=%08lX %s fw=v%u.%u.%u bl=v%lu bat=%umV sol=%umV "
                    "state=%s int=%umin log=%u%% uid=%08lX%08lX%08lX\r\n",
                    LORARADIO_u32GetUniqueId(),
                    (unsigned long)IDENTITY_u32GetSerial(),
@@ -734,7 +734,7 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
                            (unsigned long)LORARADIO_u32GetUniqueId(), (unsigned)tId.u8OtpFree);
         else
             (void)snprintf(resp, sizeof(resp),
-                           "serial: %lu  id=%08lX  src=%s  otp slot=%u free=%u  mirror=%s%s\r\n",
+                           "serial: %08lX  id=%08lX  src=%s  otp slot=%u free=%u  mirror=%s%s\r\n",
                            (unsigned long)tId.u32Serial,
                            (unsigned long)LORARADIO_u32GetUniqueId(),
                            IDENTITY_pcSourceText(tId.eSource),
@@ -767,7 +767,11 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
 
     case 'N':
     {
-        /* N <serial, decimal> <radio id, hex> [fix]
+        /* N <serial, 8 hex digits> <radio id, hex> [fix]
+         *
+         * The serial must be exactly 8 hex digits (format in
+         * Identity_Config.h). Exactly 8, so a decimal number typed by habit -
+         * the old format was decimal - is refused rather than read as hex.
          *
          * The radio id is required, not optional, and must be the full 8-digit
          * one: it is what stops a production station from serialising the
@@ -775,8 +779,8 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
          * so the station can log exactly what this unit accepted. */
         char       *pcEnd;
         const char *pc        = pcArg;
-        uint32_t    u32Serial = (uint32_t)strtoul(pc, &pcEnd, 10);
-        bool        bParsed   = (pcEnd != pc) && (*pcEnd == ' ');
+        uint32_t    u32Serial = (uint32_t)strtoul(pc, &pcEnd, 16);
+        bool        bParsed   = ((pcEnd - pc) == 8) && (*pcEnd == ' ');
 
         pc = pcEnd;
         while (*pc == ' ') pc++;
@@ -791,14 +795,14 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
 
         if (!bParsed)
         {
-            FRKERNEL_vReply(pCtx, "usage: N <serial> <radio id> [fix]  e.g. N 2611000123 0A3C1A2B\r\n");
+            FRKERNEL_vReply(pCtx, "usage: N <serial, 8 hex> <radio id> [fix]  e.g. N 31000001 0A3C1A2B\r\n");
             break;
         }
 
         Identity_SetResult_e eRes = IDENTITY_eSetSerial(u32Serial, u32Id, bFix);
         Identity_Status_t tId;
         IDENTITY_vGetStatus(&tId);
-        (void)snprintf(resp, sizeof(resp), "N %lu %08lX: %s (serial now %lu, otp free=%u)\r\n",
+        (void)snprintf(resp, sizeof(resp), "N %08lX %08lX: %s (serial now %08lX, otp free=%u)\r\n",
                        (unsigned long)u32Serial, (unsigned long)u32Id,
                        IDENTITY_pcSetResultText(eRes),
                        (unsigned long)tId.u32Serial, (unsigned)tId.u8OtpFree);

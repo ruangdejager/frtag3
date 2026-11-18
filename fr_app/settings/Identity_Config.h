@@ -44,6 +44,29 @@
  * The record is exactly two OTP double-words. Off-board tooling reproduces the
  * CRC as zlib.crc32(record[0:12] + uid_w0 + uid_w1 + uid_w2), each uid word as
  * 4 little-endian bytes.
+ *
+ * ---- Serial number format ----
+ *
+ * Always written and shown as 8 hex digits, 0xVRNNNNNN:
+ *
+ *   V       hardware version, bits 31..28. Units with the same hardware
+ *           version run the same code base and can be flashed with the same
+ *           image; frtag3 is hardware version 3 (IDENTITY_SERIAL_HW_VERSION).
+ *   R       hardware revision within that version, bits 27..24, 1..F. The
+ *           Tagskaap V3 RevA boards are revision 1.
+ *   NNNNNN  unit number within that revision, bits 23..0, 000001..FFFFFF.
+ *
+ * The first unit ever made is 0x31000001. Revision 0 and unit number 0 are
+ * never issued, so 0 can keep meaning "no serial" everywhere it is reported.
+ *
+ * The format is enforced only when a serial is written (IDENTITY_eSetSerial,
+ * so kernel 'N' refuses anything else). Reading accepts any CRC-valid record
+ * in IDENTITY_SERIAL_MIN..MAX: a record that validates is authentic, and
+ * refusing it would make a serialised unit look unserialised - the one thing
+ * write-once storage is there to prevent. Firmware does not check the
+ * revision against the board it runs on: within one hardware version every
+ * revision runs this same image, so the firmware cannot tell revisions apart
+ * and has no business refusing one.
  */
 
 #ifndef SETTINGS_IDENTITY_CONFIG_H_
@@ -66,5 +89,15 @@
  * the serial is reported, and all-ones is what an erased record holds. */
 #define IDENTITY_SERIAL_MIN         1UL
 #define IDENTITY_SERIAL_MAX         0xFFFFFFFEUL
+
+/* Serial number fields (format above). Only serials whose hardware version is
+ * this code base's own may be written; production/provision_tag.ps1 carries
+ * the same constants. */
+#define IDENTITY_SERIAL_HW_VERSION  3UL                 /* frtag3 */
+#define IDENTITY_SERIAL_VER_SHIFT   28U
+#define IDENTITY_SERIAL_REV_SHIFT   24U
+#define IDENTITY_SERIAL_NIBBLE_MASK 0xFUL
+#define IDENTITY_SERIAL_UNIT_MASK   0x00FFFFFFUL
+#define IDENTITY_SERIAL_FIRST       0x31000001UL        /* version 3, revision 1, unit 1 */
 
 #endif /* SETTINGS_IDENTITY_CONFIG_H_ */

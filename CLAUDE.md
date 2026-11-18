@@ -216,7 +216,10 @@ The serial number is not a setting. `fr_app/settings/Identity.c` keeps it write-
 OTP (first 512 B, 32 correction slots; the rest of OTP is unallocated) with a mirror in the NOR
 identity sector at 0x3C000, as a 16-byte record holding serial, radio id and a CRC-32 that
 folds in the 96-bit UID. It is written only by the kernel command `N <serial> <radio id> [fix]`
-and read with `n`.
+and read with `n`. Serials are 8 hex digits `0xVRNNNNNN`: hardware version (3 for frtag3; the
+same version means the same code base and image), hardware revision 1..F (V3 RevA = 1), unit
+number 000001..FFFFFF. The first unit is `31000001`. The firmware refuses to write any other
+form, but reads any CRC-valid record.
 
 Production sleep is persisted: `Settings_EE.inService` is false until a secondary is woken by
 solar or a shake, and kernel `P` clears it again. Every boot holds the MCU awake for

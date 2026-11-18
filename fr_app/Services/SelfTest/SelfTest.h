@@ -66,7 +66,7 @@ const char *SELFTEST_pcFlashDetail(void);
  * Output lines, in order:
  *   PT v1 role=<primary|secondary> result=<PASS|FAIL> flash=<ok|FAIL>
  *      flashdetail=<...> acc=<ok|FAIL|na> gps=<ok|FAIL|na> radio=<ok|FAIL>
- *      nf=<dBm|none> bat=<mV|na> sol=<mV|na> sn=<serial, 0 = none>
+ *      nf=<dBm|none> bat=<mV|na> sol=<mV|na> sn=<serial, 8 hex, 00000000 = none>
  *      id=<radio id hex> fw=<M.m.p>
  *   PT hold <s> s                 (only if u32HoldS > 0; all-on starts)
  *   PT done                       (all-on ended; everything back to normal)

@@ -180,7 +180,7 @@ void IDENTITY_vInit(void)
         return;
     }
 
-    DBG_LOG("Identity: serial %lu from %s (radio id %08lX, %u OTP slots free)\r\n",
+    DBG_LOG("Identity: serial %08lX from %s (radio id %08lX, %u OTP slots free)\r\n",
             (unsigned long)s_tStatus.u32Serial, IDENTITY_pcSourceText(s_tStatus.eSource),
             (unsigned long)IDENTITY_DRIVER_u32GetRadioId(), (unsigned)u8Free);
 
@@ -196,6 +196,15 @@ uint32_t IDENTITY_u32GetSerial(void)
     return s_tStatus.u32Serial;
 }
 
+bool IDENTITY_bSerialFormatOk(uint32_t u32Serial)
+{
+    const uint32_t u32Ver  = (u32Serial >> IDENTITY_SERIAL_VER_SHIFT) & IDENTITY_SERIAL_NIBBLE_MASK;
+    const uint32_t u32Rev  = (u32Serial >> IDENTITY_SERIAL_REV_SHIFT) & IDENTITY_SERIAL_NIBBLE_MASK;
+    const uint32_t u32Unit = u32Serial & IDENTITY_SERIAL_UNIT_MASK;
+
+    return (u32Ver == IDENTITY_SERIAL_HW_VERSION) && (u32Rev != 0U) && (u32Unit != 0U);
+}
+
 void IDENTITY_vGetStatus(Identity_Status_t *ptStatus)
 {
     if (ptStatus != NULL)
@@ -204,7 +213,9 @@ void IDENTITY_vGetStatus(Identity_Status_t *ptStatus)
 
 Identity_SetResult_e IDENTITY_eSetSerial(uint32_t u32Serial, uint32_t u32RadioId, bool bCorrection)
 {
-    if ((u32Serial < IDENTITY_SERIAL_MIN) || (u32Serial > IDENTITY_SERIAL_MAX))
+    /* Strict format on write only - see "Serial number format" in
+     * Identity_Config.h for why reading stays lenient. */
+    if (!IDENTITY_bSerialFormatOk(u32Serial))
         return IDENTITY_SET_BAD_SERIAL;
 
     /* Full 32-bit id, exact match - deliberately not LORARADIO_bIsOwnId, which
@@ -243,7 +254,7 @@ Identity_SetResult_e IDENTITY_eSetSerial(uint32_t u32Serial, uint32_t u32RadioId
     uint64_t au64Dw[2];
     memcpy(au64Dw, &tNew, sizeof(au64Dw));
 
-    DBG_LOG("Identity: writing serial %lu to OTP slot %u%s\r\n", (unsigned long)u32Serial,
+    DBG_LOG("Identity: writing serial %08lX to OTP slot %u%s\r\n", (unsigned long)u32Serial,
             (unsigned)u8NewSlot, (i8Slot >= 0) ? " (correction)" : "");
 
     /* Both double-words are attempted even if the first fails: the slot is
@@ -268,7 +279,7 @@ Identity_SetResult_e IDENTITY_eSetSerial(uint32_t u32Serial, uint32_t u32RadioId
 
     bool bMirrorOk = IDENTITY_bWriteMirror(&tCur);
     IDENTITY_vSetStatus(IDENTITY_SRC_OTP, &tCur, i8Slot, u8Free, bMirrorOk);
-    DBG_LOG("Identity: serial %lu written to OTP slot %u, mirror %s\r\n",
+    DBG_LOG("Identity: serial %08lX written to OTP slot %u, mirror %s\r\n",
             (unsigned long)u32Serial, (unsigned)u8NewSlot, bMirrorOk ? "ok" : "FAILED");
     return IDENTITY_SET_OK;
 }
@@ -279,7 +290,7 @@ const char *IDENTITY_pcSetResultText(Identity_SetResult_e eResult)
     {
         case IDENTITY_SET_OK:          return "written";
         case IDENTITY_SET_SAME:        return "already set to this serial";
-        case IDENTITY_SET_BAD_SERIAL:  return "serial must be 1..4294967294";
+        case IDENTITY_SET_BAD_SERIAL:  return "serial must be 3Rnnnnnn hex: hardware version 3, revision 1-F, unit 000001-FFFFFF";
         case IDENTITY_SET_WRONG_UNIT:  return "radio id does not match this unit";
         case IDENTITY_SET_ALREADY_SET: return "a different serial is set - add 'fix' to replace it";
         case IDENTITY_SET_OTP_FULL:    return "no free OTP slot left";

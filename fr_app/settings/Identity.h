@@ -6,7 +6,9 @@
  * in Identity_Config.h; the write rules in Identity.c.
  *
  * The serial number is set during production with the kernel command
- * 'N <serial> <radio id>' (see FrKernel.c) and read with 'n'.
+ * 'N <serial> <radio id>' (see FrKernel.c) and read with 'n'. It is always
+ * 8 hex digits, hardware version / revision / unit number - format in
+ * Identity_Config.h.
  */
 
 #ifndef SETTINGS_IDENTITY_H_
@@ -24,7 +26,7 @@ typedef enum {
 typedef enum {
     IDENTITY_SET_OK = 0,      /* written to OTP and mirrored                  */
     IDENTITY_SET_SAME,        /* already this serial; mirror refreshed only   */
-    IDENTITY_SET_BAD_SERIAL,  /* 0 or 0xFFFFFFFF                              */
+    IDENTITY_SET_BAD_SERIAL,  /* not 0x3Rnnnnnn, see Identity_Config.h        */
     IDENTITY_SET_WRONG_UNIT,  /* radio id given is not this unit's            */
     IDENTITY_SET_ALREADY_SET, /* a different serial is in OTP; needs "fix"    */
     IDENTITY_SET_OTP_FULL,    /* no free OTP slot left                        */
@@ -46,6 +48,10 @@ void IDENTITY_vInit(void);
 
 /* 0 when the unit has no serial number. */
 uint32_t IDENTITY_u32GetSerial(void);
+
+/* True when u32Serial may be written on this code base: hardware version
+ * IDENTITY_SERIAL_HW_VERSION, revision 1..F, unit number 1..0xFFFFFF. */
+bool IDENTITY_bSerialFormatOk(uint32_t u32Serial);
 
 void IDENTITY_vGetStatus(Identity_Status_t *ptStatus);
 

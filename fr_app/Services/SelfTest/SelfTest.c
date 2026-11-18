@@ -321,7 +321,7 @@ bool SELFTEST_bRunProductionTest(uint32_t u32HoldS, SelfTestReply_f pfReply, voi
 
     (void)snprintf(acLine, sizeof(acLine),
                    "PT v1 role=%s result=%s flash=%s flashdetail=%s acc=%s gps=%s radio=%s "
-                   "nf=%s bat=%s sol=%s sn=%lu id=%08lX fw=%u.%u.%u\r\n",
+                   "nf=%s bat=%s sol=%s sn=%08lX id=%08lX fw=%u.%u.%u\r\n",
                    bSecondary ? "secondary" : "primary",
                    bPass ? "PASS" : "FAIL",
                    bFlash ? "ok" : "FAIL",

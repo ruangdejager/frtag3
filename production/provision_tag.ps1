@@ -7,9 +7,10 @@
 #   - ST-LINK (V3) on the tag's SWD header. Its virtual COM port carries the
 #     tag's debug UART (USART2, 115200 8N1); the script finds that port on its
 #     own unless -ComPort names one.
-#   - Optionally an Otii Arc on the tag's supply input (secondary: battery
-#     terminals; primary: the 3.0 V input the fr9 normally feeds). With it the
-#     script powers the board itself, power-cycles it, and measures current.
+#   - Optionally an Otii Arc on the tag's battery input. Primary and
+#     secondary run from the same battery type, so both are supplied at 3.8 V
+#     (-SupplyV). With it the script powers the board itself, power-cycles it,
+#     and measures current.
 #     Without it (or without an Otii Automation Toolbox licence on this PC) the
 #     board must be powered some other way; every step still runs except the
 #     current measurements, and resets go through the ST-LINK instead.
@@ -51,6 +52,17 @@
 # fr_app/settings/Identity_Config.h); a wrong one can only be superseded with
 # -Fix, and each chip has 32 slots for that in total.
 #
+# Serial number format: 8 hex digits, 0xVRNNNNNN - V hardware version (3 for
+# every frtag3; units with the same hardware version run the same code base),
+# R hardware revision (1..F, -HwRevision, Tagskaap V3 RevA = 1), NNNNNN unit
+# number within that revision (000001..FFFFFF). The first unit is 31000001.
+# A new unit gets the next free number in its revision from the unit database;
+# -Serial overrides that. The firmware refuses any other format.
+#
+# The unit database is this station's own file. Two stations each with their
+# own database would hand out the same numbers: run one station, or share the
+# database between them (one run at a time).
+#
 # Requirements
 #   - STM32CubeProgrammer (STM32_Programmer_CLI.exe).
 #   - Firmware built with FRKERNEL_INTERFACE_UART (build_config.h; on by
@@ -67,10 +79,11 @@
 #   put the limits a sensible margin outside what they measured.
 #
 # Examples
-#   .\provision_tag.ps1 -Role secondary -FirstSerial 2611000001
+#   .\provision_tag.ps1 -Role secondary
 #   .\provision_tag.ps1 -Role primary -NoOtii
 #   .\provision_tag.ps1 -Role secondary -DryRun          (read and check only)
-#   .\provision_tag.ps1 -Role secondary -Serial 2611000123 -Fix
+#   .\provision_tag.ps1 -Role secondary -Serial 31000123 -Fix
+#   .\provision_tag.ps1 -Role secondary -HwRevision 2    (first RevB unit: 32000001)
 #
 # Exit code 0 when every check passed, 1 otherwise.
 
@@ -84,8 +97,9 @@ param(
     [string] $FlashHex = '',
     [switch] $NoFlash,
 
-    [uint32] $Serial = 0,
-    [uint32] $FirstSerial = 0,
+    [string] $Serial = '',          # 8 hex digits; empty = keep / next free
+    [ValidateRange(1, 15)]
+    [int]    $HwRevision = 1,       # revision digit for newly allocated serials
     [switch] $Fix,
 
     [string] $Database  = (Join-Path $PSScriptRoot 'provisioned_units.csv'),
@@ -93,7 +107,7 @@ param(
     [string] $RunLogDir = (Join-Path $PSScriptRoot 'runs'),
 
     [switch] $NoOtii,
-    [double] $SupplyV = 0,          # 0 = role default (secondary 3.8 V, primary 3.0 V)
+    [double] $SupplyV = 3.8,        # Otii output, both roles (same battery)
     [int]    $HoldS = 10,
     [double] $SleepMaxUA = 50,      # placeholder - set from golden units
     [double] $AllOnMinMA = 5,       # placeholder - set from golden units
@@ -120,6 +134,9 @@ $ID_FORMAT         = 1            # IDENTITY_FORMAT
 $LORA_ID_CRC8_POLY = 0x07         # LORA_ID_CRC8_POLY, LoraRadio_Config.h
 $LORA_ID_HI_SUBST  = 0xFF00       # LORA_ID_HI_ZERO_SUBST
 $BOOT_WINDOW_S     = 30           # APP_BOOT_WINDOW_MS, DeviceDiscovery.h
+$SN_HW_VERSION     = 3            # IDENTITY_SERIAL_HW_VERSION, Identity_Config.h
+$SN_FAMILY_MASK    = 0xFF000000L  # version + revision digits
+$SN_UNIT_MASK      = 0x00FFFFFFL  # IDENTITY_SERIAL_UNIT_MASK
 # Note for anyone editing: in Windows PowerShell a hex literal of 0x80000000
 # or more is a NEGATIVE [int] (0xFFFFFFFF is -1). Every such constant below
 # carries the L suffix to make it a positive [long].
@@ -236,6 +253,35 @@ function Get-RadioId([uint32[]] $uid) {
     [uint32] $hi = (($w1 -band 0xFF) -shl 8) -bor (Get-Crc8 $lot)
     if ($hi -eq 0) { $hi = $LORA_ID_HI_SUBST }
     return [uint32](([uint64]$hi -shl 16) -bor $lo)
+}
+
+# ---- Serial numbers ---------------------------------------------------------
+# Serials are [long] inside the script and 8 hex digits everywhere they are
+# shown, logged or stored.
+
+function Format-Serial($sn) { return '{0:X8}' -f [long]$sn }
+
+# Text (8 hex digits, optional 0x) to [long]; $null when it is not that.
+function ConvertFrom-SerialText([string] $text) {
+    $t = $text.Trim()
+    if ($t -match '^0[xX]') { $t = $t.Substring(2) }
+    if ($t -notmatch '^[0-9A-Fa-f]{8}$') { return $null }
+    return [long]::Parse($t, [Globalization.NumberStyles]::HexNumber)
+}
+
+# Same rule as IDENTITY_bSerialFormatOk: version 3, revision 1..F, unit 1..FFFFFF.
+function Test-SerialFormat([long] $sn) {
+    return ((($sn -shr 28) -band 0xF) -eq $SN_HW_VERSION) -and
+           ((($sn -shr 24) -band 0xF) -ne 0) -and
+           (($sn -band $SN_UNIT_MASK) -ne 0)
+}
+
+# Every serial in the unit database, parsed. A row that is not 8 hex digits
+# stops the run: allocating around a row we cannot read could reuse a number.
+function Get-DbSerial($row) {
+    $sn = ConvertFrom-SerialText $row.Serial
+    if ($null -eq $sn) { Stop-Run ("unit database row for chip {0} has serial '{1}', not 8 hex digits - fix $Database" -f $row.Uid, $row.Serial) }
+    return $sn
 }
 
 # Decode the OTP identity slots. Returns the current record (highest valid
@@ -451,13 +497,13 @@ function Connect-Kernel {
     $deadline = (Get-Date).AddSeconds($BOOT_WINDOW_S - 2)
     while ((Get-Date) -lt $deadline) {
         Send-Line 'i'
-        $l = Wait-Line '^[0-9A-F]{8} sn=\d+ (PRIMARY|secondary) fw=v' 1.5
+        $l = Wait-Line '^[0-9A-F]{8} sn=[0-9A-F]{8} (PRIMARY|secondary) fw=v' 1.5
         if ($l) {
-            if ($l -notmatch '^([0-9A-F]{8}) sn=(\d+) (PRIMARY|secondary) fw=v(\S+) bl=v(\S+) bat=(\d+)mV sol=(\d+)mV state=(\S+)') {
+            if ($l -notmatch '^([0-9A-F]{8}) sn=([0-9A-F]{8}) (PRIMARY|secondary) fw=v(\S+) bl=v(\S+) bat=(\d+)mV sol=(\d+)mV state=(\S+)') {
                 Stop-Run "unrecognised status line: $l"
             }
             return [pscustomobject]@{
-                RadioId = $Matches[1]; Serial = [uint32]$Matches[2]
+                RadioId = $Matches[1]; Serial = $Matches[2]
                 Role = $Matches[3].ToLower(); Fw = $Matches[4]; Bl = $Matches[5]
                 BatMv = [int]$Matches[6]; SolMv = [int]$Matches[7]; State = $Matches[8]
             }
@@ -493,8 +539,6 @@ try {
 
     $script:Cli = Find-Programmer
     if (-not $script:Cli) { Stop-Run 'STM32_Programmer_CLI.exe not found - install STM32CubeProgrammer or pass -Programmer' }
-
-    if ($SupplyV -eq 0) { if ($Role -eq 'secondary') { $SupplyV = 3.8 } else { $SupplyV = 3.0 } }
 
     $R.Timestamp  = $RunStamp.ToString('yyyy-MM-ddTHH:mm:ssK')
     $R.Station    = $env:COMPUTERNAME
@@ -542,7 +586,7 @@ try {
     }
 
     $otpCur = $target.Otp.Current
-    if ($otpCur) { Log ("OTP      serial {0} in slot {1}, {2} slots free" -f $otpCur.Serial, $otpCur.Slot, $target.Otp.Free) }
+    if ($otpCur) { Log ("OTP      serial {0} in slot {1}, {2} slots free" -f (Format-Serial $otpCur.Serial), $otpCur.Slot, $target.Otp.Free) }
     else         { Log ("OTP      no serial, {0} slots free" -f $target.Otp.Free) }
 
     $db = @(); if (Test-Path $Database) { $db = @(Import-Csv $Database) }
@@ -557,30 +601,53 @@ try {
                    "set this unit aside and report it - the id derivation needs attention.") -f $byId[0].Uid, $byId[0].Serial)
     }
 
-    if ($Serial -eq 0) {
-        if ($byChip.Count -gt 0)    { $Serial = [uint32]$byChip[-1].Serial }
-        elseif ($otpCur)            { $Serial = $otpCur.Serial }
-        elseif ($db.Count -gt 0)    { $Serial = [uint32](($db | ForEach-Object { [uint32]$_.Serial } | Measure-Object -Maximum).Maximum + 1) }
-        elseif ($FirstSerial -ne 0) { $Serial = $FirstSerial }
-        else { Stop-Run 'unit database is empty: pass -Serial or -FirstSerial for the first unit' }
+    $dbSerials = @($db | ForEach-Object { Get-DbSerial $_ })
+    if ($Serial -ne '') {
+        $sn = ConvertFrom-SerialText $Serial
+        if ($null -eq $sn) { Stop-Run "-Serial '$Serial' is not 8 hex digits (e.g. 31000001)" }
+    } elseif ($byChip.Count -gt 0) {
+        $sn = Get-DbSerial $byChip[-1]
+    } elseif ($otpCur) {
+        $sn = [long]$otpCur.Serial
+    } else {
+        # Next free unit number in this revision. The highest one issued plus
+        # one, not the first gap: a gap may be a unit that failed after its
+        # serial was written but before it reached the database.
+        $family = ([long]$SN_HW_VERSION -shl 28) -bor ([long]$HwRevision -shl 24)
+        $issued = @($dbSerials | Where-Object { ($_ -band $SN_FAMILY_MASK) -eq $family })
+        if ($issued.Count -eq 0) {
+            $sn = $family + 1
+        } else {
+            $top = [long]($issued | Measure-Object -Maximum).Maximum
+            if (($top -band $SN_UNIT_MASK) -eq $SN_UNIT_MASK) {
+                Stop-Run ("revision {0:X} has used all {1} unit numbers - the next units need a new -HwRevision" -f $HwRevision, $SN_UNIT_MASK)
+            }
+            $sn = [long]$top + 1
+        }
     }
-    if (($Serial -lt 1) -or ($Serial -gt 0xFFFFFFFEL)) { Stop-Run "serial $Serial is out of range 1..4294967294" }
+    $snText = Format-Serial $sn
 
-    $bySerial = @($db | Where-Object { [uint32]$_.Serial -eq $Serial -and $_.Uid -ne $uidText })
-    if ($bySerial.Count -gt 0) { Stop-Run ("serial $Serial already belongs to chip {0} (radio id {1})" -f $bySerial[0].Uid, $bySerial[0].RadioId) }
+    $bySerial = @($db | Where-Object { (Get-DbSerial $_) -eq $sn -and $_.Uid -ne $uidText })
+    if ($bySerial.Count -gt 0) { Stop-Run ("serial $snText already belongs to chip {0} (radio id {1})" -f $bySerial[0].Uid, $bySerial[0].RadioId) }
 
     $needFix = $false
-    if ($otpCur -and $otpCur.Serial -ne $Serial) {
-        if (-not $Fix) { Stop-Run ("chip already holds serial {0}; to replace it with {1} re-run with -Fix (uses one of the {2} free OTP slots)" -f $otpCur.Serial, $Serial, $target.Otp.Free) }
+    if ($otpCur -and [long]$otpCur.Serial -ne $sn) {
+        if (-not $Fix) { Stop-Run ("chip already holds serial {0}; to replace it with {1} re-run with -Fix (uses one of the {2} free OTP slots)" -f (Format-Serial $otpCur.Serial), $snText, $target.Otp.Free) }
         $needFix = $true
     }
-    if ($byChip.Count -gt 0 -and [uint32]$byChip[-1].Serial -ne $Serial -and -not $Fix) {
-        Stop-Run ("database has this chip as serial {0}; pass -Fix to re-serialise it as {1}" -f $byChip[-1].Serial, $Serial)
+    if ($byChip.Count -gt 0 -and (Get-DbSerial $byChip[-1]) -ne $sn -and -not $Fix) {
+        Stop-Run ("database has this chip as serial {0}; pass -Fix to re-serialise it as {1}" -f $byChip[-1].Serial, $snText)
     }
     $needWrite = (-not $otpCur) -or $needFix
+    if (-not (Test-SerialFormat $sn)) {
+        # The firmware refuses to write such a serial, so stop before testing.
+        # A unit that already holds one keeps it; it is only flagged.
+        if ($needWrite) { Stop-Run "serial $snText is not in the 3Rnnnnnn format (version 3, revision 1-F, unit 000001-FFFFFF)" }
+        Add-Note "serial $snText predates the 3Rnnnnnn format - re-serialise with -Serial <new> -Fix"
+    }
     if ($needWrite -and $target.Otp.Free -eq 0) { Stop-Run 'no free OTP identity slot left on this chip' }
-    $R.Serial = $Serial
-    Log "Serial   $Serial$(if ($needFix) { '  (correction)' } elseif (-not $needWrite) { '  (already in OTP)' })"
+    $R.Serial = $snText
+    Log "Serial   $snText$(if ($needFix) { '  (correction)' } elseif (-not $needWrite) { '  (already in OTP)' })"
 
     if ($DryRun) {
         Log 'DryRun: identity and database checks passed; nothing programmed, tested or written.' 'Yellow'
@@ -655,10 +722,10 @@ try {
         if (-not $ptPass) {
             Add-Fail 'serial not written: the production test failed'
         } else {
-            $cmd = "N $Serial $idText$(if ($needFix) { ' fix' })"
+            $cmd = "N $snText $idText$(if ($needFix) { ' fix' })"
             Log "Writing serial: $cmd"
             Send-Line $cmd
-            $reply = Wait-Line ('^N {0} {1}: ' -f $Serial, $idText) 10
+            $reply = Wait-Line ('^N {0} {1}: ' -f $snText, $idText) 10
             if (-not $reply) { Add-Fail 'no reply to the N command' }
             elseif ($reply -notmatch ': (written|already set to this serial) ') { Add-Fail "the tag refused the serial: $reply" }
             else { Log $reply }
@@ -667,7 +734,7 @@ try {
     Send-Line 'n'
     $nLine = Wait-Line '^serial: ' 5
     if (-not $nLine) { Add-Fail "no reply to 'n'" }
-    elseif ($nLine -match '^serial: (\d+) ') { $R.SerialOnTag = $Matches[1] }
+    elseif ($nLine -match '^serial: ([0-9A-F]{8}) ') { $R.SerialOnTag = $Matches[1] }
     else { $R.SerialOnTag = 'none' }
 
     # -- 6. Sleep and final-pass current --
@@ -687,14 +754,14 @@ try {
         $after = Read-Target
         $cur = $after.Otp.Current
         if (-not $cur)                    { Add-Fail 'OTP holds no valid identity record' }
-        elseif ($cur.Serial -ne $Serial)  { Add-Fail ("OTP holds serial {0}, expected {1}" -f $cur.Serial, $Serial) }
-        elseif ($cur.RadioId -ne $radioId){ Add-Fail ("OTP record names radio id {0:X8}, expected {1}" -f $cur.RadioId, $idText) }
-        else { Log ("OTP verified: slot {0}, serial {1}, {2} slots free" -f $cur.Slot, $cur.Serial, $after.Otp.Free) 'Green' }
+        elseif ([long]$cur.Serial -ne $sn) { Add-Fail ("OTP holds serial {0}, expected {1}" -f (Format-Serial $cur.Serial), $snText) }
+        elseif ($cur.RadioId -ne $radioId) { Add-Fail ("OTP record names radio id {0:X8}, expected {1}" -f $cur.RadioId, $idText) }
+        else { Log ("OTP verified: slot {0}, serial {1}, {2} slots free" -f $cur.Slot, (Format-Serial $cur.Serial), $after.Otp.Free) 'Green' }
 
-        $known = @($db | Where-Object { $_.Uid -eq $uidText -and [uint32]$_.Serial -eq $Serial }).Count -gt 0
-        if ($cur -and $cur.Serial -eq $Serial -and -not $known) {
+        $known = @($db | Where-Object { $_.Uid -eq $uidText -and (Get-DbSerial $_) -eq $sn }).Count -gt 0
+        if ($cur -and [long]$cur.Serial -eq $sn -and -not $known) {
             [pscustomobject]@{
-                Timestamp = $R.Timestamp; Serial = $Serial; RadioId = $idText; Uid = $uidText
+                Timestamp = $R.Timestamp; Serial = $snText; RadioId = $idText; Uid = $uidText
                 OtpSlot = $cur.Slot; Role = $Role; Firmware = $R.Fw; Operator = $Operator
             } | Export-Csv -Path $Database -Append -NoTypeInformation
             Log "Unit recorded in $Database"
