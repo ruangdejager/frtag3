@@ -13,7 +13,8 @@
  *   0x3D000             settings bank A               this file
  *   0x3E000             settings bank B               this file
  *   0x3F000             reserved                      this file
- *   0x40000 - 0x7EFFF   text log                      Log.h
+ *   0x40000 - 0x7CFFF   text log                      Log.h
+ *   0x7D000 - 0x7EFFF   LoRaWAN DevNonce journal      Log.h, LoRaWan.c
  *   0x7F000             flash self-test scratch       Flash_Config.h
  *
  * The 16 KB at 0x3C000 came off the bottom of the text log (268 -> 252 KB).
@@ -35,7 +36,8 @@
  * next per-unit record does not have to take another bite out of the log and
  * move its start again.
  *
- * Kernel command 'W' (LOG_vEraseAll) is a NOR chip erase and takes this whole
+ * Kernel command 'W' (LOG_vEraseAll) erases everything below the LoRaWAN
+ * DevNonce journal and takes this whole
  * partition with it. The unit then runs on compiled-in defaults until the next
  * SETTINGS_bCommit().
  */

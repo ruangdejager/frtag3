@@ -2,5 +2,5 @@
 /Debug
 /Release
 
-# Local OTAA credentials (feature/mode) - copy lorawan_keys_template.h, never commit
+# Local OTAA credentials - copy lorawan_keys_template.h, never commit
 fr_app/Worker/LoRaWan/lorawan_keys.h

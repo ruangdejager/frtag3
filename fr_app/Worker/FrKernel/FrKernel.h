@@ -13,7 +13,7 @@
  * ----------------------
  * A tag is either IDLE or has an ACTIVE kernel session. While a session is
  * active the kernel owns the device: DeviceDiscovery runs no campaign, starts
- * no scheduled wake, GPS pre-trigger or basic beacon, and MeshNetwork drops
+ * no scheduled wake, GPS pre-trigger or LoRaWAN report, and MeshNetwork drops
  * every packet that is not FrKernel or OTA traffic. Nothing but the session
  * ending - "x", 5 minutes without a command, or a terminal command such as
  * production sleep - gives the device back.
@@ -61,7 +61,7 @@ bool FRKERNEL_bIsActive(void);
 
 /* True while the kernel holds the device: a session is active, or the shake
  * window is still waiting for a connect. The wake-schedule task stands down
- * (no discovery wake, basic beacon or GPS pre-trigger) while this is true. */
+ * (no discovery wake, LoRaWAN report or GPS pre-trigger) while this is true. */
 bool FRKERNEL_bHoldsDevice(void);
 
 /* End the session from outside the kernel (e.g. the device is going into a

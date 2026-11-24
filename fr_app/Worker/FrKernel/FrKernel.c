@@ -1001,10 +1001,13 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         break;
 
     case 'W':
-        /* Whole-chip erase: log AND the OTA scratchpad/metadata. Destroys a
-         * staged-but-not-installed image - a deliberate full reset. */
+        /* Log, settings/identity mirror AND the OTA scratchpad/metadata.
+         * Destroys a staged-but-not-installed image - a deliberate field
+         * reset. Not a chip erase any more: the LoRaWAN DevNonce journal
+         * survives it (review LW04, see LOG_vEraseAll), so this command
+         * cannot lock a tag out of TTN. */
         DBGLOG_vRequestEraseAll();
-        FRKERNEL_vReply(pCtx, "full ext-flash erase requested (log + staged OTA image)\r\n");
+        FRKERNEL_vReply(pCtx, "ext-flash erase requested (log + settings + OTA image; nonce kept)\r\n");
         break;
 
     case 'P':

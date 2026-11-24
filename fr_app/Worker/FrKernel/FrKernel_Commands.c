@@ -60,7 +60,7 @@ static const FrkCmd_t s_atCmds[] = {
 
     /* ---- destructive / terminal (upper case) ---- */
     { 'E', 0U,                              "",          "ERASE the ext-flash log" },
-    { 'W', 0U,                              "",          "WIPE the whole ext-flash (log + staged OTA image)" },
+    { 'W', 0U,                              "",          "WIPE the ext-flash (log, settings, staged OTA image; keeps LoRaWAN nonce)" },
     { 'P', 0U,                              "",          "production sleep - wakes on solar or shake (secondary)" },
     { 'S', 0U,                              "",          "solar sleep - wakes on shake only (secondary)" },
     { 'R', FRK_CMDF_SINGLE,                 "",          "radio range test (secondary beacons, shake to end;"

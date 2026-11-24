@@ -76,9 +76,9 @@ void DBGLOG_vCancelDump(void);
  * consumer's own log writes on the shared storage device. */
 void DBGLOG_vRequestErase(void);
 
-/* Flash backend only: ask the consumer task to erase the ENTIRE ext-flash
- * device -- log partition AND the OTA image scratchpad + metadata below it
- * (LOG_vEraseAll), not just the log. Destroys any staged-but-not-yet-
+/* Flash backend only: ask the consumer task to erase the ext-flash log
+ * partition AND the OTA image scratchpad + metadata below it (LOG_vEraseAll),
+ * not just the log. The LoRaWAN DevNonce journal is kept. Destroys any staged-but-not-yet-
  * installed OTA image. Same consumer-task rationale as DBGLOG_vRequestErase. */
 void DBGLOG_vRequestEraseAll(void);
 

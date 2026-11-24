@@ -10,6 +10,9 @@
 #include "Movement_Config.h"
 #include "time_config.h"
 
+/* const: only ever read (settings.c copies it into RAM and reads default
+ * values back out of it), so it lives in flash instead of costing 340 B of
+ * .data. */
 const Settings_EE settings_def =
 {
     .utcTime      = 1,

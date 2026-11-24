@@ -97,7 +97,7 @@
  * the log's top sector, which is not shared with anything). The read-only half
  * - JEDEC ID and status register - always runs, with or without this.
  *
- * Off in production. It costs one 4 KB erase per boot against a 100,000-cycle
+ * Off in production. It costs one 4 KB erase per boot against a 10,000-cycle
  * endurance rating (so the wear is negligible) plus ~50 ms of boot time, but a
  * production image has nothing to do with the answer: the write path is
  * exercised continuously by the log anyway. This is a bring-up and returns

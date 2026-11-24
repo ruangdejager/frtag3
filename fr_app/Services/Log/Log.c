@@ -276,16 +276,44 @@ void LOG_vErase(void)
 
 void LOG_vEraseAll(void)
 {
-    /* Whole-device erase: also wipes the OTA scratchpad + metadata sectors
-     * and the stored settings below LOG_FLASH_START_ADDR — deliberate, see
-     * Log.h; the settings store copes with its banks vanishing under it and
-     * rewrites on the next commit. FLASH_vChipErase
-     * blocks until the device reports done (a full 512 KB erase takes
-     * several seconds); Flash.c's own mutex keeps this safe against the
-     * DbgLog consumer's other flash traffic, but this function is still
-     * only ever called FROM that consumer task (DBGLOG_vRequestEraseAll),
-     * same as LOG_vErase, so there's nothing else to race here anyway. */
-    (void)FLASH_vChipErase();
+    /* Erase everything BELOW LOG_PROTECTED_START_ADDR: the OTA scratchpad +
+     * metadata, the settings + identity mirror sectors (the settings store
+     * copes with its banks vanishing and rewrites on the next commit) and the
+     * whole log partition - deliberate, see Log.h. The
+     * LoRaWAN DevNonce journal and the self-test sector above it are kept.
+     *
+     * This was a chip erase (review LW04, 2026-11-13). That also wiped the
+     * DevNonce journal, so after a kernel 'W' - a command that
+     * reaches a tag over LoRa, wildcard included - the next reboot restarted
+     * DevNonce at 0 and the network server refused every join until someone
+     * reset the device's nonce history in the TTN console. Erasing a log or
+     * a staged image must never cost a tag its network identity; a deliberate
+     * re-provisioning would be its own, separate operation.
+     *
+     * 64 KB block erases cover the aligned bulk, 4 KB sector erases the rest.
+     * Each call blocks until the device reports done, so the whole pass takes
+     * a few seconds, like the chip erase did. Flash.c's own mutex keeps this
+     * safe against other flash traffic, and it is only ever called FROM the
+     * DbgLog consumer task (DBGLOG_vRequestEraseAll), same as LOG_vErase. A
+     * failed erase stops the pass rather than skipping ahead. */
+    uint32_t u32Addr = 0U;
+    while (u32Addr < LOG_PROTECTED_START_ADDR)
+    {
+        bool bOk;
+        if ((u32Addr % FLASH_BLOCK_SIZE_BYTES) == 0U &&
+            (u32Addr + FLASH_BLOCK_SIZE_BYTES) <= LOG_PROTECTED_START_ADDR)
+        {
+            bOk = FLASH_vBlockErase(u32Addr);
+            u32Addr += FLASH_BLOCK_SIZE_BYTES;
+        }
+        else
+        {
+            bOk = FLASH_vSectorErase(u32Addr);
+            u32Addr += FLASH_SECTOR_SIZE_BYTES;
+        }
+        if (!bOk)
+            break;
+    }
     u32WriteAddr = LOG_FLASH_START_ADDR;
     u32StartAddr = LOG_FLASH_START_ADDR;
     bWrapped     = false;
