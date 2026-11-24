@@ -1184,7 +1184,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
              * at all. */
             HAL_UART_vInit();
             DEBUG_vInit();
-            LORARADIO_vWakeUp();
+            /* Not when the radio is already awake: a session opened from a
+             * presence beacon's listen window arrives here with the radio
+             * handed over awake in RX (LORARADIO_bKeepAwakeAfterWindow), and
+             * re-initialising it now would cut off the tag's "connected"
+             * reply, which the kernel is sending at this very moment. */
+            if (LORARADIO_bIsAsleep())
+                LORARADIO_vWakeUp();
 
             if (!FRKERNEL_bIsActive() && bShakePending)
             {
@@ -1808,6 +1814,20 @@ void DEVICE_DISCOVERY_vTriggerKernelWakeup(void)
  * the kernel branch, which skips the shake window because a session is
  * already active (or nothing is pending) and falls into the session.
  * -------------------------------------------------------------------------- */
+bool DEVICE_DISCOVERY_bPresenceAllowed(void)
+{
+    /* Production sleep is the shelf / shipping state: a unit in a box must not
+     * spend ~40 uA announcing itself. A low or recovering battery likewise
+     * keeps it for the schedule. A primary has no power-class manager and
+     * reports whatever POWER_vInit left, which is NORMAL. */
+    return !bAppTaskBusy &&
+           bBootWindowDone &&
+           !bShakePending &&
+           (eProductionState != PRODUCTION_SLEEP) &&
+           !RADIOTESTMODE_bActive() &&
+           ((POWER_tGetState() & POWER_CLASS_NORMAL) != 0U);
+}
+
 void DEVICE_DISCOVERY_vOnKernelSession(bool bOpened)
 {
     if (DeviceDiscoveryAppTask_handle != NULL)

@@ -535,7 +535,13 @@ typedef enum {
      * reserved rather than reused: a v2.4.x tag in a mixed fleet can still
      * air one, and it must keep landing in the RX dispatcher's default case
      * instead of being decoded as something else. */
-    MeshPktType_Reserved11 = 11
+    MeshPktType_Reserved11 = 11,
+
+    /* Kernel presence beacon: a sleeping tag's "I am here, listening for a
+     * few ms" - layout FRK_PRESENCE_* in FrKernel_Protocol.h. Never forwarded.
+     * Tags drop it; the kernel console lists it and may answer with a
+     * CONNECT inside the listen window. */
+    MeshPktType_Presence   = 12
 } MeshPktType_e;
 
 /* ---- Wake-up interval enum ---- */
@@ -878,6 +884,11 @@ uint8_t       MESHNETWORK_u8GetWakeupInterval(void);
 /* Called by the parser when a FrKernel packet arrives.
  * Override in FrKernel.c when FRKERNEL_INTERFACE_LORA is defined. */
 void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len);
+
+/* Called by the parser when a kernel presence beacon arrives; buf is the whole
+ * packet including the type byte. Weak no-op: only the kernel console
+ * (FrKernelConsole.c) does anything with one. */
+void MESHNETWORK_vOnPresence(const uint8_t *buf, uint8_t len, int16_t i16Rssi);
 
 /* Enqueue a small OTA response (PrepAck/Report, <= the mesh TX item size)
  * through the jittered mesh TX queue. Parser-context safe — used by the

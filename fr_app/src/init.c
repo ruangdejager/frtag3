@@ -150,6 +150,9 @@ void INIT_vInitialization(void *parameters)
 #ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
         " FRKERNEL_INTERFACE_LORA_CONSOLE\r\n"
 #endif
+#ifdef ENABLE_KERNEL_PRESENCE_BEACON
+        " ENABLE_KERNEL_PRESENCE_BEACON\r\n"
+#endif
 #ifdef DEBUG_OUTPUT_UART
         " DEBUG_OUTPUT_UART\r\n"
 #endif

@@ -52,6 +52,16 @@
  #define FRKERNEL_INTERFACE_LORA           /* tag: LoRa (deployed tag)    */
 // #define FRKERNEL_INTERFACE_LORA_CONSOLE   /* operator console rig        */
 
+/* Kernel presence beacon (needs FRKERNEL_INTERFACE_LORA). Between scheduled
+ * wakes the tag beacons its id every 10-20 s and listens ~30 ms after each, so
+ * a console can list it ("scan") and connect to it ("c <n>", "scan bulk")
+ * within one beacon period, without a shake or a scheduled wake. Costs on the
+ * order of 40 uA averaged at the default period - see FRKERNEL_PRESENCE_MIN_MS
+ * in fr_app/Worker/FrKernel/FrKernel_Config.h, which is the knob. Off: the tag
+ * never beacons and connects only in the shake and wake windows; the console
+ * side is always built. Consumed by FrKernel.c (tag) and LoraRadio.c. */
+#define ENABLE_KERNEL_PRESENCE_BEACON
+
 /* --------------------------------------------------------------------------
  * Debug transport — select at most one. Neither defined compiles Debug.c to
  * stubs (no output produced). See fr_app/Services/Debug/Debug.h.
@@ -225,6 +235,13 @@
 /* The console prints everything through DbgLog's UART path. */
 #if defined(FRKERNEL_INTERFACE_LORA_CONSOLE) && !defined(DEBUG_OUTPUT_UART)
 #  error "build_config.h: FRKERNEL_INTERFACE_LORA_CONSOLE needs DEBUG_OUTPUT_UART"
+#endif
+/* The presence beacon is a LoRa connect path; a UART-only tag has nothing to
+ * connect it to. (On the console the option is ignored: the console's side of
+ * it is always built.) */
+#if defined(ENABLE_KERNEL_PRESENCE_BEACON) && \
+    !defined(FRKERNEL_INTERFACE_LORA) && !defined(FRKERNEL_INTERFACE_LORA_CONSOLE)
+#  error "build_config.h: ENABLE_KERNEL_PRESENCE_BEACON needs FRKERNEL_INTERFACE_LORA"
 #endif
 /* Tag UART commands arrive on the debug UART. */
 #if defined(FRKERNEL_INTERFACE_UART) && !defined(DEBUG_OUTPUT_UART)

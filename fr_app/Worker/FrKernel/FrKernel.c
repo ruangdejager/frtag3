@@ -1355,15 +1355,103 @@ static bool FRKERNEL_bBusy(void)
            (RADIOTESTMODE_bActive() && RADIOTESTMODE_bIsListener());
 }
 
+/* -------------------------------------------------------------------------- */
+/* Presence beacon                                                            */
+/* -------------------------------------------------------------------------- */
+
+#if defined(ENABLE_KERNEL_PRESENCE_BEACON) && defined(FRKERNEL_INTERFACE_LORA)
+/* Tick the next beacon is due. Runs on this task only. Starts "due now", so
+ * the first beacon goes out as soon as the device is first idle. */
+static uint32_t s_u32NextPresence = 0U;
+
+static uint32_t FRKERNEL_u32PresenceGapMs(void)
+{
+    return FRKERNEL_PRESENCE_MIN_MS +
+           (MESHNETWORK_u32Random() %
+            (FRKERNEL_PRESENCE_MAX_MS - FRKERNEL_PRESENCE_MIN_MS + 1U));
+}
+
+/* How long this task may block while idle: until the next beacon is due. */
+static uint32_t FRKERNEL_u32IdleWaitMs(void)
+{
+    int32_t i32Left = (int32_t)(s_u32NextPresence - osKernelGetTickCount());
+    return (i32Left > 0) ? (uint32_t)i32Left : 1U;
+}
+
+/* Send a presence beacon if one is due and the device is free for it. A
+ * beacon that is due but not allowed is not sent late: the next one is simply
+ * scheduled a full random gap later, so a tag never fires a burst of beacons
+ * the moment it comes free (and a herd waking together does not beacon in
+ * step afterwards).
+ *
+ * The connect window is opened BEFORE the radio is asked for the beacon: the
+ * console's CONNECT can be parsed within ~50 ms of the request, and it must
+ * not find the window still closed. If the radio refuses (it is not asleep -
+ * someone owns it), the window is taken back. */
+static void FRKERNEL_vServicePresence(void)
+{
+    const uint32_t u32Now = osKernelGetTickCount();
+    if ((int32_t)(s_u32NextPresence - u32Now) > 0)
+        return;
+    s_u32NextPresence = u32Now + FRKERNEL_u32PresenceGapMs();
+
+    if (s_bActive || FRKERNEL_bWindowOpen() || !DEVICE_DISCOVERY_bPresenceAllowed())
+        return;
+
+    uint8_t au8Frame[FRK_PRESENCE_LEN];
+    au8Frame[0] = (uint8_t)MeshPktType_Presence;
+    FRK_vPutU32(&au8Frame[FRK_PRESENCE_OFS_ID], LORARADIO_u32GetUniqueId());
+    au8Frame[FRK_PRESENCE_OFS_FLAGS] = (uint8_t)(
+        ((DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY) ? FRK_PRESENCE_F_PRIMARY : 0U) |
+        ((MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_LORAWAN) ? FRK_PRESENCE_F_LORAWAN : 0U));
+
+    FRKERNEL_vOpenWindow(FRKERNEL_WINDOW_PRESENCE, FRKERNEL_PRESENCE_CONNECT_MS);
+    if (!LORARADIO_bStartBeaconWindow(au8Frame, (uint8_t)sizeof(au8Frame),
+                                      FRKERNEL_PRESENCE_LISTEN_MS))
+    {
+        if (s_eWindow == FRKERNEL_WINDOW_PRESENCE)
+            FRKERNEL_vCloseWindow();
+    }
+}
+
+/* Radio-task hook (LoraRadio.h): a packet arrived in the beacon's listen
+ * window. Keep the radio awake only for a CONNECT that is about to open a
+ * session here - the same test FRKERNEL_vHandleFrame applies - so a foreign
+ * frame that happened to land in the window never leaves the chip burning RX
+ * with no owner to sleep it again. Reads only volatile state; does not block. */
+bool LORARADIO_bKeepAwakeAfterWindow(const LoraRadio_Packet_t *pRx)
+{
+    if ((pRx->length < (1U + FRK_HDR_LEN)) ||
+        (pRx->buffer[0] != (uint8_t)MeshPktType_FrKernel))
+        return false;
+
+    const uint8_t *pF = &pRx->buffer[1];
+    if ((pF[FRK_OFS_VERSION] != FRK_PROTO_VERSION) ||
+        (pF[FRK_OFS_KIND] != (uint8_t)FRK_KIND_CONNECT))
+        return false;
+
+    const uint32_t u32Id = FRK_u32GetU32(&pF[FRK_OFS_ID]);
+    if (!LORARADIO_bIsOwnId(u32Id) && (u32Id != FRK_ID_BULK))
+        return false;
+
+    return !s_bActive && (s_eWindow == FRKERNEL_WINDOW_PRESENCE) && FRKERNEL_bWindowOpen();
+}
+#endif /* ENABLE_KERNEL_PRESENCE_BEACON && FRKERNEL_INTERFACE_LORA */
+
 static void FRKERNEL_vTask(void *arg)
 {
     (void)arg;
 
     for (;;)
     {
+#if defined(ENABLE_KERNEL_PRESENCE_BEACON) && defined(FRKERNEL_INTERFACE_LORA)
+        const uint32_t u32IdleWait = FRKERNEL_u32IdleWaitMs();
+#else
+        const uint32_t u32IdleWait = osWaitForever;
+#endif
         (void)osThreadFlagsWait(FRKERNEL_FLAG_UART | FRKERNEL_FLAG_LORA,
                                 osFlagsWaitAny,
-                                s_bActive ? FRKERNEL_POLL_INTERVAL_MS : osWaitForever);
+                                s_bActive ? FRKERNEL_POLL_INTERVAL_MS : u32IdleWait);
 
 #ifdef FRKERNEL_INTERFACE_UART
         FRKERNEL_vServiceUart();
@@ -1376,7 +1464,12 @@ static void FRKERNEL_vTask(void *arg)
 #endif
 
         if (!s_bActive)
+        {
+#if defined(ENABLE_KERNEL_PRESENCE_BEACON) && defined(FRKERNEL_INTERFACE_LORA)
+            FRKERNEL_vServicePresence();
+#endif
             continue;
+        }
 
         if (s_bEndRequested)
         {

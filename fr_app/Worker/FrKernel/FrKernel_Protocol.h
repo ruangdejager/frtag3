@@ -131,6 +131,31 @@ typedef enum {
 } FrkKind_e;
 
 /* -------------------------------------------------------------------------- */
+/* Presence beacon                                                            */
+/* -------------------------------------------------------------------------- */
+
+/* A sleeping tag's beacon, sent every FRKERNEL_PRESENCE_MIN_MS..MAX_MS while
+ * it sits between scheduled wakes (FRKERNEL_vServicePresence). It is NOT a
+ * FrKernel frame - it has its own mesh type so a tag's parser never has to
+ * look inside it - and it is followed by a FRKERNEL_PRESENCE_LISTEN_MS
+ * receive window in which a CONNECT (single or bulk) opens a session exactly
+ * as one in the shake or wake window would.
+ *
+ *   [0]    MeshPktType_Presence
+ *   [1..4] the tag's id, little-endian u32 (same encoding as FRK_OFS_ID)
+ *   [5]    flags, FRK_PRESENCE_F_*
+ *
+ * Six bytes plus the radio's CRC byte: ~15 ms on air at SF7/BW250, which is
+ * most of what a beacon costs. Later versions may append bytes; a listener
+ * must accept a longer frame and ignore what it does not know. */
+#define FRK_PRESENCE_OFS_ID       1U
+#define FRK_PRESENCE_OFS_FLAGS    5U
+#define FRK_PRESENCE_LEN          6U
+
+#define FRK_PRESENCE_F_PRIMARY    0x01U   /* sent by a primary               */
+#define FRK_PRESENCE_F_LORAWAN    0x02U   /* discovery mode is LoRaWAN       */
+
+/* -------------------------------------------------------------------------- */
 /* Command set                                                                */
 /* -------------------------------------------------------------------------- */
 

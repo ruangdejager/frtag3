@@ -20,7 +20,25 @@
  *              pass with no typing. Bulk tags never reply; queries are refused
  *              locally. Every bulk command is sent three times (tags dedupe).
  *   c off      stop connecting / forget the connection (tags time out).
- *   scan       list tags that are just-shaken or already connected.
+ *   scan       keep listing tags until "scan off": every tag whose presence
+ *              beacon is heard (an idle tag beacons every 10-20 s, see
+ *              FRKERNEL_PRESENCE_MIN_MS), and every tag that was just shaken
+ *              or is connected (asked with a SCAN frame every few seconds).
+ *              Each tag is numbered once, in the order it first appears,
+ *              "5678EFDA [1] ...", and the numbering restarts with every scan.
+ *              Tags in their scheduled 5 s wake window stay quiet.
+ *   scan bulk  as scan, and every beaconing tag is pulled into a bulk session
+ *              at once: the console answers its beacon with CONNECT(bulk)
+ *              inside the tag's listen window. Joined tags stop beaconing, so
+ *              "if not already connected" takes care of itself.
+ *   scan off   stop listing (and, after scan bulk, stop pulling tags in; the
+ *              bulk session itself carries on).
+ *   c 3        connect to entry 3 of the latest scan. One or two decimal
+ *              digits is a list number; an id is 4 or 8 hex digits. For a tag
+ *              listed from its beacon the console sends nothing until that
+ *              tag's next beacon, then answers it with CONNECT at once
+ *              (LORARADIO_bFastReply below: no queue, no carrier sense, long
+ *              preamble) so it lands in the tag's ~30 ms listen window.
  *   dbg        toggle this console's own debug output.
  *   ?          help.
  *   <letter> [arg]   a tag command (FrKernel_Commands.c), sent on Enter.
@@ -67,7 +85,29 @@
 
 #define CON_FLAG_UART  0x01U
 #define CON_FLAG_LORA  0x02U
+#define CON_FLAG_PRES  0x04U
 #define CON_TICK_MS    100U
+
+/* What the radio task's fast-reply hook answers a presence beacon with. */
+typedef enum {
+    CON_FAST_NONE,
+    CON_FAST_SINGLE,   /* CONNECT to s_u32FastId, when that tag beacons */
+    CON_FAST_BULK,     /* CONNECT(bulk) to every tag that beacons       */
+} ConFast_e;
+
+/* How a scan entry was found: decides how "c <n>" reaches it. */
+typedef enum {
+    CON_SRC_BEACON,    /* heard its presence beacon: answer the next one */
+    CON_SRC_SHAKE,     /* answered SCAN (shaken / connected): CONNECT    */
+} ConSrc_e;
+
+/* One presence beacon, parser task -> console task. */
+typedef struct {
+    uint32_t u32Id;
+    int16_t  i16Rssi;
+    uint8_t  u8Flags;
+    bool     bConnectSent;   /* the radio task already answered it */
+} ConPresence_t;
 
 typedef enum {
     CON_IDLE,
@@ -112,6 +152,30 @@ static char      s_acLine[FRKERNEL_LINE_BUF_LEN];
 static uint8_t   s_u8LineLen        = 0U;
 
 static bool      s_bDbgMuted        = true;
+
+/* Latest scan: its seq (0 = no scan yet; 0 is never a command seq; every SCAN
+ * query of one scan carries the same seq) and the tags it found, in the order
+ * they first appeared. Entry i is "[i + 1]" on screen. The list outlives the
+ * scan, so "c <n>" still works after "scan off". */
+static bool      s_bScanning        = false;
+static bool      s_bScanBulk        = false;
+static uint32_t  s_u32NextScanQuery = 0U;
+static uint8_t   s_u8ScanSeq        = 0U;
+static uint8_t   s_u8ScanCount      = 0U;
+static uint32_t  s_au32ScanIds[FRKERNEL_CON_SCAN_MAX];
+static uint8_t   s_au8ScanSrc[FRKERNEL_CON_SCAN_MAX];
+
+/* Connecting: whether the 1 s CONNECT repeat runs. Off when the target is
+ * reached through its beacon instead: the repeats would only keep this radio
+ * transmitting when it should be listening for that beacon. */
+static bool      s_bConnectRepeat   = true;
+
+/* Read by the radio task (LORARADIO_bFastReply), written by the console
+ * task. Two aligned words; the id is written before the mode is armed. */
+static volatile uint8_t  s_eFast    = CON_FAST_NONE;
+static volatile uint32_t s_u32FastId = 0U;
+
+static osMessageQueueId_t s_presQueue = NULL;
 
 static void CON_vTask(void *arg);
 
@@ -194,12 +258,16 @@ static void CON_vHelp(void)
     static const char *const apcLines[] = {
         "\r\nConsole:\r\n",
         "  c <id>     connect to one tag (repeats until it answers)\r\n",
+        "  c <n>      connect to entry n of the latest scan\r\n",
         "  c bulk     connect to every tag in range (no replies)\r\n",
         "  c off      stop / forget the connection\r\n",
-        "  scan       list tags that were just shaken or are connected\r\n",
+        "  scan       list beaconing, shaken and connected tags until 'scan off'\r\n",
+        "  scan bulk  as scan, and pull every beaconing tag into a bulk session\r\n",
+        "  scan off   stop scanning\r\n",
         "  dbg        toggle this console's own debug output\r\n",
-        "A tag only listens for a connect for 2 min after its shake\r\n",
-        "sequence, and for the first 5 s of each discovery wake.\r\n\r\n",
+        "A tag listens for a connect ~30 ms after each presence beacon\r\n",
+        "(every 10-20 s while idle), 2 min after its shake sequence, and\r\n",
+        "for the first 5 s of each discovery wake.\r\n\r\n",
     };
     for (size_t i = 0U; i < (sizeof(apcLines) / sizeof(apcLines[0])); i++)
         CON_vPut(apcLines[i]);
@@ -212,10 +280,109 @@ static void CON_vHelp(void)
 
 static void CON_vResetConnection(void)
 {
-    s_eMode       = CON_IDLE;
-    s_bPending    = false;
-    s_bBulkBeacon = false;
-    s_bStreaming  = false;
+    s_eFast          = CON_FAST_NONE;    /* first: the radio task reads it */
+    s_eMode          = CON_IDLE;
+    s_bPending       = false;
+    s_bBulkBeacon    = false;
+    s_bStreaming     = false;
+    s_bConnectRepeat = true;
+    if (s_bScanBulk)
+    {
+        s_bScanBulk = false;
+        s_bScanning = false;
+    }
+}
+
+/* Start calling u32Id. bRepeat: send CONNECT every second (shaken tag, wake
+ * window). The fast reply to its beacon is armed either way - a tag that is
+ * idle answers through its beacon whatever the operator typed. */
+static void CON_vStartConnecting(uint32_t u32Id, bool bRepeat)
+{
+    CON_vResetConnection();
+    s_bScanning       = false;           /* the list stays for "c <n>" */
+    s_eMode           = CON_CONNECTING;
+    s_u32Target       = u32Id;
+    s_bConnectRepeat  = bRepeat;
+    s_u32ConnectStart = osKernelGetTickCount();
+    s_u32NextConnect  = s_u32ConnectStart;
+    s_u32NextNote     = s_u32ConnectStart + FRKERNEL_CON_WAIT_NOTE_MS;
+    s_u32FastId       = u32Id;
+    s_eFast           = CON_FAST_SINGLE; /* last: arms the radio task */
+}
+
+/* Add a tag to the scan list. Returns its 1-based number, or 0 if the list is
+ * full; *pbNew says whether it was just added (so it is printed only once). */
+static uint8_t CON_u8ScanAdd(uint32_t u32Id, ConSrc_e eSrc, bool *pbNew)
+{
+    *pbNew = false;
+    for (uint8_t i = 0U; i < s_u8ScanCount; i++)
+    {
+        if (s_au32ScanIds[i] == u32Id)
+        {
+            /* A tag first seen by its beacon and later shaken is now best
+             * reached by CONNECT; never the other way round. */
+            if (eSrc == CON_SRC_SHAKE)
+                s_au8ScanSrc[i] = (uint8_t)CON_SRC_SHAKE;
+            return (uint8_t)(i + 1U);
+        }
+    }
+    if (s_u8ScanCount >= FRKERNEL_CON_SCAN_MAX)
+        return 0U;
+    s_au32ScanIds[s_u8ScanCount] = u32Id;
+    s_au8ScanSrc[s_u8ScanCount]  = (uint8_t)eSrc;
+    s_u8ScanCount++;
+    *pbNew = true;
+    return s_u8ScanCount;
+}
+
+static void CON_vScanCmd(const char *pcArg)
+{
+    if ((strcmp(pcArg, "off") == 0) || (strcmp(pcArg, "stop") == 0))
+    {
+        if (s_bScanBulk)
+        {
+            s_eFast     = CON_FAST_NONE;
+            s_bScanBulk = false;
+            CON_vPut("scan stopped - no more tags pulled in; the bulk session carries on\r\n");
+        }
+        else
+        {
+            CON_vPut(s_bScanning ? "scan stopped\r\n" : "not scanning\r\n");
+        }
+        s_bScanning = false;
+        return;
+    }
+
+    const bool bBulk = (strcmp(pcArg, "bulk") == 0);
+    if (!bBulk && (*pcArg != '\0'))
+    {
+        CON_vPut("usage: scan | scan bulk | scan off\r\n");
+        return;
+    }
+
+    /* A fresh scan starts the numbering over. */
+    s_u8ScanSeq   = CON_u8NextSeq();
+    s_u8ScanCount = 0U;
+
+    if (bBulk)
+    {
+        CON_vResetConnection();
+        s_eMode      = CON_BULK;
+        s_bBulkBeacon = false;           /* beacon-driven only, see header */
+        s_bScanBulk  = true;
+        s_bScanning  = true;
+        s_eFast      = CON_FAST_BULK;
+        CON_vPut("scan bulk: every tag that beacons is listed and pulled into the\r\n"
+                 "bulk session at once ('scan off' stops that). Bulk commands go to\r\n"
+                 "all joined tags; joined tags stop beaconing.\r\n");
+        FRK_vPrintHelp(CON_vPut, true);
+        return;
+    }
+
+    s_bScanning        = true;
+    s_u32NextScanQuery = osKernelGetTickCount();   /* first query now */
+    CON_vPut("scanning - beaconing tags (every 10-20 s), shaken and connected\r\n"
+             "tags are listed as they appear; 'c <n>' connects, 'scan off' stops\r\n");
 }
 
 static void CON_vConnectCmd(const char *pcArg)
@@ -242,11 +409,39 @@ static void CON_vConnectCmd(const char *pcArg)
 
     if (*pcArg == '\0')
     {
-        CON_vPut("usage: c <id> | c bulk | c off\r\n");
+        CON_vPut("usage: c <id> | c <n> | c bulk | c off\r\n");
         return;
     }
 
     char *pcEnd;
+
+    /* "c <n>": one or two decimal digits pick an entry of the latest scan.
+     * No real id is that short (ids are 4 or 8 hex digits), so the two forms
+     * cannot be confused. */
+    const size_t szArgLen = strlen(pcArg);
+    if ((szArgLen <= 2U) && isdigit((unsigned char)pcArg[0]) &&
+        ((szArgLen == 1U) || isdigit((unsigned char)pcArg[1])))
+    {
+        const unsigned long ulN = strtoul(pcArg, NULL, 10);
+        if ((ulN == 0UL) || (ulN > s_u8ScanCount))
+        {
+            if (s_u8ScanCount == 0U)
+                CON_vPut("no scan entries - 'scan' first\r\n");
+            else
+                _DBG_("no scan entry %lu - the latest scan has 1..%u\r\n",
+                      ulN, (unsigned)s_u8ScanCount);
+            return;
+        }
+        const bool bByBeacon = (s_au8ScanSrc[ulN - 1UL] == (uint8_t)CON_SRC_BEACON);
+        CON_vStartConnecting(s_au32ScanIds[ulN - 1UL], !bByBeacon);
+        if (bByBeacon)
+            _DBG_("connecting to %08" PRIX32 " [%lu] - waiting for its next beacon"
+                  " (10-20 s)...\r\n", s_u32Target, ulN);
+        else
+            _DBG_("connecting to %08" PRIX32 " [%lu]...\r\n", s_u32Target, ulN);
+        return;
+    }
+
     /* 4 digits (the legacy id, still printed on older tags and labels) or 8
      * (the full id). A 4-digit target reaches every tag sharing those 16 bits;
      * the first one to answer pins the connection to its full id - see
@@ -259,14 +454,9 @@ static void CON_vConnectCmd(const char *pcArg)
         return;
     }
 
-    CON_vResetConnection();
-    s_eMode          = CON_CONNECTING;
-    s_u32Target      = u32Id;
-    s_u32ConnectStart = osKernelGetTickCount();
-    s_u32NextConnect = s_u32ConnectStart;
-    s_u32NextNote    = s_u32ConnectStart + FRKERNEL_CON_WAIT_NOTE_MS;
-    _DBG_("connecting to %04" PRIX32 " - shake it, or wait for its next discovery\r\n"
-          "wake. 'c off' stops calling.\r\n", u32Id);
+    CON_vStartConnecting(u32Id, true);
+    _DBG_("connecting to %04" PRIX32 " - at its next beacon, its shake, or its next\r\n"
+          "discovery wake. 'c off' stops calling.\r\n", u32Id);
 }
 
 static void CON_vSendCommand(const char *pcLine)
@@ -354,10 +544,13 @@ static void CON_vRunLine(char *pcLine)
             pcArg++;
         CON_vConnectCmd(pcArg);
     }
-    else if (strcmp(pcLine, "scan") == 0)
+    else if ((strncmp(pcLine, "scan", 4U) == 0) &&
+             ((pcLine[4] == '\0') || (pcLine[4] == ' ')))
     {
-        (void)CON_bSend(FRK_KIND_SCAN, FRK_ID_BULK, CON_u8NextSeq(), NULL);
-        CON_vPut("scan sent - shaken/connected tags answer within ~2 s\r\n");
+        const char *pcArg = &pcLine[4];
+        while (*pcArg == ' ')
+            pcArg++;
+        CON_vScanCmd(pcArg);
     }
     else if (strcmp(pcLine, "dbg") == 0)
     {
@@ -453,8 +646,34 @@ static void CON_vHandleFrame(const ConFrame_t *pF)
     {
     case FRK_KIND_REPLY:
     {
+        /* An answer to the current scan's SCAN query: list it the first time
+         * only - the query repeats every few seconds and a shaken tag answers
+         * each one. Checked first because a tag being called with "c" can also
+         * answer the scan, and its scan answer is not the connect reply. */
+        if ((s_u8ScanSeq != 0U) && (u8Seq == s_u8ScanSeq))
+        {
+            if (s_bScanning)
+            {
+                bool bNew;
+                const uint8_t u8N = CON_u8ScanAdd(u32Id, CON_SRC_SHAKE, &bNew);
+                if (bNew || (u8N == 0U))
+                {
+                    char acMsg[FRK_MAX_PAYLOAD + 40U];
+                    if (u8N != 0U)
+                        (void)snprintf(acMsg, sizeof(acMsg), "%08" PRIX32 " [%u]  %s",
+                                       u32Id, (unsigned)u8N, acText);
+                    else
+                        (void)snprintf(acMsg, sizeof(acMsg), "%08" PRIX32 " [-]  %s  (list full)",
+                                       u32Id, acText);
+                    CON_vAsync(acMsg);
+                }
+            }
+            break;
+        }
+
         if ((s_eMode == CON_CONNECTING) && bFromTarget)
         {
+            s_eFast = CON_FAST_NONE;     /* connected: stop answering beacons */
             /* Pin to the full id of whichever tag answered first. Commands
              * addressed by a 16-bit id would reach every tag that shares it;
              * after this they reach only the one actually connected, and a
@@ -563,6 +782,98 @@ void UART2_vNotifyOnRX(void)
 }
 
 /* -------------------------------------------------------------------------- */
+/* Presence beacons                                                           */
+/* -------------------------------------------------------------------------- */
+
+/* Is this presence beacon one the fast reply answers right now? Shared by the
+ * radio-task hook (which sends the CONNECT) and the console task (which only
+ * reports that it was sent), so the two cannot disagree. */
+static bool CON_bFastWants(uint32_t u32Id)
+{
+    const uint8_t eFast = s_eFast;
+    if (eFast == (uint8_t)CON_FAST_BULK)
+        return true;
+    return (eFast == (uint8_t)CON_FAST_SINGLE) && LORARADIO_bSameDevice(u32Id, s_u32FastId);
+}
+
+/* Radio-task hook (LoraRadio.h). A beacon from a tag we want: answer it with
+ * CONNECT now, inside its listen window - the radio layer sends this before it
+ * even queues the beacon, with no carrier sense and a long preamble. Reads two
+ * volatile words and builds 11 bytes; nothing here blocks. */
+bool LORARADIO_bFastReply(const LoraRadio_Packet_t *pRx, uint8_t *pu8Reply,
+                          uint8_t *pu8ReplyLen)
+{
+    if ((pRx->length < FRK_PRESENCE_LEN) ||
+        (pRx->buffer[0] != (uint8_t)MeshPktType_Presence))
+        return false;
+
+    const uint32_t u32Id = FRK_u32GetU32(&pRx->buffer[FRK_PRESENCE_OFS_ID]);
+    if (!CON_bFastWants(u32Id))
+        return false;
+
+    /* Single: address the beacon's own full id, which is also what a 16-bit
+     * target typed by the operator gets pinned to on the tag's answer. */
+    const uint32_t u32To = (s_eFast == (uint8_t)CON_FAST_BULK) ? FRK_ID_BULK : u32Id;
+
+    pu8Reply[0] = (uint8_t)MeshPktType_FrKernel;
+    uint8_t *pF = &pu8Reply[1];
+    pF[FRK_OFS_VERSION] = FRK_PROTO_VERSION;
+    pF[FRK_OFS_KIND]    = (uint8_t)FRK_KIND_CONNECT;
+    FRK_vPutU32(&pF[FRK_OFS_ID], u32To);
+    pF[FRK_OFS_SEQ]     = 0U;
+    *pu8ReplyLen = (uint8_t)(1U + FRK_HDR_LEN);
+    return true;
+}
+
+/* Override the weak MeshNetwork callback - parser task. Only queue. */
+void MESHNETWORK_vOnPresence(const uint8_t *buf, uint8_t len, int16_t i16Rssi)
+{
+    if ((s_presQueue == NULL) || (len < FRK_PRESENCE_LEN))
+        return;
+
+    ConPresence_t tP;
+    tP.u32Id        = FRK_u32GetU32(&buf[FRK_PRESENCE_OFS_ID]);
+    tP.i16Rssi      = i16Rssi;
+    tP.u8Flags      = buf[FRK_PRESENCE_OFS_FLAGS];
+    tP.bConnectSent = CON_bFastWants(tP.u32Id);
+    if ((osMessageQueuePut(s_presQueue, &tP, 0U, 0U) == osOK) && (s_taskHandle != NULL))
+        osThreadFlagsSet(s_taskHandle, CON_FLAG_PRES);
+}
+
+static void CON_vHandlePresence(const ConPresence_t *pP)
+{
+    char acMsg[112];
+
+    if (s_bScanning)
+    {
+        bool bNew;
+        const uint8_t u8N = CON_u8ScanAdd(pP->u32Id, CON_SRC_BEACON, &bNew);
+        if (bNew)
+        {
+            (void)snprintf(acMsg, sizeof(acMsg), "%08" PRIX32 " [%u]  beacon  rssi %d dBm%s%s%s",
+                           pP->u32Id, (unsigned)u8N, (int)pP->i16Rssi,
+                           (pP->u8Flags & FRK_PRESENCE_F_PRIMARY) ? "  primary" : "",
+                           (pP->u8Flags & FRK_PRESENCE_F_LORAWAN) ? "  lorawan" : "",
+                           (s_bScanBulk && pP->bConnectSent) ? "  -> bulk connect sent" : "");
+            CON_vAsync(acMsg);
+            return;
+        }
+        if (u8N == 0U)
+            return;   /* list full: nothing to number it with */
+    }
+
+    /* Already listed (or not scanning): only worth a line when we acted on it.
+     * A bulk tag that beacons again did not join (missed the CONNECT); it is
+     * simply answered again. */
+    if (pP->bConnectSent && (s_eMode == CON_CONNECTING))
+    {
+        (void)snprintf(acMsg, sizeof(acMsg), "%08" PRIX32 " beaconed (rssi %d dBm) - connect sent\r\n",
+                       pP->u32Id, (int)pP->i16Rssi);
+        CON_vAsync(acMsg);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Timers                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -570,8 +881,10 @@ static void CON_vTimers(void)
 {
     const uint32_t u32Now = osKernelGetTickCount();
 
-    /* CONNECT beacon: single until answered, bulk until idle. */
-    if (((s_eMode == CON_CONNECTING) || ((s_eMode == CON_BULK) && s_bBulkBeacon)) &&
+    /* CONNECT beacon: single until answered (unless the target is reached
+     * through its presence beacon instead), bulk until idle. */
+    if ((((s_eMode == CON_CONNECTING) && s_bConnectRepeat) ||
+         ((s_eMode == CON_BULK) && s_bBulkBeacon)) &&
         ((int32_t)(u32Now - s_u32NextConnect) >= 0))
     {
         s_u32NextConnect = u32Now + FRKERNEL_CON_CONNECT_PERIOD_MS;
@@ -579,11 +892,22 @@ static void CON_vTimers(void)
                         (s_eMode == CON_BULK) ? FRK_ID_BULK : s_u32Target, 0U, NULL);
     }
 
+    /* Scan: re-ask for shaken / connected tags every few seconds, so a tag
+     * shaken after the scan started still turns up. Beaconing tags need no
+     * asking. Not in a bulk scan, which is beacon-driven only. */
+    if (s_bScanning && !s_bScanBulk &&
+        ((int32_t)(u32Now - s_u32NextScanQuery) >= 0))
+    {
+        s_u32NextScanQuery = u32Now + FRKERNEL_CON_SCAN_QUERY_MS;
+        (void)CON_bSend(FRK_KIND_SCAN, FRK_ID_BULK, s_u8ScanSeq, NULL);
+    }
+
     if ((s_eMode == CON_CONNECTING) && ((int32_t)(u32Now - s_u32NextNote) >= 0))
     {
         s_u32NextNote = u32Now + FRKERNEL_CON_WAIT_NOTE_MS;
         char acMsg[96];
-        (void)snprintf(acMsg, sizeof(acMsg), "still calling %04" PRIX32 " (%lu s) - 'c off' to stop\r\n",
+        (void)snprintf(acMsg, sizeof(acMsg), "still %s %04" PRIX32 " (%lu s) - 'c off' to stop\r\n",
+                       s_bConnectRepeat ? "calling" : "waiting for a beacon from",
                        s_u32Target, (unsigned long)((u32Now - s_u32ConnectStart) / 1000U));
         CON_vAsync(acMsg);
     }
@@ -636,6 +960,8 @@ void FRKERNEL_vInit(void)
 {
     s_rxQueue = osMessageQueueNew(FRKERNEL_CON_RX_QUEUE_LEN, sizeof(ConFrame_t), NULL);
     configASSERT(s_rxQueue != NULL);
+    s_presQueue = osMessageQueueNew(FRKERNEL_CON_PRES_QUEUE_LEN, sizeof(ConPresence_t), NULL);
+    configASSERT(s_presQueue != NULL);
 
     static const osThreadAttr_t attr = {
         .name       = "FrkConsole",
@@ -664,13 +990,18 @@ static void CON_vTask(void *arg)
 
     for (;;)
     {
-        (void)osThreadFlagsWait(CON_FLAG_UART | CON_FLAG_LORA, osFlagsWaitAny, CON_TICK_MS);
+        (void)osThreadFlagsWait(CON_FLAG_UART | CON_FLAG_LORA | CON_FLAG_PRES,
+                                osFlagsWaitAny, CON_TICK_MS);
 
         CON_vServiceUart();
 
         ConFrame_t tF;
         while (osMessageQueueGet(s_rxQueue, &tF, NULL, 0U) == osOK)
             CON_vHandleFrame(&tF);
+
+        ConPresence_t tP;
+        while (osMessageQueueGet(s_presQueue, &tP, NULL, 0U) == osOK)
+            CON_vHandlePresence(&tP);
 
         CON_vTimers();
     }

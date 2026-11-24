@@ -336,6 +336,14 @@ void               DEVICE_DISCOVERY_vTriggerKernelWakeup(void);
 /* FrKernel -> AppTask: a kernel session has opened (bOpened) or closed. */
 void               DEVICE_DISCOVERY_vOnKernelSession(bool bOpened);
 
+/* FrKernel -> AppTask: may the kernel send a presence beacon now? True only
+ * while the device sits idle between scheduled wakes, in service and on a
+ * normal battery: the AppTask is waiting for its next event (no campaign,
+ * LoRaWAN report or kernel session in progress), no shake is pending, no radio
+ * test runs, the boot window is over, and the unit is not in production
+ * sleep. The radio layer separately refuses unless the chip is asleep. */
+bool               DEVICE_DISCOVERY_bPresenceAllowed(void);
+
 /* Super-deep sleep (secondary only): discovery, acc logging and scheduled
  * wakes all stop; the STOP2 indicator goes green. The two variants differ
  * only in what may wake the device again:

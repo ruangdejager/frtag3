@@ -18,6 +18,39 @@
 
 #define LORA_MAX_PACKET_SIZE        (256)
 
+/* ---- Beacon + listen window, and the fast reply that answers it ----
+ *
+ * A sleeping tag announces itself with a tiny beacon and then listens for a
+ * few tens of ms (LORARADIO_bStartBeaconWindow). A listener that wants it -
+ * the kernel console - answers inside that window (LORARADIO_bFastReply).
+ * Timeline, measured from the end of the beacon on both sides:
+ *
+ *   tag      TX done -> ~4-5 ms TCXO + SetRx -> receiver live -> window timer
+ *   console  RX done -> read + build (~1 ms) -> ~4 ms TCXO + PLL -> preamble
+ *
+ * The two start within a few ms of each other, so the answer goes out with a
+ * long preamble (32 symbols = 16.4 ms at SF7/BW250) that is still on the air
+ * whenever the tag's receiver comes up, and the tag's timer only has to
+ * cover the start of that preamble (stop-on-preamble-detect does the rest). */
+#define LORA_FAST_REPLY_PREAMBLE_LENGTH 32U
+
+/* Longest fast reply a listener may build (a kernel CONNECT is 11 B). */
+#define LORA_FAST_REPLY_MAX_LEN         24U
+
+/* Longest beacon frame LORARADIO_bStartBeaconWindow takes (type + id + flags
+ * is 6 B); kept tiny because every byte is airtime on a sleeping tag. */
+#define LORA_BEACON_FRAME_MAX           8U
+
+/* After the listen window's timer expires (or a preamble stopped it), how long
+ * the radio task waits for the chip to report the outcome. Covers a full
+ * long-preamble CONNECT (~30 ms on air) with margin. */
+#define LORA_BEACON_WINDOW_TAIL_MS      150U
+
+/* How long LORARADIO_vWakeUp / LORARADIO_vEnterDeepSleep wait for a beacon
+ * window in progress to finish before they take the chip anyway. A window is
+ * ~60 ms end to end; this is only reached if something went wrong. */
+#define LORA_BEACON_WAIT_MAX_MS         300U
+
 /* ---- Radio device id (see LORARADIO_u32GetUniqueId) ----
  *
  * The id's high half is [15:8] wafer number, [7:0] a CRC-8 over the 7 lot

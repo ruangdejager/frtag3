@@ -147,10 +147,27 @@ static volatile uint32_t u32LastTxDoneTick = 0U;
  * into that TX. */
 static volatile bool bTxInFlight = false;
 
+/* Chip power state as this layer last set it (see LORARADIO_bIsAsleep). True
+ * from LORARADIO_vInit's sleep until the radio task's first wake. */
+static volatile bool    bAsleep            = true;
+
+/* Beacon + listen window (LORARADIO_bStartBeaconWindow). bWindowBusy is the
+ * claim: set under a critical section by the requester only while the chip is
+ * asleep, cleared by the radio task when the window is over. vWakeUp and
+ * vEnterDeepSleep wait for it, which is the whole of the coordination with the
+ * chip's other owners. The frame is a few bytes of static, not a packet: the
+ * full 264 B LoraRadio_Packet_t would not fit in this build's RAM. */
+static volatile bool    bWindowBusy        = false;
+static uint8_t          au8WindowFrame[LORA_BEACON_FRAME_MAX + 1U];  /* + CRC */
+static uint8_t          u8WindowFrameLen   = 0U;
+static uint32_t         u32WindowListenMs  = 0U;
+
 /* -------------------------------------------------------------------------- */
 
 static uint8_t LORARADIO_u8CRC8_Calculate(const uint8_t *data, uint16_t len);
 static void    LORARADIO_vNotifyFromISR(uint32_t evt);
+static void    LORARADIO_vRunBeaconWindow(void);
+static void    LORARADIO_vWaitBeaconWindow(void);
 
 static inline void LORARADIO_vStashPendingEvents(uint32_t evt)
 {
@@ -276,6 +293,16 @@ void LORARADIO_vRadioTask(void *arg)
         /* Merge any stashed events from a carrier-sense interruption */
         events |= LORARADIO_u32ConsumePendingEvents();
 
+        /* ---------- BEACON + LISTEN WINDOW ----------
+         * Only ever requested while the chip sleeps, so nothing else below
+         * can be in progress; the window owns the chip until it returns. */
+        if (events & RADIO_EVT_BEACON_WINDOW)
+        {
+            LORARADIO_vRunBeaconWindow();
+            events &= ~RADIO_EVT_BEACON_WINDOW;
+            events |= LORARADIO_u32ConsumePendingEvents();
+        }
+
         /* ---------- NOISE FLOOR ----------
          * A bare 50 ms timeout with nothing queued: no IRQ fired, no TX is
          * waiting, and every path out of this loop leaves the chip in
@@ -320,6 +347,26 @@ void LORARADIO_vRadioTask(void *arg)
                 if (crc == crc_rx)
                 {
                     pkt.length--;
+
+                    /* Fast reply BEFORE anything else - the sender is
+                     * listening for only a few tens of ms. No carrier sense
+                     * (the sender has just finished, the channel is ours) and
+                     * no queue: transmitted from here, then the packet that
+                     * triggered it is queued as usual. */
+                    uint8_t au8Reply[LORA_FAST_REPLY_MAX_LEN + 1U];
+                    uint8_t u8ReplyLen = 0U;
+                    if (LORARADIO_bFastReply(&pkt, au8Reply, &u8ReplyLen) &&
+                        (u8ReplyLen > 0U) && (u8ReplyLen <= LORA_FAST_REPLY_MAX_LEN))
+                    {
+                        au8Reply[u8ReplyLen] = LORARADIO_u8CRC8_Calculate(au8Reply, u8ReplyLen);
+                        bTxInFlight = true;
+                        (void)LORARADIO_DRIVER_bTransmitPayloadEx(au8Reply, (uint8_t)(u8ReplyLen + 1U),
+                                                                  LORA_FAST_REPLY_PREAMBLE_LENGTH,
+                                                                  false);
+                        u32LastTxDoneTick = osKernelGetTickCount();
+                        bTxInFlight       = false;
+                    }
+
                     osMessageQueuePut(xLoRaRxQueue, &pkt, 0, 0);
                 }
                 else
@@ -769,14 +816,183 @@ void LORARADIO_vEnterDeepSleep(void)
     if (bKeepAwake)
         return;
 
+    LORARADIO_vWaitBeaconWindow();
     LORARADIO_DRIVER_vEnterDeepSleep();
+    bAsleep = true;
 }
 
-void LORARADIO_vWakeUp(void)         { LORARADIO_DRIVER_vWakeUp(); }
+/* Wait (bounded) for a beacon window to finish, then mark the chip as taken so
+ * no new window can start on it. The claim and the test are one critical
+ * section: a window request checks bAsleep under the same lock, so once this
+ * returns no window can be starting behind the caller's back. */
+static void LORARADIO_vClaimFromBeaconWindow(void)
+{
+    const uint32_t u32Start = osKernelGetTickCount();
+    for (;;)
+    {
+        taskENTER_CRITICAL();
+        if (!bWindowBusy)
+        {
+            bAsleep = false;
+            taskEXIT_CRITICAL();
+            return;
+        }
+        taskEXIT_CRITICAL();
+
+        if ((osKernelGetTickCount() - u32Start) >= LORA_BEACON_WAIT_MAX_MS)
+        {
+            DBG_LOG("Loraradio: beacon window overran %u ms - taking the radio\r\n",
+                    (unsigned)LORA_BEACON_WAIT_MAX_MS);
+            bAsleep = false;
+            return;
+        }
+        osDelay(2);
+    }
+}
+
+static void LORARADIO_vWaitBeaconWindow(void)
+{
+    const uint32_t u32Start = osKernelGetTickCount();
+    while (bWindowBusy &&
+           ((osKernelGetTickCount() - u32Start) < LORA_BEACON_WAIT_MAX_MS))
+        osDelay(2);
+}
+
+void LORARADIO_vWakeUp(void)
+{
+    LORARADIO_vClaimFromBeaconWindow();
+    LORARADIO_DRIVER_vWakeUp();
+}
 
 void LORARADIO_vSetKeepAwake(bool bEnable)
 {
     bKeepAwake = bEnable;
+}
+
+bool LORARADIO_bIsAsleep(void)
+{
+    return bAsleep;
+}
+
+/* --------------------------------------------------------------------------
+ * Beacon + listen window
+ * -------------------------------------------------------------------------- */
+bool LORARADIO_bStartBeaconWindow(const uint8_t *pu8Frame, uint8_t u8Len,
+                                  uint32_t u32ListenMs)
+{
+    if ((pu8Frame == NULL) || (u8Len == 0U) || (u8Len > LORA_BEACON_FRAME_MAX) ||
+        (LORARADIO_vRadioTask_handle == NULL))
+        return false;
+
+    taskENTER_CRITICAL();
+    if (!bAsleep || bKeepAwake || bWindowBusy)
+    {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    bWindowBusy = true;
+    taskEXIT_CRITICAL();
+
+    memcpy(au8WindowFrame, pu8Frame, u8Len);
+    u8WindowFrameLen  = u8Len;
+    u32WindowListenMs = u32ListenMs;
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_BEACON_WINDOW);
+    return true;
+}
+
+/* Radio task. The chip is asleep (cold) and nobody else will touch it until
+ * bWindowBusy clears: re-init, beacon, listen, then sleep again unless the
+ * keep-awake hook claimed what arrived. Every event that is not the window's
+ * own is stashed for the main loop, exactly as carrier sense does. */
+static void LORARADIO_vRunBeaconWindow(void)
+{
+    bool bKeep = false;
+
+    LORARADIO_DRIVER_vInit();
+
+    au8WindowFrame[u8WindowFrameLen] =
+        LORARADIO_u8CRC8_Calculate(au8WindowFrame, u8WindowFrameLen);
+
+    bTxInFlight = true;
+    const bool bSent = LORARADIO_DRIVER_bTransmitPayloadEx(au8WindowFrame,
+                                                           (uint8_t)(u8WindowFrameLen + 1U),
+                                                           LORA_PREAMBLE_LENGTH, false);
+    bTxInFlight = false;
+
+    if (bSent)
+    {
+        u32LastTxDoneTick = osKernelGetTickCount();
+        LORARADIO_DRIVER_vEnterRxWindow(u32WindowListenMs);
+
+        const uint32_t u32Start = osKernelGetTickCount();
+        const uint32_t u32Limit = u32WindowListenMs + LORA_BEACON_WINDOW_TAIL_MS;
+        for (;;)
+        {
+            const uint32_t u32Elapsed = osKernelGetTickCount() - u32Start;
+            if (u32Elapsed >= u32Limit)
+                break;
+
+            uint32_t r = osThreadFlagsWait(ALL_FLAGS, osFlagsWaitAny, u32Limit - u32Elapsed);
+            if (r & osFlagsError)
+                break;
+
+            const uint32_t u32Foreign = r & ~(RADIO_EVT_RX_DONE | RADIO_EVT_TIMEOUT |
+                                              RADIO_EVT_CRC_ERROR | RADIO_EVT_HEADER_ERROR);
+            if (u32Foreign != 0U)
+                LORARADIO_vStashPendingEvents(u32Foreign);
+
+            if (r & RADIO_EVT_RX_DONE)
+            {
+                LoraRadio_Packet_t tRx;
+                memset(&tRx, 0, sizeof(tRx));
+                LORARADIO_DRIVER_bReceivePayload(&tRx);
+                tRx.i16NoiseFloor = LORA_NOISE_FLOOR_INVALID;
+                if ((tRx.length >= 2U) &&
+                    (LORARADIO_u8CRC8_Calculate(tRx.buffer, (uint16_t)(tRx.length - 1U)) ==
+                     tRx.buffer[tRx.length - 1U]))
+                {
+                    tRx.length--;
+                    bKeep = LORARADIO_bKeepAwakeAfterWindow(&tRx);
+                    osMessageQueuePut(xLoRaRxQueue, &tRx, 0, 0);
+                }
+                break;
+            }
+            if (r & (RADIO_EVT_TIMEOUT | RADIO_EVT_CRC_ERROR | RADIO_EVT_HEADER_ERROR))
+                break;
+        }
+    }
+
+    SUBGRF_ClearIrqStatus(IRQ_RADIO_ALL);
+
+    if (bKeep)
+    {
+        /* A session is about to own the radio: hand it over awake and in the
+         * normal continuous receive the rest of the firmware expects. */
+        LORARADIO_DRIVER_vEnterRxMode(0);
+        bAsleep = false;
+    }
+    else
+    {
+        LORARADIO_DRIVER_vEnterDeepSleep();
+    }
+
+    bWindowBusy = false;
+}
+
+/* Weak defaults: a build with no beacon listener and no beacon-window user. */
+__attribute__((weak)) bool LORARADIO_bKeepAwakeAfterWindow(const LoraRadio_Packet_t *pRx)
+{
+    (void)pRx;
+    return false;
+}
+
+__attribute__((weak)) bool LORARADIO_bFastReply(const LoraRadio_Packet_t *pRx,
+                                                uint8_t *pu8Reply, uint8_t *pu8ReplyLen)
+{
+    (void)pRx;
+    (void)pu8Reply;
+    (void)pu8ReplyLen;
+    return false;
 }
 
 /* --------------------------------------------------------------------------

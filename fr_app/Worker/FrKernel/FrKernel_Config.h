@@ -37,6 +37,35 @@
  * traffic and costs the campaign nothing when no console is about. */
 #define FRKERNEL_WAKE_WINDOW_MS         5000U
 
+/* ---- Tag: presence beacon (ENABLE_KERNEL_PRESENCE_BEACON) ----------------
+ *
+ * Between scheduled wakes a tag beacons its id every MIN..MAX ms (uniform
+ * random per beacon, from MESHNETWORK_u32Random, so a herd never lines up)
+ * and listens for PRESENCE_LISTEN_MS after each one. A console that wants the
+ * tag answers inside that listen with a CONNECT (LORA_FAST_REPLY_* in
+ * LoraRadio_Config.h), so connecting takes at most MAX ms with no shake and no
+ * waiting for the schedule.
+ *
+ * Cost, estimated from datasheet currents (measure it on the Otii before
+ * trusting it): one beacon is ~18 ms of TX at ~20-25 mA, ~30 ms of RX at
+ * ~5 mA and a few ms of radio re-init and TCXO start, ~0.6 mC in all. At
+ * 10..20 s (15 s on average) that is ~40 uA averaged (~1 mAh a day) - far more
+ * than a sleeping tag's floor, so these two numbers are THE power knob of this
+ * feature: doubling both halves it. 5..15 s was the first choice, ~60 uA. */
+#define FRKERNEL_PRESENCE_MIN_MS        10000U
+#define FRKERNEL_PRESENCE_MAX_MS        20000U
+
+/* Listen after each beacon. The receiver only has to catch the START of the
+ * console's long-preamble CONNECT (stop-on-preamble keeps it receiving to the
+ * end), and that starts ~4-5 ms after the beacon on both sides; 30 ms leaves
+ * room for a slow console without paying for much idle RX. */
+#define FRKERNEL_PRESENCE_LISTEN_MS     30U
+
+/* How long the kernel accepts a CONNECT after asking for a beacon: the beacon,
+ * the listen and the parser hand-off all fit in well under this. Longer would
+ * only let a stray CONNECT that arrived some other way open a session. */
+#define FRKERNEL_PRESENCE_CONNECT_MS    500U
+
 /* Task poll while a session is active (inactivity check). Idle, the task
  * blocks until a command arrives - the v1 task woke every 10 s forever. */
 #define FRKERNEL_POLL_INTERVAL_MS       1000U
@@ -104,6 +133,22 @@
  * times, this far apart. The tags dedupe on seq. */
 #define FRKERNEL_CON_BULK_REPEATS       3U
 #define FRKERNEL_CON_BULK_GAP_MS        400U
+
+/* Scan list on the console: how many answering tags one scan numbers, so the
+ * operator can connect with "c <n>" instead of typing an 8-digit id. Answers
+ * past this still print, unnumbered. 16 x 4 B of console RAM; only the console
+ * build has the list at all. */
+#define FRKERNEL_CON_SCAN_MAX           16U
+
+/* While scanning, how often the console re-sends SCAN so a tag shaken after
+ * the scan began is still listed. Each is ~15 ms on air; tags answer only from
+ * the shake window or a session, so this costs the herd nothing. */
+#define FRKERNEL_CON_SCAN_QUERY_MS      3000U
+
+/* Presence beacons queued from the parser to the console task. A burst of a
+ * whole herd's beacons is spread over 10-20 s, so a few slots are plenty; an
+ * overflow only delays a tag's listing to its next beacon. */
+#define FRKERNEL_CON_PRES_QUEUE_LEN     8U
 
 /* Log stream on the console: no stream frame for this long ends stream mode
  * (the END frame can be lost like any other) with an "incomplete" notice. */

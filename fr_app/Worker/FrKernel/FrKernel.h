@@ -25,6 +25,13 @@
  *   - FRKERNEL_WINDOW_WAKE  for FRKERNEL_WAKE_WINDOW_MS (5 s) at the start of
  *     every discovery wake, inside the quiet wake buffer before any campaign
  *     traffic. A session opened there takes the device out of that campaign.
+ * and the kernel opens one itself:
+ *   - FRKERNEL_WINDOW_PRESENCE for FRKERNEL_PRESENCE_CONNECT_MS around each
+ *     presence beacon (ENABLE_KERNEL_PRESENCE_BEACON): every 10-20 s between
+ *     scheduled wakes, the tag beacons its id and listens ~30 ms. Only a
+ *     console that heard that beacon and answered at once gets in, so it is
+ *     still the operator's deliberate choice of this tag, not a console left
+ *     beaconing.
  * Outside a window a CONNECT is ignored, so a console left beaconing can never
  * pull a tag out of its schedule at an arbitrary moment.
  *
@@ -37,10 +44,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Ordered by precedence: an open window is only ever replaced by a higher one
+ * (see FRKERNEL_vOpenWindow). Not on the wire. */
 typedef enum {
-    FRKERNEL_WINDOW_NONE  = 0,
-    FRKERNEL_WINDOW_WAKE  = 1,   /* first seconds of a discovery wake */
-    FRKERNEL_WINDOW_SHAKE = 2,   /* after the shake sequence          */
+    FRKERNEL_WINDOW_NONE     = 0,
+    FRKERNEL_WINDOW_PRESENCE = 1,   /* listen after a presence beacon     */
+    FRKERNEL_WINDOW_WAKE     = 2,   /* first seconds of a discovery wake  */
+    FRKERNEL_WINDOW_SHAKE    = 3,   /* after the shake sequence           */
 } FrKernelWindow_e;
 
 void FRKERNEL_vInit(void);

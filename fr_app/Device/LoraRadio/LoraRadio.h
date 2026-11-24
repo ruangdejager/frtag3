@@ -25,6 +25,7 @@
 #define RADIO_EVT_CAD_CLEAR     (1UL << 5)
 #define RADIO_EVT_CAD_BUSY      (1UL << 6)
 #define RADIO_EVT_TX_PENDING    (1UL << 7)
+#define RADIO_EVT_BEACON_WINDOW (1UL << 8)   /* run a beacon + listen window */
 
 typedef struct {
     uint8_t  buffer[LORA_MAX_PACKET_SIZE];
@@ -185,5 +186,44 @@ void LORARADIO_vWakeUp(void);
  * this keeps the transceiver able to answer a CAD. Not nested — a single
  * boolean, because there is exactly one such user. */
 void LORARADIO_vSetKeepAwake(bool bEnable);
+
+/* True while the chip is in deep sleep as far as this layer knows: set by
+ * LORARADIO_vEnterDeepSleep, cleared by LORARADIO_vWakeUp (and by a beacon
+ * window that ends with the radio kept awake, see below). */
+bool LORARADIO_bIsAsleep(void);
+
+/* ---- Beacon + listen window (kernel presence beacon) ----
+ *
+ * Ask the radio task to wake the SLEEPING chip, transmit pu8Frame (no carrier
+ * sense, no log line), listen for u32ListenMs, and put the chip back to sleep.
+ * Returns false, doing nothing, unless the radio is asleep, not held awake and
+ * no other window is running - so it can never disturb an owner that has the
+ * radio awake (a campaign, a kernel session, a LoRaWAN session). Non-blocking;
+ * the window runs on the radio task and takes ~50-70 ms.
+ *
+ * A packet received in the window goes to the RX queue like any other. If
+ * LORARADIO_bKeepAwakeAfterWindow() says it is one the receiver must act on
+ * (a CONNECT for this tag), the chip is left awake in RX instead of being slept
+ * - the kernel session that follows needs it, and is from then on its owner.
+ *
+ * LORARADIO_vWakeUp and LORARADIO_vEnterDeepSleep wait (bounded) for a window
+ * in progress, so a scheduled wake that lands mid-window simply follows it. */
+bool LORARADIO_bStartBeaconWindow(const uint8_t *pu8Frame, uint8_t u8Len,
+                                  uint32_t u32ListenMs);
+
+/* Hook, radio task: a packet just arrived in a beacon window. Return true to
+ * keep the radio awake in RX afterwards. Weak default: false. FrKernel.c
+ * overrides it to say yes to a CONNECT that opens a session. */
+bool LORARADIO_bKeepAwakeAfterWindow(const LoraRadio_Packet_t *pRx);
+
+/* Hook, radio task: a packet just arrived (normal RX). Fill pu8Reply with up
+ * to LORA_FAST_REPLY_MAX_LEN bytes (no CRC, the radio adds it) and return true
+ * to transmit it AT ONCE - before the packet is even queued, with no carrier
+ * sense and a LORA_FAST_REPLY_PREAMBLE_LENGTH preamble - so it lands in the
+ * sender's beacon listen window. Weak default: false. Runs on the radio task:
+ * must not block. FrKernelConsole.c overrides it to answer a presence beacon
+ * with a CONNECT. */
+bool LORARADIO_bFastReply(const LoraRadio_Packet_t *pRx, uint8_t *pu8Reply,
+                          uint8_t *pu8ReplyLen);
 
 #endif /* DEVICE_LORARADIO_LORARADIO_H_ */

@@ -2096,6 +2096,11 @@ void MESHNETWORK_vParserTask(void *pvParameters)
                  * collects these any more; drop it without the "unknown type"
                  * log line every such tag in earshot would otherwise cost. */
                 break;
+            case MeshPktType_Presence:
+                /* Another tag's kernel presence beacon. Only the console
+                 * acts on it (weak hook); a tag drops it silently. */
+                MESHNETWORK_vOnPresence(tRx.buffer, (uint8_t)tRx.length, tRx.rssi);
+                break;
             case MeshPktType_DAck:
                 MESHNETWORK_vHandleDAck(tRx.buffer, tRx.length, tRx.rssi);
                 break;
@@ -2985,4 +2990,9 @@ bool MESHNETWORK_bSendOtaResponse(const uint8_t *buf, uint16_t len)
 __attribute__((weak)) void MESHNETWORK_vOnFrKernelPacket(const uint8_t *buf, uint8_t len)
 {
     (void)buf; (void)len;
+}
+
+__attribute__((weak)) void MESHNETWORK_vOnPresence(const uint8_t *buf, uint8_t len, int16_t i16Rssi)
+{
+    (void)buf; (void)len; (void)i16Rssi;
 }

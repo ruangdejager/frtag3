@@ -95,6 +95,25 @@ void LORARADIO_DRIVER_vInit(void)
  * -------------------------------------------------------------------------- */
 bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
 {
+    return LORARADIO_DRIVER_bTransmitPayloadEx(payload, payload_length,
+                                               LORA_PREAMBLE_LENGTH, true);
+}
+
+/* As LORARADIO_DRIVER_bTransmitPayload, with the preamble length and the
+ * per-TX log line chosen by the caller.
+ *
+ *  - u16Preamble: the kernel console's fast CONNECT answers a tag's presence
+ *    beacon with a LONGER preamble than the mesh uses, so that the tag's short
+ *    listen window, which opens a few ms after its own TX, still lands inside
+ *    the preamble whatever the exact turnaround on either side (see
+ *    LORA_FAST_REPLY_PREAMBLE_LENGTH). A receiver set for an 8-symbol preamble
+ *    receives a longer one; the other way round would not work.
+ *  - bLog: the presence beacon runs every few seconds on a sleeping tag, and a
+ *    "TX done" line each time would wake the DbgLog consumer and the debug UART
+ *    for nothing. */
+bool LORARADIO_DRIVER_bTransmitPayloadEx(uint8_t *payload, uint8_t payload_length,
+                                         uint16_t u16Preamble, bool bLog)
+{
     RadioPhyStatus_t tRadioStatus = SUBGRF_GetStatus();
     uint8_t u8ChipMode = tRadioStatus.Fields.ChipMode;
 
@@ -126,7 +145,7 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
     PacketParams_t packetParams = {
         .PacketType = PACKET_TYPE_LORA,
         .Params.LoRa = {
-            .PreambleLength = LORA_PREAMBLE_LENGTH,
+            .PreambleLength = u16Preamble,
             .HeaderType     = LORA_PACKET_VARIABLE_LENGTH,
             .PayloadLength  = payload_length,
             .CrcMode        = LORA_CRC_ON,
@@ -179,9 +198,14 @@ bool LORARADIO_DRIVER_bTransmitPayload(uint8_t *payload, uint8_t payload_length)
     }
 
     if (bSuccess)
-        DBG("LoraRadio: TX done\r\n");
+    {
+        if (bLog)
+            DBG("LoraRadio: TX done\r\n");
+    }
     else
+    {
         DBG_LOG("LoraRadio: TX failed (timeout or error)\r\n");
+    }
     return bSuccess;
 }
 
@@ -231,6 +255,45 @@ void LORARADIO_DRIVER_vEnterRxMode(uint32_t u32RxTimeout)
     };
     SUBGRF_SetPacketParams(&packetParams);
     SUBGRF_SetRx(u32RxTimeout << 6);  /* ms → radio ticks (×64, 15.625 µs/tick) */
+}
+
+/* --------------------------------------------------------------------------
+ * LORARADIO_DRIVER_vEnterRxWindow
+ *
+ * A short, single receive straight after a TX: the presence beacon's listen
+ * window. Unlike vEnterRxMode there is no standby + 5 ms settle first - the
+ * chip has just fallen back to standby from the TX, and every millisecond
+ * here is one the console's answer may already be arriving in.
+ *
+ * Stop-on-preamble is what keeps the window short AND safe: the timer only
+ * has to cover the START of a reply. Once a preamble is detected the timer
+ * stops and the packet is received to the end however long it is; if nothing
+ * starts in time the chip times out and the caller sleeps it again. The flag
+ * is left set; vInit clears it, and vEnterRxMode(0) receives without a timer,
+ * where it has no effect.
+ * -------------------------------------------------------------------------- */
+void LORARADIO_DRIVER_vEnterRxWindow(uint32_t u32WindowMs)
+{
+    SUBGRF_SetDioIrqParams(
+        IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_CRC_ERROR | IRQ_HEADER_ERROR,
+        IRQ_RX_DONE | IRQ_RX_TX_TIMEOUT | IRQ_CRC_ERROR | IRQ_HEADER_ERROR,
+        IRQ_RADIO_NONE, IRQ_RADIO_NONE);
+
+    SUBGRF_SetSwitch(RFO_LP, RFSWITCH_RX);
+    SUBGRF_SetStopRxTimerOnPreambleDetect(true);
+
+    PacketParams_t packetParams = {
+        .PacketType = PACKET_TYPE_LORA,
+        .Params.LoRa = {
+            .PreambleLength = LORA_PREAMBLE_LENGTH,
+            .HeaderType     = LORA_PACKET_VARIABLE_LENGTH,
+            .PayloadLength  = 0xFF,
+            .CrcMode        = LORA_CRC_ON,
+            .InvertIQ       = LORA_IQ_NORMAL
+        }
+    };
+    SUBGRF_SetPacketParams(&packetParams);
+    SUBGRF_SetRx(u32WindowMs << 6);   /* ms -> 15.625 us radio ticks */
 }
 
 /* --------------------------------------------------------------------------
