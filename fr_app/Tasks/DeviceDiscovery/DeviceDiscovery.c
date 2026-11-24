@@ -963,14 +963,15 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                      * reported RSSI — 0 if that neighbour's firmware predates
                      * the field. Together with RSSI it says where the tag's
                      * good path actually is, which hop count alone does not. */
-                    DBG_LOG("  ID:%X  Hops:%X  Wave:%d  RSSI:%d  RssiSrc:%04X  Bat:%d  Move:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
+                    DBG_LOG("  ID:%X  Hops:%X  Wave:%d  RSSI:%d  RssiSrc:%04X  Bat:%d  Move:%u  MoveCnt:%u  Lat:%ld  Lon:%ld  FwPatch:%u\r\n",
                         tNeighbors[i].u32DeviceId,
                         tNeighbors[i].u8HopCount,
                         tNeighbors[i].u8Wave,
                         tNeighbors[i].i16Rssi,
                         tNeighbors[i].u16BestRssiSrcId,
                         tNeighbors[i].u16BatMv,
-                        tNeighbors[i].u8MoveState,
+                        (unsigned)tNeighbors[i].u8MoveState,
+                        (unsigned)tNeighbors[i].u16MoveCnt,
                         tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LatUDeg : 0L,
                         tNeighbors[i].bGpsValid ? (long)tNeighbors[i].i32LonUDeg : 0L,
                         tNeighbors[i].u8FwPatch);

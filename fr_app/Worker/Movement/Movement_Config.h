@@ -108,9 +108,20 @@
 #define MOVE_MIN_WINDOW_DTZ3_DEF                60
 #define MOVE_MIN_WINDOW_MAX                     254
 
-/* RTOS state machine — STILL detection */
-#define MOVE_STILL_TIMEOUT_S        300U   /* 5 min of envelope ≤ threshold → STILL */
-#define MOVE_STILL_ENV_THRESHOLD      3U   /* envelope ≤ this counts as no motion   */
+/* Accelerometer output data rate the trigger algorithm counts in. Must match
+ * the ODR that ACC.c programs into CTRL_REG1 (25 Hz). The fr9's move.c
+ * hard-codes the same 25 as a literal; it is named here because maxWindow is
+ * a setting in SECONDS that the algorithm compares against a SAMPLE count. */
+#define MOVE_ACC_SAMPLE_RATE_HZ       25U
+
+/* RTOS state machine — STILL detection.
+ *
+ * 15 min (was 5 min). Counted in 1 Hz heartbeat ticks, so it is wall time while
+ * the task is being woken every second. Five minutes flagged an animal that was
+ * merely lying down or grazing quietly as STILL, which is not what the beacon's
+ * still bit is meant to report. */
+#define MOVE_STILL_TIMEOUT_S        900U   /* 15 min of envelope ≤ threshold → STILL */
+#define MOVE_STILL_ENV_THRESHOLD      3U   /* envelope ≤ this counts as no motion    */
 
 /* Gravity sequence detector */
 #define MOVE_SEQ_GRAV_TH              50    /* |dcLevel| > this → axis carries gravity  */

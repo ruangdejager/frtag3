@@ -45,6 +45,7 @@
 #define MESH_BEACON_FLAG_GPS_VALID  0x02U   /* bit1: 1 = lat/lon present   */
 #define MESH_BEACON_FLAG_RSSI_SRC   0x04U   /* bit2: 1 = best-RSSI src id present */
 #define MESH_BEACON_FLAG_ID_HI      0x08U   /* bit3: 1 = device id high half present */
+#define MESH_BEACON_FLAG_MOVE_CNT   0x10U   /* bit4: 1 = daily move trigger count present */
 
 /* DBeacon on-wire sizes.
  *
@@ -64,6 +65,12 @@
  *   [25..26]  u16BestRssiSrcId  (only if RSSI_SRC and GPS_VALID)
  *   [+0..+1]  u16DeviceIdHi     (only if ID_HI; straight after whatever of the
  *                                above is present, i.e. at 17, 19, 25 or 27)
+ *   [+0..+1]  u16MoveCnt        (only if MOVE_CNT; straight after whatever of
+ *                                the above is present — the originator's
+ *                                high-activity trigger count since its local
+ *                                midnight, MOVE_u16GetDailyTriggerCount)
+ *
+ * Longest frame: 17 + 8 GPS + 2 src + 2 id hi + 2 move count = 31 bytes.
  *
  * A decoder that sees fewer than MESH_BEACON_LEN_BASE bytes (an older peer
  * that hasn't been updated yet) still parses cleanly — see the length-guarded
@@ -130,7 +137,7 @@
 
 /* ---- TX queue item ----
  * Item buffer 64 (was 128): the largest mesh frame is a full D-Ack at
- * 10 + 12*4 = 58 B (beacon 29, DReq 9, TimeSync 11); FrKernel responses bypass
+ * 10 + 12*4 = 58 B (beacon 31, DReq 9, TimeSync 11); FrKernel responses bypass
  * this queue entirely. 24 x 64 B saves ~1.5 KB of heap vs 128. */
 #define MESH_TX_QUEUE_LEN        24
 #define MESH_TX_MAX_PACKET_SIZE  64
@@ -671,6 +678,10 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
                  * with later waves. (dreqWaveDisc unused in the update path.) */
                 tNeighborTable[i].u8MoveState          = ptBeacon->u8MoveState;
                 tNeighborTable[i].u8FwPatch            = ptBeacon->u8FwPatch;
+                /* Keep the last reported count if this copy arrived through an
+                 * older forwarder that dropped the field. */
+                if (ptBeacon->bMoveCntValid)
+                    tNeighborTable[i].u16MoveCnt       = ptBeacon->u16MoveCnt;
                 /* Keep the last known fix if this beacon carries none. */
                 if (ptBeacon->bGpsValid)
                 {
@@ -695,6 +706,7 @@ static void NEIGHBOR_vAddOrUpdate(const MeshPktDBeacon_t *ptBeacon)
             ptNew->u8DreqWaveDiscovered = ptBeacon->dreqWaveDisc;
             ptNew->u8MoveState          = ptBeacon->u8MoveState;
             ptNew->u8FwPatch            = ptBeacon->u8FwPatch;
+            ptNew->u16MoveCnt           = ptBeacon->bMoveCntValid ? ptBeacon->u16MoveCnt : 0U;
             ptNew->bGpsValid            = ptBeacon->bGpsValid;
             ptNew->i32LatUDeg           = ptBeacon->i32LatUDeg;
             ptNew->i32LonUDeg           = ptBeacon->i32LonUDeg;
@@ -772,6 +784,9 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     const size_t   u32IdHiOff = u32Needed;
     const uint16_t u16IdHi    = (uint16_t)(ptBeacon->u32DeviceId >> 16);
     if (u16IdHi != 0U) u32Needed += 2U;
+    /* Move count after the id high half, by the same append-only rule. */
+    const size_t   u32MoveCntOff = u32Needed;
+    if (ptBeacon->bMoveCntValid) u32Needed += 2U;
     if (u32BufLen < u32Needed) return false;
 
     pBuf[0] = (uint8_t)MeshPktType_DBeacon;
@@ -788,6 +803,7 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
     if (ptBeacon->bGpsValid)          u8Flags |= MESH_BEACON_FLAG_GPS_VALID;
     if (ptBeacon->bBestRssiSrcValid)  u8Flags |= MESH_BEACON_FLAG_RSSI_SRC;
     if (u16IdHi != 0U)                u8Flags |= MESH_BEACON_FLAG_ID_HI;
+    if (ptBeacon->bMoveCntValid)      u8Flags |= MESH_BEACON_FLAG_MOVE_CNT;
     pBuf[15] = u8Flags;
     pBuf[16] = ptBeacon->u8FwPatch;
 
@@ -809,6 +825,9 @@ static bool MESHNETWORK_bEncodeDBeacon(const MeshPktDBeacon_t *ptBeacon,
      * that a receiver would have to special-case anyway. */
     if (u16IdHi != 0U)
         write_u16_be(&pBuf[u32IdHiOff], u16IdHi);
+
+    if (ptBeacon->bMoveCntValid)
+        write_u16_be(&pBuf[u32MoveCntOff], ptBeacon->u16MoveCnt);
 
     *pu32Written = u32Needed;
     return true;
@@ -1023,6 +1042,10 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
     tBeacon.i32LonUDeg  = 0;
     uint32_t u32GpsAgeS = UINT32_MAX;   /* age of the fix we evaluated (for log) */
     tBeacon.u8MoveState = (MOVE_eGetState() == MOVE_STATE_STILL) ? 1U : 0U;
+    /* Always carried by an originator, 0 included: "no triggers today" is a
+     * reading, unlike a count missing because an older peer relayed it. */
+    tBeacon.bMoveCntValid = true;
+    tBeacon.u16MoveCnt    = MOVE_u16GetDailyTriggerCount();
     {
         gnss_coord_deg_t tLat, tLon;
         /* Only stamp a fix from the most recent pre-trigger: it must exist AND
@@ -1037,9 +1060,9 @@ static void MESHNETWORK_vBuildAndQueueBeacon(void)
         }
     }
 
-    DBG_LOG("MeshNetwork: Sending Beacon %08X move=%u gps=%u age=%lus\r\n",
-        tBeacon.u32BeaconMsgId, tBeacon.u8MoveState, tBeacon.bGpsValid,
-        (unsigned long)u32GpsAgeS);
+    DBG_LOG("MeshNetwork: Sending Beacon %08X move=%u mc=%u gps=%u age=%lus\r\n",
+        tBeacon.u32BeaconMsgId, tBeacon.u8MoveState, (unsigned)tBeacon.u16MoveCnt,
+        tBeacon.bGpsValid, (unsigned long)u32GpsAgeS);
     EVTLOG(LOG_TX_BEACON, 1);
 
     uint8_t u8Buf[64];
@@ -1608,6 +1631,8 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
     tBeacon.i32LonUDeg  = 0;
     tBeacon.bBestRssiSrcValid = false;
     tBeacon.u16BestRssiSrcId  = 0U;
+    tBeacon.bMoveCntValid     = false;
+    tBeacon.u16MoveCnt        = 0U;
     if (u32Len >= 16U)
     {
         uint8_t u8Flags = pBuf[15];
@@ -1646,13 +1671,26 @@ static void MESHNETWORK_vHandleDBeacon(const uint8_t *pBuf,
         {
             tBeacon.u32DeviceId |= (uint32_t)read_u16_be(&pBuf[u32IdHiOff]) << 16;
         }
+
+        /* Daily move trigger count, after the id high half when the FLAG says
+         * one is there. Same length gate: a truncated frame reports no count
+         * rather than a neighbour's bytes. */
+        size_t u32MoveCntOff = u32IdHiOff +
+                               ((u8Flags & MESH_BEACON_FLAG_ID_HI) ? 2U : 0U);
+        if ((u8Flags & MESH_BEACON_FLAG_MOVE_CNT) &&
+            (u32Len >= u32MoveCntOff + 2U))
+        {
+            tBeacon.u16MoveCnt    = read_u16_be(&pBuf[u32MoveCntOff]);
+            tBeacon.bMoveCntValid = true;
+        }
     }
 
-    DBG("MeshNetwork: Beacon: dev=%08X dreq=%08X hop=%u wave=%X bat=%u rssi=%d rsrc=%04X move=%u gps=%u fwp=%u\r\n",
+    DBG("MeshNetwork: Beacon: dev=%08X dreq=%08X hop=%u wave=%X bat=%u rssi=%d rsrc=%04X move=%u mc=%u gps=%u fwp=%u\r\n",
         tBeacon.u32DeviceId, tBeacon.u32DreqId, tBeacon.u8HopCount,
         tBeacon.dreqWaveDisc, tBeacon.u16BatMv, tBeacon.i16Rssi,
         tBeacon.u16BestRssiSrcId,
-        tBeacon.u8MoveState, tBeacon.bGpsValid, tBeacon.u8FwPatch);
+        tBeacon.u8MoveState, (unsigned)tBeacon.u16MoveCnt,
+        tBeacon.bGpsValid, tBeacon.u8FwPatch);
     u16StatBeaconsHeard++;
 
     uint32_t u32LogValue;
@@ -2592,6 +2630,7 @@ bool MESHNETWORK_bGetDiscoveredNeighbors(MeshDiscoveredNeighbor_t *pBuffer,
         pBuffer[i].i32LatUDeg  = tNeighborTable[i].i32LatUDeg;
         pBuffer[i].i32LonUDeg  = tNeighborTable[i].i32LonUDeg;
         pBuffer[i].u16BestRssiSrcId = tNeighborTable[i].u16BestRssiSrcId;
+        pBuffer[i].u16MoveCnt  = tNeighborTable[i].u16MoveCnt;
     }
     *pu16ActualEntries = u16Count;
     osMutexRelease(xNeighborTableMutex);

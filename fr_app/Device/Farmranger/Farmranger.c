@@ -546,7 +546,7 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
 #define FR_LOG_ROW_GAP_MS 10U
 
 /* Upper bound (ms) on waiting for one upload chunk to leave the wire. A chunk
- * is at most FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES = 66 bytes, ~6 ms
+ * is at most FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES = 48 bytes, ~4 ms
  * at 115200, so this only trips when USART1 is wedged. Without a bound such a
  * wait hangs the AppTask with the campaign sleep lock held, so the device
  * never reaches STOP2 again. Also bounds the AT+RTLOG row drain. */
@@ -579,19 +579,23 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  *   flow applies and that race cannot arise here.
  * - The CRC has to be known before the header line goes out, so pass 1 folds
  *   it while it counts. That is the only reason pass 1 exists at all; the
- *   length is just 8 + count*22.
+ *   length is just FR_BLOG_HDR_BYTES + count*FR_BLOG_RECORD_BYTES.
  * ========================================================================== */
 
 /* Records per UART write.
  *
- * 3 * 22 = 66 bytes, chosen to sit just under the ~67-byte worst case of a
- * single CSV row - the in-flight size that FR_LOG_ROW_GAP_MS was tuned
- * against and that the fr9's 128-byte co-operatively-drained RX ring is known
- * to survive. Larger chunks would be faster and are probably fine, but "fine"
- * here means "does not overflow a ring on the other board", and there is no
- * reason to re-litigate that with a bigger number when the campaign takes
- * under a second either way. */
-#define FR_BLOG_RECS_PER_CHUNK  3U
+ * The bound is the in-flight byte count, not the record count: it must stay
+ * at or under the ~67-byte worst case of a single CSV row - the in-flight size
+ * that FR_LOG_ROW_GAP_MS was tuned against and that the fr9's 128-byte
+ * co-operatively-drained RX ring is known to survive. With v2's 22-byte
+ * records that was 3 per chunk (66 B). v3's 24-byte records would make 3 a
+ * 72-byte chunk, past the proven size, so it is 2 (48 B). Larger chunks would
+ * be faster and are probably fine, but "fine" here means "does not overflow a
+ * ring on the other board"; the extra chunks cost ~0.3 s on a full 120-node
+ * campaign. */
+#define FR_BLOG_RECS_PER_CHUNK  2U
+_Static_assert(FR_BLOG_RECS_PER_CHUNK * FR_BLOG_RECORD_BYTES <= 67U,
+               "AT+BLOG chunk exceeds the in-flight size the fr9 RX ring is proven against");
 
 /* ---- little-endian writers ---- */
 
@@ -641,6 +645,7 @@ static void FARMRANGER_vPackRow(uint8_t *rec, const MeshDiscoveredNeighbor_t *n)
      * straight back into the Move column it has always printed. */
     rec[21] = (uint8_t)((n->u8MoveState ? 0x01U : 0x00U)
                       | (n->bGpsValid  ? 0x02U : 0x00U));
+    FARMRANGER_vPut16(&rec[22], n->u16MoveCnt);     /* v3 */
 }
 
 /* Queue a chunk and wait for it to leave the wire, then pause. Same shape as

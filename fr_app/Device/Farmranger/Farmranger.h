@@ -91,6 +91,14 @@ bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  * TAGDISC_bAcceptPayload), same as it always has. The two sides are paired
  * hardware and must be flashed together regardless.
  *
+ * v3 appends u16 moveCnt (MeshDiscoveredNeighbor_t u16MoveCnt: the tag's
+ * high-activity trigger count since its local midnight) at bytes 22..23,
+ * making a record 24 bytes; the first 22 bytes are v2's unchanged. Unlike
+ * v1 -> v2, the fr9 decodes BOTH v2 and v3 (frtag_disc.c picks the record
+ * size from the version byte), because frtag2 primaries still send v2 to the
+ * same fr9 firmware. An fr9 older than that change rejects v3 outright, so a
+ * frtag3 primary needs it.
+ *
  * Records are FR_BLOG_RECORD_BYTES; the type selects the decode. Type 1
  * (basic mode) is retired with basic mode itself: LoRaWAN mode, which took
  * over its setting value, uploads nothing through the primary, so no v2.5+
@@ -102,10 +110,10 @@ bool     FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
  *
  * Flags byte: bit0 = MoveState, bit1 = GpsValid.
  * ------------------------------------------------------------------------- */
-#define FR_BLOG_FORMAT_VER      2U
+#define FR_BLOG_FORMAT_VER      3U
 #define FR_BLOG_TYPE_ADVANCED   0U
 #define FR_BLOG_HDR_BYTES       12U
-#define FR_BLOG_RECORD_BYTES    22U
+#define FR_BLOG_RECORD_BYTES    24U
 
 /* True when the fr9's ready line advertised binary-upload support ("RDY,B").
  * Meaningful only after a successful FARMRANGER_bDeviceOn(); false before

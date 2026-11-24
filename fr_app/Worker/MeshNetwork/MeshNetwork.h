@@ -607,6 +607,12 @@ typedef struct {
     bool     bGpsValid;      /* true if i32Lat/Lon hold a real fix */
     int32_t  i32LatUDeg;     /* latitude  in microdegrees (10^-6 deg) */
     int32_t  i32LonUDeg;     /* longitude in microdegrees (10^-6 deg) */
+    /* Originator's high-activity trigger count since its local midnight
+     * (MOVE_u16GetDailyTriggerCount). bMoveCntValid false = the frame did not
+     * carry the field (older peer, or relayed by one); a forwarder then leaves
+     * it out again rather than inventing a 0. */
+    bool     bMoveCntValid;
+    uint16_t u16MoveCnt;
 } MeshPktDBeacon_t;
 
 /* 8 -> 12. At 8 ids per MESH_PRIMARY_ACK_INTERVAL_MS the primary can silence
@@ -660,17 +666,15 @@ typedef struct {
 } ForwardRing_t;
 
 /* ---- Neighbor entry (internal) ----
- * Field order is load-bearing. The declared fields below occupy 21 bytes and
- * the struct is 24 (verified against .bss.tNeighborTable = 0xb40 = 120 x 24 in
- * the linked map), so there are 3 bytes of tail padding the compiler inserts
- * whatever we do. u16BestRssiSrcId is placed last deliberately: it lands at
- * offset 22 inside that existing padding and sizeof stays 24, which is the only
- * reason this field is affordable at all.
+ * Field order is load-bearing; sizeof is held at 24 by the static assert in
+ * MeshNetwork.c (120 entries, so every byte added here costs 120). The table
+ * had 3 bytes of tail padding, which u16BestRssiSrcId took. u16MoveCnt was
+ * paid for by turning bAcked from a whole bool into a bit of the flags byte
+ * the other bitfields already occupy: that moves u16BestRssiSrcId down to
+ * offset 20 and leaves 22..23 for the count, sizeof unchanged.
  *
- * That headroom is now spent. .bss is byte-exact full on this part — the linked
- * image leaves 8 bytes of the 64K RAM region — so a SECOND 2-byte field here,
- * or widening this one to uint32_t, pushes sizeof to 28 and costs 480 B, which
- * will not link. The static assert in MeshNetwork.c is what catches that. */
+ * The flags byte has 3 bits left. There are no spare bytes left in the
+ * struct; the next field costs 4 B x 120. */
 typedef struct {
     uint32_t u32DeviceId;
     int32_t  i32LatUDeg;     /* latitude  in microdegrees */
@@ -687,9 +691,11 @@ typedef struct {
      * already occupy, so sizeof is unchanged and the 24-byte assert still
      * holds. See MESH_ACK_TRIES_MAX for what it is for. */
     uint8_t  u8AckTries  : 2;
-    bool     bAcked;
+    uint8_t  bAcked      : 1;  /* listed in a D-Ack since its last beacon */
     uint16_t u16BestRssiSrcId; /* node whose DReq gave i16Rssi; 0 = not reported
                                 * (older peer, or relayed via an older node) */
+    uint16_t u16MoveCnt;       /* daily high-activity trigger count; 0 also
+                                * when the beacon did not carry one */
 } NeighborEntry_t;
 
 /* ---- Node role ---- */
@@ -708,19 +714,21 @@ typedef enum {
 
 /* ---- Discovered neighbor (application interface) ----
  * Callers stack-allocate MESH_MAX_NEIGHBORS of these (DeviceDiscovery.c), so
- * sizeof is a 120x stack cost, not just a RAM one. u16BestRssiSrcId sits after
- * bGpsValid to fall in the 2-byte hole already there ahead of i32LatUDeg;
- * sizeof stays 24. */
+ * sizeof is a 120x stack cost, not just a RAM one; the static assert in
+ * MeshNetwork.c holds it at 24. Every byte is used: the u16 fields are grouped
+ * to need no padding, and u8MoveState / bGpsValid share one byte as bits,
+ * which is what made room for u16MoveCnt. */
 typedef struct {
     uint32_t u32DeviceId;
-    uint8_t  u8HopCount;
     int16_t  i16Rssi;
     uint16_t u16BatMv;
-    uint8_t  u8Wave;
-    uint8_t  u8MoveState;    /* 0 = moving, 1 = still */
-    uint8_t  u8FwPatch;      /* neighbor's VERSION_SW_PATCH from beacon */
-    bool     bGpsValid;
     uint16_t u16BestRssiSrcId; /* node whose DReq gave i16Rssi; 0 = not reported */
+    uint16_t u16MoveCnt;     /* daily high-activity trigger count */
+    uint8_t  u8HopCount;
+    uint8_t  u8Wave;
+    uint8_t  u8FwPatch;      /* neighbor's VERSION_SW_PATCH from beacon */
+    uint8_t  u8MoveState : 1;  /* 0 = moving, 1 = still */
+    uint8_t  bGpsValid   : 1;
     int32_t  i32LatUDeg;     /* latitude  in microdegrees */
     int32_t  i32LonUDeg;     /* longitude in microdegrees */
 } MeshDiscoveredNeighbor_t;
