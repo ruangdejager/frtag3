@@ -90,7 +90,7 @@ void FRKERNEL_vEndSession(const char *pcReason) { (void)pcReason; }
 #include "DbgLog.h"
 #include "Log.h"
 #include "SelfTest.h"
-#include "RadioTestMode.h"     /* R&D radio link/range test                 */
+#include "RadioTestMode.h"     /* RSSI test (kernel B, Q)                    */
 #include "stm32wlxx_hal.h"     /* TAMP->BKP2R, HAL_GetUIDw*                  */
 #include "Fota.h"
 #include "Flash.h"             /* flash health query / on-demand recovery   */
@@ -1029,61 +1029,67 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         break;
     }
 
-    case 'R':
-        /* Entered BEFORE the ack so the reply reflects what happened: the
+    case 'B':
+        /* RSSI test, measured by an external meter. "B" is the basic setup,
+         * "B gps" also holds the GPS on and sends the live position (secondary
+         * only).
+         *
+         * Entered BEFORE the ack so the reply reflects what happened: the
          * entry flushes the radio TX queue, which would otherwise discard an
          * ack queued ahead of it. TX still works once the mode is up - it is
-         * only the receive path a beaconing secondary closes.
+         * only the receive path the test closes.
          *
          * Single-connection only (FRK_CMDF_SINGLE): over bulk it would make
-         * every secondary in earshot deaf to the radio until each was found
-         * and shaken by hand. */
-        if (RADIOTESTMODE_bEnter())
+         * every tag in earshot deaf to the radio until each was found and
+         * shaken by hand. A primary has no accelerometer, so on one the way
+         * out is 'Q' over the UART, a reset, or the 1 h limit. */
+        if ((*pcArg != '\0') && (strcmp(pcArg, "gps") != 0))
         {
-            if (RADIOTESTMODE_bIsListener())
-            {
-                /* A listening primary stays reachable: the session stays open
-                 * (the test counts as activity) so "Q" can end it. */
-                FRKERNEL_vReply(pCtx, "radio test: listening - 'Q' ends it\r\n");
-            }
-            else
-            {
-                FRKERNEL_vReply(pCtx, "radio test: beaconing every 5 s - shake to end\r\n");
-                FRKERNEL_vTerminal("radio test");
-            }
+            FRKERNEL_vReply(pCtx, "usage: B  or  B gps\r\n");
+        }
+        else if (RADIOTESTMODE_bEnter(strcmp(pcArg, "gps") == 0))
+        {
+            const bool bGps = (strcmp(pcArg, "gps") == 0);
+            FRKERNEL_vReply(pCtx,
+                (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
+                    ? "rssi test: beacon every 10 s for 1 h - 'Q' on UART ends it\r\n"
+                    : bGps ? "rssi test (gps): beacon every 10 s for 1 h, position once fixed - shake to end\r\n"
+                           : "rssi test: beacon every 10 s for 1 h - shake to end\r\n");
+            FRKERNEL_vTerminal("rssi test");
         }
         else
         {
             /* The reason matters: this reply is very likely the ONLY thing a
              * remote operator ever sees of the failure. */
-            (void)snprintf(resp, sizeof(resp), "radio test: could not enter (%s)\r\n",
-                           RADIOTESTMODE_pcLastEnterError());
-            FRKERNEL_vReply(pCtx, resp);
-        }
-        break;
-
-    case 'B':
-        /* RSSI test beacon. Entered before the ack for the same reason as R,
-         * and single-connection only for the same reason: it makes the tag
-         * deaf to the radio. A primary has no accelerometer, so on one the
-         * way out is 'Q' over the UART, a reset, or the 1 h limit. */
-        if (RADIOTESTMODE_bEnterRssi())
-        {
-            FRKERNEL_vReply(pCtx,
-                (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
-                    ? "rssi test: beacon every 10 s for 1 h - 'Q' on UART ends it\r\n"
-                    : "rssi test: beacon every 10 s for 1 h - shake to end\r\n");
-            FRKERNEL_vTerminal("rssi test");
-        }
-        else
-        {
             (void)snprintf(resp, sizeof(resp), "rssi test: could not enter (%s)\r\n",
                            RADIOTESTMODE_pcLastEnterError());
             FRKERNEL_vReply(pCtx, resp);
         }
         break;
 
+    case 'C':
+        /* CW test: an unmodulated carrier for 1 min. Entered first so the
+         * reply reflects what happened; the carrier itself only starts once
+         * this ack and the session's BYE have left the radio (RadioTestMode),
+         * so the console hears both. Single-connection only, like B. */
+        if (RADIOTESTMODE_bEnterCw())
+        {
+            FRKERNEL_vReply(pCtx,
+                (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
+                    ? "cw test: carrier for 60 s - 'Q' on UART ends it sooner\r\n"
+                    : "cw test: carrier for 60 s - shake to end sooner\r\n");
+            FRKERNEL_vTerminal("cw test");
+        }
+        else
+        {
+            (void)snprintf(resp, sizeof(resp), "cw test: could not enter (%s)\r\n",
+                           RADIOTESTMODE_pcLastEnterError());
+            FRKERNEL_vReply(pCtx, resp);
+        }
+        break;
+
     case 'Q':
+        /* Reaches a tag in a test only over the UART: over LoRa it is deaf. */
         if (RADIOTESTMODE_bActive())
         {
             RADIOTESTMODE_vExit("Q");
@@ -1091,7 +1097,7 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         }
         else
         {
-            FRKERNEL_vReply(pCtx, "radio test not running\r\n");
+            FRKERNEL_vReply(pCtx, "no radio test running\r\n");
         }
         break;
 
@@ -1347,12 +1353,11 @@ static void FRKERNEL_vServiceUart(void)
 /* -------------------------------------------------------------------------- */
 
 /* Work in progress that the operator is waiting on keeps the session alive
- * even though no command arrives: a log stream, a FOTA receive/distribute, a
- * listening radio test. */
+ * even though no command arrives: a log stream, a FOTA receive/distribute.
+ * (The RSSI test is not one: entering it ends the session.) */
 static bool FRKERNEL_bBusy(void)
 {
-    return DBGLOG_bDumpBusy() || FOTA_bSessionActive() ||
-           (RADIOTESTMODE_bActive() && RADIOTESTMODE_bIsListener());
+    return DBGLOG_bDumpBusy() || FOTA_bSessionActive();
 }
 
 /* -------------------------------------------------------------------------- */

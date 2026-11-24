@@ -34,7 +34,7 @@
 #include "SolarPower_Config.h"
 #include "Debug.h"
 #include "FrKernel.h"
-#include "RadioTestMode.h"   /* R&D radio link/range test gates */
+#include "RadioTestMode.h"   /* RSSI test gates */
 #include "LoRaWan.h"
 
 #include <stdlib.h>   /* srand() */
@@ -273,15 +273,13 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
         bool bKernelWakeup = ((u32Flags & osFlagsError) == 0U) &&
                              ((u32Flags & DISCOVERY_KERNEL_BIT) != 0U);
 
-        /* A radio test owns the radio AND the Farmranger link for its whole
-         * duration, so a campaign started now can only do harm: its DReq will
-         * not transmit (MESHNETWORK_bSendPacket refuses while a test runs), so
-         * every wave times out hearing nothing, and the logger round-trip at
-         * the end then fights the test for the same fr9 session and PA0
-         * attention line. Two owners toggling that line produced exactly the
-         * observed symptom on the fr9 - a burst of sessions at rx=0B, one
-         * cancelling the other, with the occasional stray byte from a transfer
-         * cut off when the other side de-inits the UART pins mid-character.
+        /* The RSSI test owns the radio for its whole duration, so a campaign
+         * started now can only do harm: its DReq will not transmit
+         * (MESHNETWORK_bSendPacket refuses while a test runs), so every wave
+         * times out hearing nothing. (The old tag-to-tag range test also owned
+         * the Farmranger link, and a campaign's logger round-trip fighting it
+         * for the PA0 attention line is what produced bursts of rx=0B sessions
+         * on the fr9.)
          *
          * The scheduler is already gated, so this only catches a wake whose
          * flag was set just before the test was entered. */
@@ -1360,7 +1358,7 @@ static void DEVICE_DISCOVERY_vCheckWakeupScheduleTask(void *pvParameters)
          * this one. */
         uint64_t u64Slot      = u64Utc / (uint64_t)u32IntervalS;
 
-        /* ---- R&D radio link/range test: participate in nothing ----
+        /* ---- RSSI test: participate in nothing ----
          * Same shape as the ProductionSleep gate below: one continue skips
          * the scheduled discovery wake, the LoRaWAN report window and the
          * GPS pre-trigger. Unlike ProductionSleep this does not sleep — the

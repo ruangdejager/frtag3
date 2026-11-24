@@ -162,6 +162,9 @@ static uint8_t          au8WindowFrame[LORA_BEACON_FRAME_MAX + 1U];  /* + CRC */
 static uint8_t          u8WindowFrameLen   = 0U;
 static uint32_t         u32WindowListenMs  = 0U;
 
+/* Carrier on (LORARADIO_bStartCw). Written by the radio task only. */
+static volatile bool    bCw                = false;
+
 /* -------------------------------------------------------------------------- */
 
 static uint8_t LORARADIO_u8CRC8_Calculate(const uint8_t *data, uint16_t len);
@@ -301,6 +304,37 @@ void LORARADIO_vRadioTask(void *arg)
             LORARADIO_vRunBeaconWindow();
             events &= ~RADIO_EVT_BEACON_WINDOW;
             events |= LORARADIO_u32ConsumePendingEvents();
+        }
+
+        /* ---------- CONTINUOUS WAVE ----------
+         * Stop is handled first, so a start and a stop that land in one wait
+         * (an exit right behind an entry) end with the carrier off. */
+        if (events & RADIO_EVT_CW_STOP)
+        {
+            if (bCw)
+            {
+                SUBGRF_SetStandby(STDBY_RC);
+                bCw = false;
+                LORARADIO_DRIVER_vEnterRxMode(0);
+            }
+            events &= ~(RADIO_EVT_CW_STOP | RADIO_EVT_CW_START);
+        }
+        if ((events & RADIO_EVT_CW_START) && !bAsleep)
+        {
+            SUBGRF_SetStandby(STDBY_RC);
+            SUBGRF_SetRfFrequency(RF_FREQUENCY);
+            SUBGRF_SetRfTxPower(TX_OUTPUT_POWER);
+            SUBGRF_SetSwitch(RFO_LP, RFSWITCH_TX);
+            SUBGRF_SetTxContinuousWave();
+            bCw = true;
+        }
+        if (bCw)
+        {
+            /* The carrier owns the chip: nothing is received (it is in TX)
+             * and nothing queued may go out, because sending it would mean
+             * standby + CAD - the end of the carrier. */
+            LORARADIO_vFlushTxQueue();
+            continue;
         }
 
         /* ---------- NOISE FLOOR ----------
@@ -872,6 +906,35 @@ void LORARADIO_vSetKeepAwake(bool bEnable)
 bool LORARADIO_bIsAsleep(void)
 {
     return bAsleep;
+}
+
+/* --------------------------------------------------------------------------
+ * Continuous wave - the work is done on the radio task, see the main loop
+ * -------------------------------------------------------------------------- */
+bool LORARADIO_bStartCw(void)
+{
+    if (bAsleep || (LORARADIO_vRadioTask_handle == NULL))
+        return false;
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_CW_START);
+    return true;
+}
+
+void LORARADIO_vStopCw(void)
+{
+    if (LORARADIO_vRadioTask_handle == NULL)
+        return;
+    osThreadFlagsSet(LORARADIO_vRadioTask_handle, RADIO_EVT_CW_STOP);
+
+    /* The radio task normally answers within one pass; bounded so a caller on
+     * a shake or a timeout can never hang here. */
+    const uint32_t u32Start = osKernelGetTickCount();
+    while (bCw && ((osKernelGetTickCount() - u32Start) < 200U))
+        osDelay(5);
+}
+
+bool LORARADIO_bCwActive(void)
+{
+    return bCw;
 }
 
 /* --------------------------------------------------------------------------

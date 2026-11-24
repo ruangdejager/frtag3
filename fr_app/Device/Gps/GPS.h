@@ -188,6 +188,15 @@ void GPS_vShutdown(void);
 bool GPS_bGetCoordinates(gnss_coord_deg_t *pLat, gnss_coord_deg_t *pLong);
 bool GPS_bHasStableFix(void);
 
+/* The fix as of the latest NMEA epoch, only if it is LIVE: the receiver is
+ * powered, this session has declared a stable fix, and the most recent
+ * solution is still valid (GnssSession.bHasStableFixNow, cleared on the first
+ * invalid epoch). Never a cached or old position - GPS_bGetLastKnownFix is
+ * for that. Lat/lon in microdegrees; *pu8Sats is the number of satellites
+ * tracked with signal in that epoch's GSV (GGA's "used in fix" count is not
+ * parsed in a normal build), which reads the same or slightly higher. */
+bool GPS_bGetLiveFix(int32_t *pi32LatUDeg, int32_t *pi32LonUDeg, uint8_t *pu8Sats);
+
 /* Last-known fix retention. Retained across sessions and power cycles;
  * cleared only on cold boot. Returns true and copies lat/lon if any fix
  * has ever been acquired since boot. *pu32AgeSeconds is set to the wall-

@@ -26,6 +26,8 @@
 #define RADIO_EVT_CAD_BUSY      (1UL << 6)
 #define RADIO_EVT_TX_PENDING    (1UL << 7)
 #define RADIO_EVT_BEACON_WINDOW (1UL << 8)   /* run a beacon + listen window */
+#define RADIO_EVT_CW_START      (1UL << 9)   /* start an unmodulated carrier */
+#define RADIO_EVT_CW_STOP       (1UL << 10)  /* stop it, back to receive     */
 
 typedef struct {
     uint8_t  buffer[LORA_MAX_PACKET_SIZE];
@@ -225,5 +227,21 @@ bool LORARADIO_bKeepAwakeAfterWindow(const LoraRadio_Packet_t *pRx);
  * with a CONNECT. */
 bool LORARADIO_bFastReply(const LoraRadio_Packet_t *pRx, uint8_t *pu8Reply,
                           uint8_t *pu8ReplyLen);
+
+/* ---- Continuous wave (CW test, RadioTestMode) ----
+ *
+ * Start an unmodulated carrier on RF_FREQUENCY at TX_OUTPUT_POWER, or stop it
+ * and return to receive. Both run on the radio task, the chip's one owner, so
+ * no other task can issue a SUBGRF command into the carrier. While it is on,
+ * the radio task ignores receive events and drops everything queued for TX -
+ * a carrier interrupted by a stray packet would not be a CW test.
+ *
+ * Start refuses (false) while the chip is asleep: the caller must hold it
+ * awake (LORARADIO_vSetKeepAwake) and have woken it first. Stop waits (bounded)
+ * until the carrier is really off, so the caller may then release the radio.
+ * No IRQ ends a carrier; only Stop (or a deep sleep) does. */
+bool LORARADIO_bStartCw(void);
+void LORARADIO_vStopCw(void);
+bool LORARADIO_bCwActive(void);
 
 #endif /* DEVICE_LORARADIO_LORARADIO_H_ */

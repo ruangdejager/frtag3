@@ -63,11 +63,10 @@ static const FrkCmd_t s_atCmds[] = {
     { 'W', 0U,                              "",          "WIPE the ext-flash (log, settings, staged OTA image; keeps LoRaWAN nonce)" },
     { 'P', 0U,                              "",          "production sleep - wakes on solar or shake (secondary)" },
     { 'S', 0U,                              "",          "solar sleep - wakes on shake only (secondary)" },
-    { 'R', FRK_CMDF_SINGLE,                 "",          "radio range test (secondary beacons, shake to end;"
-                                                         " primary listens)" },
-    { 'B', FRK_CMDF_SINGLE,                 "",          "RSSI test: beacon every 10 s, 1 h limit,"
+    { 'B', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[gps]",     "RSSI test: beacon every 10 s, 1 h limit,"
                                                          " shake to end" },
-    { 'Q', 0U,                              "",          "quit a radio range or RSSI test (UART, or listening primary)" },
+    { 'C', FRK_CMDF_SINGLE,                 "",          "CW test: unmodulated carrier for 1 min, shake to end" },
+    { 'Q', 0U,                              "",          "quit the RSSI or CW test (UART only - deaf over LoRa)" },
     { 'N', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "<serial hex> <radio id> [fix]",
                                                          "WRITE the serial number to OTP - permanent;"
                                                          " 'fix' replaces a wrong one" },

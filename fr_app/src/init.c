@@ -258,10 +258,10 @@ void INIT_vInitialization(void *parameters)
     SYSTEM_vSleepLockAcquire();
 
     /* Sample the channel noise floor for the whole life of this build. The
-     * console is the rig a range test is watched from ("dbg" shows the beacon
+     * console is a handy second view of an RSSI test ("dbg" shows the frame
      * lines), and a beacon's RSSI
      * means little without the noise it is competing against — without this
-     * every beacon line it prints would read "nf=n/a".
+     * every frame line it prints would show no noise floor or margin.
      *
      * Affordable precisely here and nowhere else: it costs the radio task one
      * extra SUBGRF read per idle pass of its 50 ms loop, which is nothing on a

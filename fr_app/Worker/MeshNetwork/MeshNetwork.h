@@ -862,8 +862,8 @@ uint32_t MESHNETWORK_u32Random(void);
  * inflated number would make every tight herd pay for a spread one. */
 uint8_t MESHNETWORK_u8GetMaxDiscoveredWave(void);
 
-/* TX-worker hooks for the runtime radio range test (RadioTestMode.c), whose
- * beaconing secondary has no task of its own and runs on the TX worker.
+/* TX-worker hooks for the runtime RSSI test (RadioTestMode.c), whose
+ * beacon has no task of its own and runs on the TX worker.
  * bTxWorkerReady lets it refuse to enter where there is no worker to run on;
  * vWakeTxWorker breaks
  * the worker out of the indefinite wait it is in by the time the test's own

@@ -19,7 +19,7 @@
 
 /* A session ends after this long without a command addressed to the tag
  * (single or bulk). Outbound traffic the operator is waiting on - a log
- * stream, an OTA receive or distribute, a listening radio test - counts as
+ * stream, an OTA receive or distribute - counts as
  * activity while it runs, so a long download is never cut off by its own
  * silence. A bulk console's repeated CONNECT beacon deliberately does NOT
  * count: a console left on would otherwise hold a whole herd out of its

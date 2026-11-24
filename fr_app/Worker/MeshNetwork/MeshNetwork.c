@@ -37,7 +37,7 @@
 
 #include "GPS.h"
 #include "Movement.h"
-#include "RadioTestMode.h"   /* R&D radio link/range test gates */
+#include "RadioTestMode.h"   /* RSSI test gates */
 #include "FrKernel.h"        /* kernelV2 exclusivity gate */
 
 /* ---- DBeacon flags byte (byte 15) ---- */
@@ -2040,32 +2040,17 @@ void MESHNETWORK_vParserTask(void *pvParameters)
             continue;
         }
 
-        /* R&D radio link/range test. Same shape as the FOTA filter above:
+        /* RSSI test (RadioTestMode). Same shape as the FOTA filter above:
          * placed after the RX read so the LoRa queue still drains, and before
          * the dispatch so a dropped packet has no side effects at all — no
          * forward-ring insert, no neighbour update, no TimeSync notify.
          *
-         * A beaconing secondary is deliberately deaf to everything: that is
-         * what makes the test a clean one-way measurement, and it is why the
-         * only way out is a shake. A listening primary keeps exactly two
-         * doors open — the beacons it is here to measure, and FrKernel, so
-         * kernel command 'Q' can still reach it. */
+         * A tag in the test is deliberately deaf to everything, kernel
+         * included: that is what makes it a clean one-way measurement for the
+         * external meter, and it is why the way out is a shake, the UART or
+         * the 1 h limit. */
         if (RADIOTESTMODE_bActive())
-        {
-            if (!RADIOTESTMODE_bIsListener())
-                continue;
-
-            if (eType == MeshPktType_Reserved)
-            {
-                RADIOTESTMODE_vOnBeacon(tRx.buffer + 1,
-                                        (uint8_t)(tRx.length - 1),
-                                        tRx.rssi, tRx.snr, tRx.i16NoiseFloor);
-                continue;
-            }
-
-            if (eType != MeshPktType_FrKernel)
-                continue;
-        }
+            continue;
 
         /* kernelV2: while a kernel session owns this device it takes part in
          * nothing else on the air - no beacon, DReq, D-Ack or TimeSync is
@@ -2116,11 +2101,11 @@ void MESHNETWORK_vParserTask(void *pvParameters)
                  * is — so this is a bystander hearing someone else's test.
                  *
                  * The kernel console is a passive listener on the whole mesh and is
-                 * the obvious rig to watch a range test from, so it decodes
+                 * a handy second view of an RSSI test, so it decodes
                  * and prints. Every other build drops it silently: type 0 is
                  * now a type we legitimately transmit, so falling through to
                  * default's "Unknown pkt type" would have every production
-                 * unit within earshot of a test log a line every 5 s about a
+                 * unit within earshot of a test log a line every 10 s about a
                  * packet that is not addressed to it and is not a fault. */
 #ifdef FRKERNEL_INTERFACE_LORA_CONSOLE
                 (void)RADIOTESTMODE_bLogBeacon(tRx.buffer + 1,
@@ -2156,8 +2141,8 @@ static void MESHNETWORK_vTxTask(void *pvParameters)
 
     for (;;)
     {
-        /* R&D radio range test, beaconing secondary only: send this node's
-         * test beacon if one is due, and take its answer as how long we may
+        /* RSSI test (RadioTestMode): send this node's
+         * test frame if one is due, and take its answer as how long we may
          * block. Returns osWaitForever - one volatile read - in every other
          * case, which is every case in normal operation.
          *

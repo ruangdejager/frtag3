@@ -1084,6 +1084,26 @@ bool GPS_bHasStableFix(void)
     return GnssSession.bHasFirstStableFix;
 }
 
+bool GPS_bGetLiveFix(int32_t *pi32LatUDeg, int32_t *pi32LonUDeg, uint8_t *pu8Sats)
+{
+    bool bLive;
+
+    /* GnssStableLat/Long are written under this same critical section on
+     * every epoch with a stable fix (GNSS_vOnSolution); GnssSol itself is
+     * memcpy'd without one, so only its single-byte satellite count is read. */
+    taskENTER_CRITICAL();
+    bLive = (eState != GPS_STATE_IDLE) &&
+            GnssSession.bHasFirstStableFix && GnssSession.bHasStableFixNow;
+    if (bLive)
+    {
+        *pi32LatUDeg = GnssStableLat.i32MicroDeg;
+        *pi32LonUDeg = GnssStableLong.i32MicroDeg;
+        *pu8Sats     = GnssSol.Sv.u8SvTracking;
+    }
+    taskEXIT_CRITICAL();
+    return bLive;
+}
+
 /* --------------------------------------------------------------------------
  * GPS_bGetLastKnownFix — retained across sessions; returns false if no fix
  * has ever been acquired since boot. Age is in seconds (RTC UTC delta).

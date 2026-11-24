@@ -74,8 +74,8 @@
  *
  * Movement (shake-to-wake / movement sequencing) and GPS are always built
  * in -- not configurable here, no ENABLE_MOVE / ENABLE_GPS guards remain in
- * the code. Neither is the radio link/range test: it is entered at run time
- * with kernel command 'R' (fr_app/Tasks/RadioTest/RadioTestMode).
+ * the code. Neither is the RSSI test: it is entered at run time
+ * with kernel command 'B' (fr_app/Tasks/RadioTest/RadioTestMode).
  *
  * Keep notes above a define, not trailing it: a trailing block comment
  * spanning several lines stops being a comment the moment the define is
