@@ -1062,6 +1062,27 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         }
         break;
 
+    case 'B':
+        /* RSSI test beacon. Entered before the ack for the same reason as R,
+         * and single-connection only for the same reason: it makes the tag
+         * deaf to the radio. A primary has no accelerometer, so on one the
+         * way out is 'Q' over the UART, a reset, or the 1 h limit. */
+        if (RADIOTESTMODE_bEnterRssi())
+        {
+            FRKERNEL_vReply(pCtx,
+                (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
+                    ? "rssi test: beacon every 10 s for 1 h - 'Q' on UART ends it\r\n"
+                    : "rssi test: beacon every 10 s for 1 h - shake to end\r\n");
+            FRKERNEL_vTerminal("rssi test");
+        }
+        else
+        {
+            (void)snprintf(resp, sizeof(resp), "rssi test: could not enter (%s)\r\n",
+                           RADIOTESTMODE_pcLastEnterError());
+            FRKERNEL_vReply(pCtx, resp);
+        }
+        break;
+
     case 'Q':
         if (RADIOTESTMODE_bActive())
         {

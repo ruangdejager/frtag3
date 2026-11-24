@@ -83,9 +83,13 @@
  * EVTLOG() / FLASHLOG_v* call becomes nothing. See fr_app/inc/flashLog.h. */
 // #define ENABLE_FLASH_LOG
 
-/* Expose MOVE_i8SensorDataX/Y/Z() — accessors returning the last raw
- * accelerometer sample, for bench telemetry. See fr_app/Worker/Movement. */
-// #define ENABLE_MOVEMENT_SENSOR_DATA_API
+/* Expose MOVE_i8SensorDataX/Y/Z() — accessors returning the last accelerometer
+ * sample (as Movement scales it), for bench telemetry. See
+ * fr_app/Worker/Movement. The RSSI test beacon (kernel B,
+ * Tasks/RadioTest/RadioTestMode.c) reads them for the frame's orientation
+ * bytes; without this option it sends those as "not available". Code only,
+ * no RAM. */
+#define ENABLE_MOVEMENT_SENSOR_DATA_API
 
 /* --------------------------------------------------------------------------
  * External flash bring-up and diagnostics

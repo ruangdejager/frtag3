@@ -48,6 +48,13 @@
 #include "DeviceDiscovery.h"    /* DEVICE_DISCOVERY_eGetDeviceRole */
 #include "Farmranger.h"
 #include "hal_system.h"         /* SYSTEM_vSleepLockAcquire / Release */
+#include "hal_bsp.h"            /* BSP_LED_On / Off, LED_AUX */
+#include "Battery.h"            /* RSSI frame: battery mV */
+#include "Power.h"              /* RSSI frame: low-battery flag */
+#include "Movement.h"           /* RSSI frame: acceleration */
+#include "SelfTest.h"           /* RSSI frame: accelerometer present + healthy */
+#include "crc16.h"
+#include "build_config.h"
 #include "dbg_log.h"
 
 #include "cmsis_os2.h"
@@ -101,6 +108,42 @@
 #define RTM_TAG_LEN         3U
 #define RTM_LINE_MAX        48U
 
+/* ---- RSSI test beacon (kernel B) ----
+ * Frame layout is documented in RadioTestMode.h. */
+#define RSSI_TEST_BEACON_MS     10000U          /* one frame every 10 s     */
+#define RSSI_TEST_TIMEOUT_MS    (60U * 60U * 1000U) /* then back to normal  */
+#define RSSI_TEST_LED_MS        50U             /* LED_AUX flash per TX     */
+#define RSSI_TEST_FRAME_LEN     24U
+#define RSSI_TEST_FORMAT_VER    1U
+#define RSSI_TEST_ID_0          0x52U           /* 'R' */
+#define RSSI_TEST_ID_1          0x53U           /* 'S' */
+#define RSSI_TEST_NA            0x80U           /* "not available" for i8 fields */
+#define RSSI_TEST_RECENT_FRAMES 10U             /* flags bit2 for this many */
+
+#define RSSI_TEST_FLAG_ACC_VALID    0x01U
+#define RSSI_TEST_FLAG_LOW_BATTERY  0x02U
+#define RSSI_TEST_FLAG_RECENT_RESET 0x04U
+
+/* Antenna configuration ids (frame byte 11). This list is the lookup the
+ * meter's labels come from: assign the next free number to a new antenna
+ * variant here, never reuse or renumber one. 0 = unknown / not yet assigned.
+ * The firmware cannot sense which antenna is fitted, so the id is per board
+ * role - the two V3 RevA boards are the only thing it can tell apart.
+ *
+ *   0  unknown / unassigned
+ */
+#define RSSI_TEST_ANTENNA_ID_SECONDARY  0U      /* Tagskaap3RevA collar tag */
+#define RSSI_TEST_ANTENNA_ID_PRIMARY    0U      /* Tagskaap3RevA_DB         */
+
+/* Radio profile ids (frame byte 12): the radio settings the frame is sent
+ * with, so the meter can confirm it listens with the same ones. Same rules
+ * as the antenna list. The test beacons on the mesh's own settings
+ * (LoraRadio_Config.h), so a change there needs a new id here.
+ *
+ *   1  mesh: 868.0 MHz, SF7, BW 250 kHz, CR 4/5, preamble 8, sync 0x1424
+ */
+#define RSSI_TEST_RADIO_PROFILE_ID      1U
+
 /* How long RADIOTESTMODE_vExit waits for the task to wind itself down. Sized
  * for the worst case on the way out: the task may be mid-upload for a beacon
  * it just measured — an fr9 session open (~1 s to RDY) plus an AT+RTLOG whose
@@ -139,6 +182,8 @@ typedef struct {
 
     uint32_t u32TxSeq;                /* beacon: next sequence number      */
     uint32_t u32NextBeaconTick;       /* beacon: tick the next one is due  */
+    uint32_t u32EnterTick;            /* RSSI test: start of the 1 h limit */
+    bool     bRssi;                   /* beacon is the RSSI test (kernel B) */
 
     uint32_t u32RxCount;              /* listener bookkeeping              */
     uint32_t u32Missed;
@@ -171,6 +216,14 @@ static RtmCtx_t      *pCtx         = NULL;
  * "could not enter" that gives a field failure nothing to go on. */
 static const char *pcLastEnterError = "";
 
+/* RSSI test frame sequence and frames-since-boot. Static, not in the context,
+ * because the format says the sequence restarts only on a reset: a meter that
+ * sees the same tag entered twice in one boot must not read the second run's
+ * restart as 65000-odd lost frames. Three bytes of permanent RAM; the frame
+ * count saturates at RSSI_TEST_RECENT_FRAMES, which is all it is for. */
+static uint16_t u16RssiSeq        = 0U;
+static uint8_t  u8RssiFramesSinceBoot = 0U;
+
 /* Every reason above is a string literal in flash, deliberately. An earlier
  * version formatted heap byte counts into a 47-byte static buffer, which was
  * scaffolding for a heap failure the design has since removed — the beacon
@@ -188,6 +241,8 @@ static void     RTM_vTask(void *arg);
 static void     RTM_vHandleBeacon(const RtmBeacon_t *pB);
 static void     RTM_vLogToFr9(const FarmrangerRtBeacon_t *pRow);
 static void     RTM_vTeardown(void);
+static bool     RTM_bEnter(bool bRssi);
+static uint8_t  RTM_u8BuildRssiFrame(uint8_t *pu8Buf, uint16_t u16Seq);
 
 /* --------------------------------------------------------------------------
  * Public state
@@ -200,7 +255,14 @@ const char *RADIOTESTMODE_pcLastEnterError(void) { return pcLastEnterError; }
 /* --------------------------------------------------------------------------
  * RADIOTESTMODE_bEnter
  * -------------------------------------------------------------------------- */
-bool RADIOTESTMODE_bEnter(void)
+bool RADIOTESTMODE_bEnter(void)     { return RTM_bEnter(false); }
+bool RADIOTESTMODE_bEnterRssi(void) { return RTM_bEnter(true); }
+
+/* Both entries share everything but the role choice and the beacon content:
+ * the RSSI test is a beacon on either role, so it never takes the listener
+ * path, and it carries its own frame, cadence and 1 h limit (see
+ * RADIOTESTMODE_u32ServiceBeacon). */
+static bool RTM_bEnter(bool bRssi)
 {
     pcLastEnterError = "";
 
@@ -210,7 +272,7 @@ bool RADIOTESTMODE_bEnter(void)
         return false;
     }
 
-    bIsListener = (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
+    bIsListener = !bRssi && (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY);
 
     /* A beaconing secondary has no task of its own — it rides MeshNetwork's TX
      * worker. Refuse up front if that worker is not there rather than entering
@@ -238,6 +300,8 @@ bool RADIOTESTMODE_bEnter(void)
         return false;
     }
     memset(pCtx, 0, sizeof(RtmCtx_t));
+    pCtx->bRssi        = bRssi;
+    pCtx->u32EnterTick = osKernelGetTickCount();
 
     if (bIsListener)
     {
@@ -345,9 +409,95 @@ bool RADIOTESTMODE_bEnter(void)
      * successful entry is what makes the next failure a comparison rather
      * than another first data point. */
     DBG_LOG("RadioTest: ENTERED as %s, %u B heap free\r\n",
+            bRssi       ? "RSSI test beacon (10 s, 1 h limit)" :
             bIsListener ? "PRIMARY (listen)" : "SECONDARY (beacon)",
             (unsigned)xPortGetFreeHeapSize());
     return true;
+}
+
+/* --------------------------------------------------------------------------
+ * RSSI test frame - layout in RadioTestMode.h
+ * -------------------------------------------------------------------------- */
+static void RTM_vPut16Le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void RTM_vPut32Le(uint8_t *p, uint32_t v)
+{
+    RTM_vPut16Le(&p[0], (uint16_t)(v & 0xFFFFU));
+    RTM_vPut16Le(&p[2], (uint16_t)(v >> 16));
+}
+
+#ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
+/* Movement keeps its last sample divided by MOVE_ACC_RAW_SCALE_VALUE (192)
+ * from the LIS2DH's left-justified ±2 g output, where 1 g = 16384, and
+ * clamped to int8. 1/64 g is 256 raw, so the frame value is v * 192 / 256 =
+ * v * 3 / 4, rounded to nearest. Movement's clamp limits it to about ±1.5 g
+ * (-96..95 here), which is more than an orientation reading needs and can
+ * never produce the 0x80 "not available" code. */
+static uint8_t RTM_u8AccTo64thG(int8_t i8Move)
+{
+    int16_t i16 = (int16_t)i8Move * 3;
+    i16 = (int16_t)((i16 + ((i16 >= 0) ? 2 : -2)) / 4);
+    return (uint8_t)(int8_t)i16;
+}
+#endif
+
+static uint8_t RTM_u8BuildRssiFrame(uint8_t *pu8Buf, uint16_t u16Seq)
+{
+    const bool bSecondary =
+        (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_PRIMARY);
+    uint8_t u8Flags = 0U;
+
+    pu8Buf[0] = (uint8_t)MeshPktType_Reserved;
+    pu8Buf[1] = RSSI_TEST_ID_0;
+    pu8Buf[2] = RSSI_TEST_ID_1;
+    pu8Buf[3] = RSSI_TEST_FORMAT_VER;
+    RTM_vPut32Le(&pu8Buf[4], LORARADIO_u32GetUniqueId());
+    RTM_vPut16Le(&pu8Buf[8], u16Seq);
+    pu8Buf[10] = (uint8_t)(int8_t)TX_OUTPUT_POWER;
+    pu8Buf[11] = bSecondary ? RSSI_TEST_ANTENNA_ID_SECONDARY
+                            : RSSI_TEST_ANTENNA_ID_PRIMARY;
+    pu8Buf[12] = RSSI_TEST_RADIO_PROFILE_ID;
+    RTM_vPut16Le(&pu8Buf[13], (uint16_t)(RSSI_TEST_BEACON_MS / 10U));
+
+    /* Battery and power class exist on a secondary only (no battery
+     * measurement is fitted on the primary daughter board): 0 mV there means
+     * "not measured", and the low-battery flag stays clear. */
+    RTM_vPut16Le(&pu8Buf[15],
+                 (bSecondary && BAT_bHasValidSample()) ? BAT_u16GetVoltage() : 0U);
+    if (bSecondary && ((POWER_tGetState() & POWER_CLASS_NORMAL) == 0U))
+        u8Flags |= RSSI_TEST_FLAG_LOW_BATTERY;
+
+    /* No temperature source is read anywhere in this firmware yet. */
+    pu8Buf[17] = RSSI_TEST_NA;
+
+    pu8Buf[18] = RSSI_TEST_NA;
+    pu8Buf[19] = RSSI_TEST_NA;
+    pu8Buf[20] = RSSI_TEST_NA;
+#ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
+    /* SELFTEST_bAccOk() is false on a primary (no accelerometer fitted) and on
+     * a secondary whose LIS2DH failed its boot check. */
+    if (bSecondary && SELFTEST_bAccOk())
+    {
+        pu8Buf[18] = RTM_u8AccTo64thG(MOVE_i8SensorDataX());
+        pu8Buf[19] = RTM_u8AccTo64thG(MOVE_i8SensorDataY());
+        pu8Buf[20] = RTM_u8AccTo64thG(MOVE_i8SensorDataZ());
+        u8Flags |= RSSI_TEST_FLAG_ACC_VALID;
+    }
+#endif
+
+    if (u8RssiFramesSinceBoot < RSSI_TEST_RECENT_FRAMES)
+    {
+        u8RssiFramesSinceBoot++;
+        u8Flags |= RSSI_TEST_FLAG_RECENT_RESET;
+    }
+    pu8Buf[21] = u8Flags;
+
+    RTM_vPut16Le(&pu8Buf[22], CRC16_u16Ccitt(pu8Buf, RSSI_TEST_FRAME_LEN - 2U));
+    return RSSI_TEST_FRAME_LEN;
 }
 
 /* --------------------------------------------------------------------------
@@ -359,6 +509,9 @@ uint32_t RADIOTESTMODE_u32ServiceBeacon(void)
     uint32_t           u32Now;
     uint32_t           u32Seq;
     uint32_t           u32Id;
+    uint32_t           u32Period;
+    bool               bRssi;
+    bool               bTimedOut;
     int                n;
 
     /* Cheap out first: this is on every trip round the mesh TX worker's loop
@@ -423,13 +576,57 @@ uint32_t RADIOTESTMODE_u32ServiceBeacon(void)
         return osWaitForever;
     }
 
+    bRssi     = pCtx->bRssi;
+    u32Period = bRssi ? RSSI_TEST_BEACON_MS : RTM_BEACON_MS;
+    bTimedOut = bRssi &&
+                ((u32Now - pCtx->u32EnterTick) >= RSSI_TEST_TIMEOUT_MS);
+
     /* Claimed even though the send below may drop it: to the listener a
      * dropped beacon is identical to one that never made it across, and the
      * sequence gap should say so. */
     u32Seq                  = pCtx->u32TxSeq++;
-    pCtx->u32NextBeaconTick = u32Now + RTM_BEACON_MS;
+    pCtx->u32NextBeaconTick = u32Now + u32Period;
+    if (bRssi && !bTimedOut)
+        u32Seq = u16RssiSeq++;    /* the frame's own boot-long counter */
 
     taskEXIT_CRITICAL();
+
+    if (bTimedOut)
+    {
+        /* The RSSI test's hour is up: back to normal use. Checked here, after
+         * the "nothing of ours still in flight" test above, so the radio is
+         * idle when it is put back to sleep. Exiting from this task is safe:
+         * the beacon role has no task of its own to wait for, so
+         * RADIOTESTMODE_vExit only clears the gates, frees the context and
+         * drops the sleep lock. The radio is deep-slept because nothing else
+         * will do it until the next scheduled wake, which wakes it again
+         * itself; a shake exit instead goes through the kernel window. */
+        RADIOTESTMODE_vExit("1 h timeout");
+        LORARADIO_vEnterDeepSleep();
+        return osWaitForever;
+    }
+
+    if (bRssi)
+    {
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.length = RTM_u8BuildRssiFrame(pkt.buffer, (uint16_t)u32Seq);
+
+        /* Flash on the enqueue: the radio task sends it straight away unless
+         * the channel is busy, so this is when the meter should see it. The
+         * 50 ms blocks only this borrowed TX worker, which has nothing else to
+         * do while a test runs. */
+        BSP_LED_On(LED_AUX);
+        bool bQueued = LORARADIO_bTxPacket(&pkt);
+        osDelay(RSSI_TEST_LED_MS);
+        BSP_LED_Off(LED_AUX);
+
+        if (bQueued)
+            DBG_LOG("RadioTest: RSSI TX seq=%lu\r\n", (unsigned long)u32Seq);
+        else
+            DBG_LOG("RadioTest: RSSI TX drop seq=%lu (queue full)\r\n",
+                    (unsigned long)u32Seq);
+        return u32Period;
+    }
 
     u32Id = LORARADIO_u32GetUniqueId();
 
@@ -464,14 +661,23 @@ void RADIOTESTMODE_vExit(const char *pcReason)
     uint32_t u32Missed = 0U;
     uint32_t u32Tx     = 0U;
 
-    if (!bActive)
-        return;
-
     /* Clear the gates first so the mesh is live again the moment we stop, and
      * so nothing new is handed to a queue we are about to delete. It is also
      * what stops the next RADIOTESTMODE_u32ServiceBeacon on the mesh TX worker
-     * dead, and puts that worker back on osWaitForever. */
+     * dead, and puts that worker back on osWaitForever.
+     *
+     * Test-and-clear in one step: since the RSSI test's 1 h timeout, the mesh
+     * TX worker can call this too, and a shake or a kernel 'Q' landing at the
+     * same moment must not get past the check as well and release the sleep
+     * lock a second time. */
+    taskENTER_CRITICAL();
+    if (!bActive)
+    {
+        taskEXIT_CRITICAL();
+        return;
+    }
     bActive = false;
+    taskEXIT_CRITICAL();
 
     /* Hand the radio's power state back to its normal owners. Released here,
      * with bActive, rather than down beside SYSTEM_vSleepLockRelease() so the
@@ -652,6 +858,30 @@ bool RADIOTESTMODE_bLogBeacon(const uint8_t *pBuf, uint8_t u8Len,
 {
     uint32_t u32Id;
     uint32_t u32Seq;
+
+    /* RSSI test frame (kernel B). pBuf starts after the type byte, so the
+     * frame's byte N is pBuf[N - 1] here, and the CRC has to fold the 0x00
+     * type byte back in. Longer frames are later format versions and fine. */
+    if (pBuf != NULL && u8Len >= (uint8_t)(RSSI_TEST_FRAME_LEN - 1U) &&
+        pBuf[0] == RSSI_TEST_ID_0 && pBuf[1] == RSSI_TEST_ID_1)
+    {
+        const uint8_t u8Type = (uint8_t)MeshPktType_Reserved;
+        uint16_t u16Crc = CRC16_u16CcittUpdate(CRC16_CCITT_INIT, &u8Type, 1U);
+        u16Crc = CRC16_u16CcittUpdate(u16Crc, pBuf, RSSI_TEST_FRAME_LEN - 3U);
+        const uint16_t u16Got = (uint16_t)(pBuf[21] | ((uint16_t)pBuf[22] << 8));
+
+        DBG_LOG("RadioTest: RSSI RX id=%08lX seq=%u v%u rssi=%d dBm snr=%d dB "
+                "bat=%u acc=%d,%d,%d flags=%02X%s\r\n",
+                (unsigned long)((uint32_t)pBuf[3] | ((uint32_t)pBuf[4] << 8) |
+                                ((uint32_t)pBuf[5] << 16) | ((uint32_t)pBuf[6] << 24)),
+                (unsigned)(pBuf[7] | ((uint16_t)pBuf[8] << 8)), (unsigned)pBuf[2],
+                i16Rssi, i8Snr,
+                (unsigned)(pBuf[14] | ((uint16_t)pBuf[15] << 8)),
+                (int)(int8_t)pBuf[17], (int)(int8_t)pBuf[18], (int)(int8_t)pBuf[19],
+                (unsigned)pBuf[20], (u16Crc == u16Got) ? "" : " CRC-BAD");
+        (void)i16NoiseFloor;
+        return true;
+    }
 
     if (!RTM_bParseBeacon(pBuf, u8Len, &u32Id, &u32Seq))
         return false;

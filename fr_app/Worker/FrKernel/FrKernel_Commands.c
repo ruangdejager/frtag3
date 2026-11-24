@@ -65,7 +65,9 @@ static const FrkCmd_t s_atCmds[] = {
     { 'S', 0U,                              "",          "solar sleep - wakes on shake only (secondary)" },
     { 'R', FRK_CMDF_SINGLE,                 "",          "radio range test (secondary beacons, shake to end;"
                                                          " primary listens)" },
-    { 'Q', 0U,                              "",          "quit a radio range test (listening primary)" },
+    { 'B', FRK_CMDF_SINGLE,                 "",          "RSSI test: beacon every 10 s, 1 h limit,"
+                                                         " shake to end" },
+    { 'Q', 0U,                              "",          "quit a radio range or RSSI test (UART, or listening primary)" },
     { 'N', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "<serial hex> <radio id> [fix]",
                                                          "WRITE the serial number to OTP - permanent;"
                                                          " 'fix' replaces a wrong one" },

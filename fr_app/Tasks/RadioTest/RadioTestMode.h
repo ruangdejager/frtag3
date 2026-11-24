@@ -32,10 +32,40 @@
  *                end. Keeps the FrKernel door open so kernel command 'Q'
  *                can end the mode over the air.
  *
+ * Entering (either role):  kernel command B - the RSSI test beacon
+ *
+ *   The tag beacons a binary "RS" frame (below) every RSSI_TEST_BEACON_MS
+ *   (10 s), whatever its role, for a hand-held signal-strength meter. It is
+ *   deaf exactly like a range-test secondary, flashes LED_AUX (blue on a
+ *   secondary, yellow on a primary) on every TX, and leaves the mode on a
+ *   shake (secondary - a primary has no accelerometer), on kernel 'Q' / 'x'
+ *   over the UART, or by itself after RSSI_TEST_TIMEOUT_MS (1 h), after which
+ *   the tag resumes its normal schedule. Single-connection only, like R.
+ *
  * The mode is RAM-only and deliberately not persisted: a reboot returns the
  * unit to normal operation. A mode that survived a power cycle would be an
  * easy way to strand a unit in the field with no mesh participation and, on a
  * secondary, no over-the-air way back.
+ *
+ * ---- RSSI test frame (format version 1), 24 bytes, little-endian ----
+ *
+ *   [0]      0x00  header: MeshPktType_Reserved, so production units drop it
+ *   [1..2]   0x52 0x53  "RS" (the range-test beacon has "RT" here)
+ *   [3]      0x01  format version; later versions only append, so a meter
+ *                  must accept longer frames and ignore trailing bytes
+ *   [4..7]   u32   tag id, LORARADIO_u32GetUniqueId()
+ *   [8..9]   u16   sequence, +1 per TX, wraps; restarts at 0 only on a reset
+ *                  (it carries on across B entries within one boot)
+ *   [10]     i8    configured TX power, dBm (TX_OUTPUT_POWER)
+ *   [11]     u8    antenna configuration id (lookup list in RadioTestMode.c)
+ *   [12]     u8    radio profile id (lookup list in RadioTestMode.c)
+ *   [13..14] u16   TX interval, units of 10 ms
+ *   [15..16] u16   battery, mV (0 = not measured: primaries, or no sample yet)
+ *   [17]     i8    temperature, deg C; 0x80 = not available (always, for now)
+ *   [18..20] 3x i8 acceleration X/Y/Z, 1 LSB = 1/64 g; 0x80 = not available
+ *   [21]     u8    flags: bit0 accelerometer valid, bit1 low battery,
+ *                  bit2 recently reset (first 10 frames since boot)
+ *   [22..23] u16   CRC-16/CCITT-FALSE over bytes 0..21, low byte first
  */
 
 #ifndef FR_APP_TASKS_RADIOTEST_RADIOTESTMODE_H_
@@ -77,6 +107,12 @@ const char *RADIOTESTMODE_pcLastEnterError(void);
  * The caller should have already sent its command acknowledgement and let it
  * drain: on a secondary this call is the point of no return for the radio. */
 bool RADIOTESTMODE_bEnter(void);
+
+/* Enter the RSSI test beacon (kernel command B; see the top of this file).
+ * Beacons on either role; otherwise the same contract as RADIOTESTMODE_bEnter,
+ * including RADIOTESTMODE_pcLastEnterError() on failure. RADIOTESTMODE_bActive()
+ * is true while it runs, so every gate the range test has applies to it too. */
+bool RADIOTESTMODE_bEnterRssi(void);
 
 /* Leave the mode and restore normal operation: stops the beacon, tears down
  * the listener's task and queue, releases the sleep lock and re-opens the
