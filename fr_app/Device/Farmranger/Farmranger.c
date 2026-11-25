@@ -480,17 +480,19 @@ uint64_t FARMRANGER_u64RequestTimestamp(void)
 /* --------------------------------------------------------------------------
  * FARMRANGER_bRequestSettings
  *
- * Fetch the three per-system settings the primary needs at the start of
- * every wake, in one AT round trip. Response wire format on the fr9 side
- * (see FRTAG_vSetReqHandler in fr9_application/fr_app/src/frtag.c):
+ * Fetch the per-system settings the primary needs at the start of every
+ * wake, in one AT round trip. Response wire format on the fr9 side (see
+ * FRTAG_vSetReqHandler in fr9_application/fr_app/src/frtag.c):
  *
- *     "<interval_min>,<lorawan_mode>,<gps_enabled>\r\n"
+ *     "<interval_min>,<basic_mode>,<gps_enabled>[,<lorawan_mode>]\r\n"
  *
- * where lorawan_mode and gps_enabled are 0 or 1 (the mode field used to mean
- * basic mode; fr9 still answers 1 for its codes 62/63, which v2.5.0 reads as
- * LoRaWAN mode - see DiscoveryMode_e). Any bogus/short response
- * leaves the outputs untouched and returns false; caller keeps its
- * previous defaults (safe cold-boot behavior).
+ * every flag 0 or 1. The 4th field arrived with the basic/LoRaWAN split
+ * (fr9 codes 64/65, see DiscoveryMode_e); frtag2 stops parsing after the 3rd
+ * so it never sees it, and an fr9 too old to send it reads as "not LoRaWAN".
+ * basic_mode is parsed but has nothing to select here - frtag3 runs basic as
+ * advanced - so it is only logged. Any bogus/short response leaves the
+ * outputs untouched and returns false; caller keeps its previous defaults
+ * (safe cold-boot behavior).
  * -------------------------------------------------------------------------- */
 bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
                                  bool    *pbLoRaWanMode,
@@ -508,9 +510,10 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
         return false;
     }
 
-    /* Parse "<int>,<mode>,<gps>" (line stripped of trailing CRLF by the
-     * parser). All three fields must be present and numeric or we reject
-     * — safer to fall back to caller defaults than partial apply. */
+    /* Parse "<int>,<basic>,<gps>[,<lorawan>]" (line stripped of trailing
+     * CRLF by the parser). The first three fields must be present and
+     * numeric or we reject — safer to fall back to caller defaults than
+     * partial apply. */
     char *p = respBuf;
     char *endptr;
 
@@ -525,8 +528,21 @@ bool FARMRANGER_bRequestSettings(uint8_t *pu8Interval,
     unsigned long ulGps = strtoul(p, &endptr, 10);
     if (endptr == p) return false;
 
+    /* Optional 4th field. Present means ",<digits>" and nothing after it; a
+     * mangled one rejects the whole line like any other field would. */
+    unsigned long ulLoRaWan = 0UL;
+    if (*endptr == ',')
+    {
+        p = endptr + 1;
+        ulLoRaWan = strtoul(p, &endptr, 10);
+        if (endptr == p || *endptr != '\0') return false;
+    }
+
+    if ((ulMode != 0UL) && (ulLoRaWan == 0UL))
+        DBG_LOG("Farmranger: SETREQ asks for basic mode - not on frtag3, running advanced\r\n");
+
     if (pu8Interval)  *pu8Interval  = (uint8_t)ulInterval;
-    if (pbLoRaWanMode) *pbLoRaWanMode = (ulMode != 0UL);
+    if (pbLoRaWanMode) *pbLoRaWanMode = (ulLoRaWan != 0UL);
     if (pbGpsEnabled) *pbGpsEnabled = (ulGps  != 0UL);
     return true;
 }

@@ -51,7 +51,13 @@ static const FrkCmd_t s_atCmds[] = {
 #endif
 
     /* ---- configuration / OTA ---- */
-    { 'd', FRK_CMDF_ARG,                    "[min]",     "show, or set, the discovery interval (15/30/60/120/240)" },
+    /* "lock" pins the value against fr9/TimeSync until "unlock" or a reboot.
+     * Help lines print through a 96-byte buffer, so these stay short. */
+    { 'd', FRK_CMDF_ARG,                    "[min [lock]|unlock]",
+                                                         "show/set discovery interval 15..240; lock lasts to reboot" },
+    { 'm', FRK_CMDF_ARG,                    "[adv|lora [lock]|unlock]",
+                                                         "show/set discovery mode; lock lasts to reboot" },
+    { 'l', FRK_CMDF_SINGLE,                 "",          "LoRaWAN DevEUI (for TTN), join state and mode" },
     { 'w', FRK_CMDF_ARG,                    "[off]",     "arm (or disarm) firmware acceptance - secondary" },
     { 'o', 0U,                              "",          "distribute the staged firmware - primary" },
 

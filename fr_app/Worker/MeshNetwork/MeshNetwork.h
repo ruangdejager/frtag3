@@ -565,17 +565,37 @@ typedef enum {
  *             mode, GPS flag, staged firmware) and run firmware
  *             distribution; the primary uploads no discovery data.
  *
- * Replaced BASIC (passive beacon collection) in v2.5.0 at the same wire
- * value, so fr9/server settings did not change: fr9's mode codes 62/63
- * ("basic with/without GPS") now mean LoRaWAN with/without GPS, AT+SETREQ
- * still answers 1 for it, and TimeSync still carries it as flag bit1.
+ * frtag3 has no BASIC mode (passive beacon collection); frtag2 still does,
+ * and the two generations share fr9s, systems and the backend. LoRaWAN mode
+ * briefly reused basic's wire values (fr9 codes 62/63, AT+SETREQ mode 1,
+ * TimeSync flag bit1). That made a system set to "basic" for its frtag2
+ * tags put every frtag3 tag in it on LoRaWAN, so on 2026-11-25 the two were
+ * split, and basic keeps everything it had:
  *
- * The mode is a system-wide setting owned by fr9 (movementAlarm.
- * morningZoneLevels.minWindow, codes 60..63), fetched by the primary via
+ *   fr9 code (movementAlarm.morningZoneLevels.minWindow)
+ *     60/61  advanced, GPS on/off
+ *     62/63  basic,    GPS on/off     frtag3 runs these as ADVANCED
+ *     64/65  LoRaWAN,  GPS on/off     new; frtag2 runs these as advanced
+ *   AT+SETREQ  "<interval>,<basic>,<gps>[,<lorawan>]" - the 4th field is
+ *              new; frtag2 ignores it, and an fr9 that does not send it
+ *              reads as "not LoRaWAN".
+ *   TimeSync   flag bit1 = basic (frtag3 never sends it, and runs advanced
+ *              when it hears it), flag bit2 = LoRaWAN (frtag2 ignores it).
+ *
+ * Basic falls back to ADVANCED, not to LoRaWAN, because advanced is the mode
+ * every generation understands: a frtag3 primary in a basic system runs a
+ * full campaign and tells frtag2 secondaries "advanced", which they obey.
+ * The cost, accepted when the split was agreed: frtag3 secondaries under a
+ * frtag2 primary in basic mode are not collected, and frtag2 secondaries
+ * under a frtag3 primary in LoRaWAN mode are not collected. A LoRaWAN system
+ * is meant to be frtag3-only.
+ *
+ * The mode is a system-wide setting owned by fr9, fetched by the primary via
  * AT+SETREQ, and distributed to secondaries in every TimeSync — a
  * secondary applies the received mode before its next scheduled wake.
  * Cold-boot default on every node is ADVANCED (safe fallback with full
- * mesh info) until the first TimeSync flips it. */
+ * mesh info) until the first TimeSync flips it. The kernel can set and lock
+ * it locally (see MESHNETWORK_vLockDiscoveryMode). */
 typedef enum {
     DISCOVERY_MODE_ADVANCED = 0,
     DISCOVERY_MODE_LORAWAN  = 1
@@ -756,6 +776,28 @@ void MESHNETWORK_vSendTimeSync(uint32_t u32UtcTimestamp,
  * is ADVANCED + GPS enabled. */
 void            MESHNETWORK_vSetDiscoveryMode(DiscoveryMode_e eMode);
 DiscoveryMode_e MESHNETWORK_eGetDiscoveryMode(void);
+
+/* Setting locks (kernel "d <min> lock", "m <mode> lock").
+ *
+ * The wake interval and the discovery mode normally follow whatever the
+ * system says: the fr9 (AT+SETREQ) on a primary, the TimeSync on a
+ * secondary. A lock pins the local value so neither of those can change it,
+ * for bench work and field trials of one tag without reconfiguring the whole
+ * system. The kernel setters above still work while locked.
+ *
+ * Locks live in RAM only and every boot starts unlocked, so a forgotten lock
+ * cannot strand a tag: a reboot hands it back to the system's settings.
+ *
+ * The _bApplyRemote* calls are the only way the fr9 or a TimeSync change
+ * these two settings; each returns false, and changes nothing, while the
+ * setting is locked. A locked primary still hands its locked value out in
+ * its TimeSync - that is the value it is running. */
+void MESHNETWORK_vLockWakeupInterval(bool bLock);
+bool MESHNETWORK_bWakeupIntervalLocked(void);
+void MESHNETWORK_vLockDiscoveryMode(bool bLock);
+bool MESHNETWORK_bDiscoveryModeLocked(void);
+bool MESHNETWORK_bApplyRemoteWakeupInterval(WakeupInterval tNewInterval);
+bool MESHNETWORK_bApplyRemoteDiscoveryMode(DiscoveryMode_e eMode);
 void            MESHNETWORK_vSetGpsEnabled(bool bEnabled);
 bool            MESHNETWORK_bGetGpsEnabled(void);
 

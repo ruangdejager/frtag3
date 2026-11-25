@@ -96,6 +96,7 @@ void FRKERNEL_vEndSession(const char *pcReason) { (void)pcReason; }
 #include "Flash.h"             /* flash health query / on-demand recovery   */
 #include "Flash_SelfTest.h"    /* flash self-test + stress harness          */
 #include "Identity.h"          /* serial number: 'n', 'N', status line      */
+#include "LoRaWan.h"           /* DevEUI and join state: 'l'                */
 #include "SelfTest.h"          /* production test: 'u'                      */
 
 #ifdef FRKERNEL_INTERFACE_UART
@@ -668,6 +669,25 @@ static void FRKERNEL_vFormatStatus(char *resp, size_t szResp)
                    (unsigned long)HAL_GetUIDw0());
 }
 
+/* Split a settings argument "<value>[ lock]" into the value and the lock
+ * request. False when the value is empty or does not fit acVal. Used by 'd'
+ * and 'm', so the two read "lock" the same way. */
+static bool FRKERNEL_bSplitLockArg(const char *pcArg, char *acVal, size_t szVal, bool *pbLock)
+{
+    static const char acSuffix[] = " lock";
+    size_t szArg    = strlen(pcArg);
+    size_t szSuffix = sizeof(acSuffix) - 1U;
+
+    *pbLock = (szArg > szSuffix) && (strcmp(&pcArg[szArg - szSuffix], acSuffix) == 0);
+    if (*pbLock) szArg -= szSuffix;
+    while ((szArg > 0U) && (pcArg[szArg - 1U] == ' ')) szArg--;
+
+    if ((szArg == 0U) || (szArg >= szVal)) return false;
+    memcpy(acVal, pcArg, szArg);
+    acVal[szArg] = '\0';
+    return true;
+}
+
 /* SelfTestReply_f adapter: the production test streams several lines, each
  * going back on the transport the command came in on. */
 static void FRKERNEL_vSelfTestReply(void *pvCtx, const char *pcLine)
@@ -914,25 +934,48 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
 
     case 'd':
     {
+        /* d                  show
+         * d <min> [lock]     set; "lock" also pins it against fr9/TimeSync
+         * d unlock           hand it back to the system's settings
+         *
+         * Bulk-capable ("d 60 lock" on a bulk connection): every connected tag
+         * applies it. Unlocked, a single tag's value is overwritten by the
+         * primary's next TimeSync, which broadcasts whatever interval the
+         * PRIMARY holds - for a lasting change, set it on the primary (or the
+         * fr9's minWindow), or lock it here. A lock lasts until "d unlock" or
+         * the next reboot (see MESHNETWORK_vLockWakeupInterval).
+         *
+         * Validity is a separate flag, not a sentinel enum value (review F25,
+         * 2026-11-13): WAKEUP_INTERVAL_MAX_COUNT aliases WAKEUP_INTERVAL_240_MIN. */
         if (*pcArg == '\0')
         {
-            (void)snprintf(resp, sizeof(resp), "discovery interval: %u min\r\n",
+            (void)snprintf(resp, sizeof(resp), "discovery interval: %u min%s\r\n",
+                           (unsigned)MESHNETWORK_u8GetWakeupInterval(),
+                           MESHNETWORK_bWakeupIntervalLocked() ? " (locked)" : "");
+            FRKERNEL_vReply(pCtx, resp);
+            break;
+        }
+        if (strcmp(pcArg, "unlock") == 0)
+        {
+            MESHNETWORK_vLockWakeupInterval(false);
+            (void)snprintf(resp, sizeof(resp), "discovery interval unlocked (%u min until the next settings update)\r\n",
                            (unsigned)MESHNETWORK_u8GetWakeupInterval());
             FRKERNEL_vReply(pCtx, resp);
             break;
         }
 
-        /* Bulk-capable ("d 60" on a bulk connection): every connected tag
-         * applies it. A single tag's value is overwritten by the primary's next
-         * TimeSync, which broadcasts whatever interval the PRIMARY holds - for
-         * a lasting change, set it on the primary (or the fr9's minWindow).
-         *
-         * Validity is a separate flag, not a sentinel enum value (review F25,
-         * 2026-11-13): WAKEUP_INTERVAL_MAX_COUNT aliases WAKEUP_INTERVAL_240_MIN. */
+        bool bLock = false;
+        char acVal[16];
+        if (!FRKERNEL_bSplitLockArg(pcArg, acVal, sizeof(acVal), &bLock))
+        {
+            FRKERNEL_vReply(pCtx, "usage: d [15|30|60|120|240 [lock] | unlock]\r\n");
+            break;
+        }
+
         char    *pcEnd;
-        uint32_t u32Mins = (uint32_t)strtoul(pcArg, &pcEnd, 10);
+        uint32_t u32Mins = (uint32_t)strtoul(acVal, &pcEnd, 10);
         WakeupInterval eNew = WAKEUP_INTERVAL_15_MIN;
-        bool bValid = (pcEnd != pcArg) && (*pcEnd == '\0');
+        bool bValid = (pcEnd != acVal) && (*pcEnd == '\0');
         if      (u32Mins == 15U)  eNew = WAKEUP_INTERVAL_15_MIN;
         else if (u32Mins == 30U)  eNew = WAKEUP_INTERVAL_30_MIN;
         else if (u32Mins == 60U)  eNew = WAKEUP_INTERVAL_60_MIN;
@@ -943,14 +986,93 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         if (bValid)
         {
             MESHNETWORK_vSetWakeupInterval(eNew);
-            (void)snprintf(resp, sizeof(resp), "discovery interval set to %u min\r\n",
-                           (unsigned)u32Mins);
+            if (bLock) MESHNETWORK_vLockWakeupInterval(true);
+            DBG_LOG("FrKernel: discovery interval set to %u min%s\r\n", (unsigned)u32Mins,
+                    MESHNETWORK_bWakeupIntervalLocked() ? " (locked)" : "");
+            (void)snprintf(resp, sizeof(resp), "discovery interval set to %u min%s\r\n",
+                           (unsigned)u32Mins,
+                           MESHNETWORK_bWakeupIntervalLocked() ? " (locked)" : "");
         }
         else
         {
             (void)snprintf(resp, sizeof(resp),
-                           "invalid interval '%s' - allowed: 15,30,60,120,240\r\n", pcArg);
+                           "invalid interval '%s' - allowed: 15,30,60,120,240\r\n", acVal);
         }
+        FRKERNEL_vReply(pCtx, resp);
+        break;
+    }
+
+    case 'm':
+    {
+        /* m                       show
+         * m adv|lora [lock]       set; "lock" also pins it against fr9/TimeSync
+         * m unlock                hand it back to the system's settings
+         *
+         * Same lock rules as 'd'. This is the bench route into LoRaWAN mode: a
+         * lone secondary has no primary to send it a TimeSync, so "m lora"
+         * (lock optional there, as nothing will override it) is the only way
+         * in. It joins at the next 15-minute report slot and sends its first
+         * report at the slot after. On a primary it changes what the primary
+         * runs and what its TimeSync hands every secondary. */
+        if (*pcArg == '\0')
+        {
+            (void)snprintf(resp, sizeof(resp), "discovery mode: %s%s\r\n",
+                           (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
+                           MESHNETWORK_bDiscoveryModeLocked() ? " (locked)" : "");
+            FRKERNEL_vReply(pCtx, resp);
+            break;
+        }
+        if (strcmp(pcArg, "unlock") == 0)
+        {
+            MESHNETWORK_vLockDiscoveryMode(false);
+            (void)snprintf(resp, sizeof(resp), "discovery mode unlocked (%s until the next settings update)\r\n",
+                           (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced");
+            FRKERNEL_vReply(pCtx, resp);
+            break;
+        }
+
+        bool bLock = false;
+        char acVal[16];
+        DiscoveryMode_e eNew = DISCOVERY_MODE_ADVANCED;
+        bool bValid = FRKERNEL_bSplitLockArg(pcArg, acVal, sizeof(acVal), &bLock);
+        if (bValid)
+        {
+            if      ((strcmp(acVal, "adv")  == 0) || (strcmp(acVal, "advanced") == 0)) eNew = DISCOVERY_MODE_ADVANCED;
+            else if ((strcmp(acVal, "lora") == 0) || (strcmp(acVal, "lorawan")  == 0)) eNew = DISCOVERY_MODE_LORAWAN;
+            else bValid = false;
+        }
+        if (!bValid)
+        {
+            FRKERNEL_vReply(pCtx, "usage: m [adv|lora [lock] | unlock]\r\n");
+            break;
+        }
+
+        MESHNETWORK_vSetDiscoveryMode(eNew);
+        if (bLock) MESHNETWORK_vLockDiscoveryMode(true);
+        DBG_LOG("FrKernel: discovery mode set to %s%s\r\n",
+                (eNew == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
+                MESHNETWORK_bDiscoveryModeLocked() ? " (locked)" : "");
+        (void)snprintf(resp, sizeof(resp), "discovery mode set to %s%s\r\n",
+                       (eNew == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
+                       MESHNETWORK_bDiscoveryModeLocked() ? " (locked)" : "");
+        FRKERNEL_vReply(pCtx, resp);
+        break;
+    }
+
+    case 'l':
+    {
+        /* LoRaWAN identity and state: the DevEUI to register in TTN, whether
+         * this boot has joined, and the mode. Never the AppKey - it is not
+         * extractable (lorawan_conf.h, KEY_EXTRACTABLE 0). */
+        uint8_t au8Eui[8];
+        LORAWAN_vGetDevEui(au8Eui);
+        (void)snprintf(resp, sizeof(resp),
+                       "lorawan: DevEUI=%02X%02X%02X%02X%02X%02X%02X%02X joined=%u mode=%s%s\r\n",
+                       au8Eui[0], au8Eui[1], au8Eui[2], au8Eui[3],
+                       au8Eui[4], au8Eui[5], au8Eui[6], au8Eui[7],
+                       (unsigned)LORAWAN_bIsJoined(),
+                       (MESHNETWORK_eGetDiscoveryMode() == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
+                       MESHNETWORK_bDiscoveryModeLocked() ? " (locked)" : "");
         FRKERNEL_vReply(pCtx, resp);
         break;
     }

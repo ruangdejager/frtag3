@@ -45,7 +45,7 @@ bool     FARMRANGER_bDeviceOn(void);
 void     FARMRANGER_vDeviceOff(void);
 uint64_t FARMRANGER_u64RequestTimestamp(void);
 /* Fetch the primary's per-system settings from the logger in one AT round
- * trip: wake interval (min), discovery mode (false=advanced, true=LoRaWAN),
+ * trip: wake interval (min), discovery mode (false=advanced, true=LoRaWAN; basic reads as advanced),
  * GPS enable (false=disabled/battery-save, true=normal). Returns true on
  * a fully-parsed response; on false the caller keeps its previous
  * defaults. Wire format is documented in FARMRANGER_bRequestSettings's

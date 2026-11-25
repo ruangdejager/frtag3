@@ -1073,19 +1073,25 @@ void DEVICE_DISCOVERY_vAppTask(void *pvParameters)
                                                             &bLoRaWanMode,
                                                             &bGpsEnabled))
                 {
-                    if      (u8WakeInterval == 15)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_15_MIN);
-                    else if (u8WakeInterval == 30)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_30_MIN);
-                    else if (u8WakeInterval == 60)  MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_60_MIN);
-                    else if (u8WakeInterval == 120) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_120_MIN);
-                    else if (u8WakeInterval == 240) MESHNETWORK_vSetWakeupInterval(WAKEUP_INTERVAL_240_MIN);
+                    /* A kernel lock (MESHNETWORK_vLock*) keeps the local
+                     * value: the _bApplyRemote* calls refuse while locked. */
+                    bool bIntervalApplied = true;
+                    if      (u8WakeInterval == 15)  bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(WAKEUP_INTERVAL_15_MIN);
+                    else if (u8WakeInterval == 30)  bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(WAKEUP_INTERVAL_30_MIN);
+                    else if (u8WakeInterval == 60)  bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(WAKEUP_INTERVAL_60_MIN);
+                    else if (u8WakeInterval == 120) bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(WAKEUP_INTERVAL_120_MIN);
+                    else if (u8WakeInterval == 240) bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(WAKEUP_INTERVAL_240_MIN);
 
-                    MESHNETWORK_vSetDiscoveryMode(bLoRaWanMode ? DISCOVERY_MODE_LORAWAN
-                                                              : DISCOVERY_MODE_ADVANCED);
+                    bool bModeApplied = MESHNETWORK_bApplyRemoteDiscoveryMode(
+                                            bLoRaWanMode ? DISCOVERY_MODE_LORAWAN
+                                                         : DISCOVERY_MODE_ADVANCED);
                     MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
 
-                    DBG_LOG("DeviceDiscovery: settings applied - interval=%u min, mode=%s, gps=%u\r\n",
+                    DBG_LOG("DeviceDiscovery: settings applied - interval=%u min%s, mode=%s%s, gps=%u\r\n",
                             (unsigned)u8WakeInterval,
+                            bIntervalApplied ? "" : " (locked, kept)",
                             bLoRaWanMode ? "lorawan" : "advanced",
+                            bModeApplied ? "" : " (locked, kept)",
                             (unsigned)bGpsEnabled);
                 }
                 else

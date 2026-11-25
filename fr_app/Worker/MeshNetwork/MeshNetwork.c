@@ -856,10 +856,11 @@ static bool MESHNETWORK_bEncodeDAck(const MeshPktDAck_t *ptAck,
  * before the flag existed — so bumping the packet from 10 -> 11 bytes
  * is backward-compatible in both directions. */
 #define MESH_TIMESYNC_FLAG_GPS_ENABLED   0x01U
-/* bit1 was BASIC_MODE until v2.5.0; LoRaWAN mode took over the same wire
- * value, so a v2.4.x primary configured for "basic" and a v2.5 one for
- * "LoRaWAN" send the same flags byte. See DiscoveryMode_e. */
-#define MESH_TIMESYNC_FLAG_LORAWAN_MODE  0x02U
+/* bit1 is frtag2's BASIC_MODE. frtag3 never sends it and runs advanced when
+ * it hears it. LoRaWAN mode borrowed bit1 until 2026-11-25 and now has bit2
+ * of its own, which frtag2 ignores - see DiscoveryMode_e for the split. */
+#define MESH_TIMESYNC_FLAG_BASIC_MODE    0x02U
+#define MESH_TIMESYNC_FLAG_LORAWAN_MODE  0x04U
 #define MESH_TIMESYNC_LEN                11U
 
 static bool MESHNETWORK_bEncodeTimeSync(const MeshPktTimeSync_t *ptTS,
@@ -1870,6 +1871,11 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
         uint8_t u8Flags = pBuf[10];
         eMode       = (u8Flags & MESH_TIMESYNC_FLAG_LORAWAN_MODE) ? DISCOVERY_MODE_LORAWAN : DISCOVERY_MODE_ADVANCED;
         bGpsEnabled = (u8Flags & MESH_TIMESYNC_FLAG_GPS_ENABLED)  ? true                   : false;
+        /* A frtag2 primary in basic mode: frtag3 has no basic, so it runs
+         * advanced (eMode already says so). Logged on every copy so a
+         * secondary that stays silent under such a primary is explainable. */
+        if ((u8Flags & MESH_TIMESYNC_FLAG_BASIC_MODE) != 0U)
+            DBG_LOG("MeshNetwork: TimeSync asks for basic mode - not on frtag3, running advanced\r\n");
     }
 
     /* DBG -> DBG_LOG, with RSSI. Every copy that reaches this node is now
@@ -1966,13 +1972,14 @@ static void MESHNETWORK_vHandleTimeSync(const uint8_t *pBuf,
     if (!bTimeSyncAcceptedThisWake)
     {
         RTC_vSetUTC(u32Utc);
-        MESHNETWORK_vSetWakeupInterval(tInterval);
-        MESHNETWORK_vSetDiscoveryMode(eMode);
+        bool bIntervalApplied = MESHNETWORK_bApplyRemoteWakeupInterval(tInterval);
+        bool bModeApplied     = MESHNETWORK_bApplyRemoteDiscoveryMode(eMode);
         MESHNETWORK_vSetGpsEnabled(bGpsEnabled);
         bTimeSyncAcceptedThisWake = true;
-        DBG_LOG("MeshNetwork: TimeSync applied: %u interval=%u mode=%s gps=%u\r\n",
-                u32Utc, tInterval,
+        DBG_LOG("MeshNetwork: TimeSync applied: %u interval=%u%s mode=%s%s gps=%u\r\n",
+                u32Utc, tInterval, bIntervalApplied ? "" : " (locked, kept)",
                 (eMode == DISCOVERY_MODE_LORAWAN) ? "lorawan" : "advanced",
+                bModeApplied ? "" : " (locked, kept)",
                 (unsigned)bGpsEnabled);
 
         /* Auto-arming firmware acceptance used to live here. It is now done
@@ -2758,6 +2765,33 @@ void MESHNETWORK_vSetDiscoveryMode(DiscoveryMode_e eMode)
         eCurrentDiscoveryMode = eMode;
 }
 DiscoveryMode_e MESHNETWORK_eGetDiscoveryMode(void) { return eCurrentDiscoveryMode; }
+
+/* Setting locks - see MeshNetwork.h. Plain RAM statics, zero at every boot,
+ * which is the "a reboot always unlocks" guarantee: nothing persists them.
+ * Written by the kernel task, read by the AppTask and the parser task; a
+ * bool store is atomic on this core, and a lock landing one TimeSync late is
+ * harmless. */
+static volatile bool bWakeupIntervalLocked = false;
+static volatile bool bDiscoveryModeLocked  = false;
+
+void MESHNETWORK_vLockWakeupInterval(bool bLock) { bWakeupIntervalLocked = bLock; }
+bool MESHNETWORK_bWakeupIntervalLocked(void)     { return bWakeupIntervalLocked; }
+void MESHNETWORK_vLockDiscoveryMode(bool bLock)  { bDiscoveryModeLocked = bLock; }
+bool MESHNETWORK_bDiscoveryModeLocked(void)      { return bDiscoveryModeLocked; }
+
+bool MESHNETWORK_bApplyRemoteWakeupInterval(WakeupInterval tNewInterval)
+{
+    if (bWakeupIntervalLocked) return false;
+    MESHNETWORK_vSetWakeupInterval(tNewInterval);
+    return true;
+}
+
+bool MESHNETWORK_bApplyRemoteDiscoveryMode(DiscoveryMode_e eMode)
+{
+    if (bDiscoveryModeLocked) return false;
+    MESHNETWORK_vSetDiscoveryMode(eMode);
+    return true;
+}
 
 void MESHNETWORK_vSetGpsEnabled(bool bEnabled) { bCurrentGpsEnabled = bEnabled; }
 bool MESHNETWORK_bGetGpsEnabled(void)          { return bCurrentGpsEnabled; }
