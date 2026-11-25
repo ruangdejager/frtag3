@@ -4,3 +4,5 @@
 
 # Local OTAA credentials - copy lorawan_keys_template.h, never commit
 fr_app/Worker/LoRaWan/lorawan_keys.h
+# Production station's TTN import files carry the AppKey (provision_tag.ps1)
+production/ttn_import_*.csv

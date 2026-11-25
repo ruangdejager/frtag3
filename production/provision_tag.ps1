@@ -35,6 +35,9 @@
 #   5. Writes the serial number (kernel 'N') if the unit has none - only after
 #      the production test passed, so a failed board does not use a serial -
 #      and reads it back (kernel 'n').
+#   5b. Secondary: reads the LoRaWAN DevEUI (kernel 'l') and, when the run
+#      passes, adds the unit to a The Things Stack import file (see "TTN
+#      import" below).
 #   6. Secondary: puts the tag into production sleep (kernel 'P', persisted, so
 #      the tag stays asleep through resets until its panel or a shake wakes it)
 #      and measures the SLEEP CURRENT again - the final pass, which proves that
@@ -62,6 +65,23 @@
 # The unit database is this station's own file. Two stations each with their
 # own database would hand out the same numbers: run one station, or share the
 # database between them (one run at a time).
+#
+# TTN import
+#   A secondary in LoRaWAN mode only gets online once it is registered in The
+#   Things Stack under its DevEUI, which only the tag can tell us. Typing those
+#   in one by one is where a batch of tags would stall, so every passing
+#   secondary is appended to ttn_import_<yyyyMMdd>.csv in -TtnImportDir, in the
+#   Console's CSV import format (semicolon separated; Applications > your app >
+#   End devices > Import end devices > CSV). Upload the day's file once, then
+#   move it away; a DevEUI already in the file is not added twice.
+#   The JoinEUI and AppKey come from -KeysFile, the same git-ignored
+#   lorawan_keys.h the firmware was built from - build and station must use
+#   the same file, or the tags join with a key TTN does not have. The import
+#   file therefore holds the AppKey: it is git-ignored too and must not be
+#   shared beyond the TTN upload. Pilot fleet only - see
+#   lorawan_keys_template.h for the move to per-device keys.
+#   Without a keys file the DevEUI is still logged, and the row is skipped
+#   with a note.
 #
 # Requirements
 #   - STM32CubeProgrammer (STM32_Programmer_CLI.exe).
@@ -106,6 +126,10 @@ param(
     [string] $TestLog   = (Join-Path $PSScriptRoot 'production_tests.csv'),
     [string] $RunLogDir = (Join-Path $PSScriptRoot 'runs'),
 
+    [string] $TtnImportDir = $PSScriptRoot,
+    [string] $KeysFile     = (Join-Path $PSScriptRoot '..\fr_app\Worker\LoRaWan\lorawan_keys.h'),
+    [string] $TtnIdPrefix  = 'frtag',   # TTN device id = <prefix>-<serial>, e.g. frtag-31000001
+
     [switch] $NoOtii,
     [double] $SupplyV = 3.8,        # Otii output, both roles (same battery)
     [int]    $HoldS = 10,
@@ -137,6 +161,13 @@ $BOOT_WINDOW_S     = 30           # APP_BOOT_WINDOW_MS, DeviceDiscovery.h
 $SN_HW_VERSION     = 3            # IDENTITY_SERIAL_HW_VERSION, Identity_Config.h
 $SN_FAMILY_MASK    = 0xFF000000L  # version + revision digits
 $SN_UNIT_MASK      = 0x00FFFFFFL  # IDENTITY_SERIAL_UNIT_MASK
+# The Things Stack registration values for these tags. They must match what
+# the firmware speaks: LoRaWAN 1.0.4 (LORAMAC_SPECIFICATION_VERSION,
+# lorawan_conf.h), RP002 1.0.1 (REGION_VERSION 0x02010001, RegionVersion.h),
+# EU868 with TTN's SF9 RX2 (lorawan_keys_template.h).
+$TTN_FREQ_PLAN     = 'EU_863_870_TTN'
+$TTN_MAC_VERSION   = 'MAC_V1_0_4'
+$TTN_PHY_VERSION   = 'RP002_V1_0_1'
 # Note for anyone editing: in Windows PowerShell a hex literal of 0x80000000
 # or more is a NEGATIVE [int] (0xFFFFFFFF is -1). Every such constant below
 # carries the L suffix to make it a positive [long].
@@ -325,6 +356,50 @@ function Read-Target {
 }
 
 function Format-Uid([uint32[]] $uid) { '{0:X8}{1:X8}{2:X8}' -f $uid[2], $uid[1], $uid[0] }
+
+# ---- LoRaWAN / TTN import -------------------------------------------------
+
+# JoinEUI and AppKey from lorawan_keys.h ("#define FRTAG_LORAWAN_APP_KEY 2B,7E,..."),
+# as plain upper-case hex. $null when the file is missing or a value does not
+# parse; an all-zero AppKey (the unedited template) also counts as missing.
+function Get-LoRaWanKeys([string] $path) {
+    if (-not (Test-Path $path)) { return $null }
+    $text = Get-Content -Path $path -Raw
+    $out = @{}
+    foreach ($pair in @(@('JoinEui', 'FRTAG_LORAWAN_JOIN_EUI', 8), @('AppKey', 'FRTAG_LORAWAN_APP_KEY', 16))) {
+        $m = [regex]::Match($text, '(?m)^\s*#define\s+' + $pair[1] + '\s+([0-9A-Fa-f]{2}(?:\s*,\s*[0-9A-Fa-f]{2})*)')
+        if (-not $m.Success) { return $null }
+        $bytes = @($m.Groups[1].Value -split '\s*,\s*')
+        if ($bytes.Count -ne $pair[2]) { return $null }
+        $out[$pair[0]] = ($bytes -join '').ToUpper()
+    }
+    if ($out.AppKey -match '^0+$') { return $null }
+    return $out
+}
+
+# One row of The Things Stack's CSV import format (semicolon separated,
+# header required). Skips a DevEUI the file already holds.
+function Add-TtnImportRow([string] $devEui, [string] $serial) {
+    $keys = Get-LoRaWanKeys $KeysFile
+    if (-not $keys) {
+        Add-Note "no usable LoRaWAN keys in $KeysFile - DevEUI $devEui not added to a TTN import file"
+        return
+    }
+    if (-not (Test-Path $TtnImportDir)) { New-Item -ItemType Directory -Path $TtnImportDir | Out-Null }
+    $file = Join-Path $TtnImportDir ('ttn_import_' + $RunStamp.ToString('yyyyMMdd') + '.csv')
+    if (Test-Path $file) {
+        if (Select-String -Path $file -Pattern (';' + $devEui + ';') -SimpleMatch -Quiet) {
+            Log "DevEUI $devEui already in $file"
+            return
+        }
+    } else {
+        Set-Content -Path $file -Encoding ASCII -Value 'id;name;dev_eui;join_eui;app_key;frequency_plan_id;lorawan_version;lorawan_phy_version'
+    }
+    $id = ('{0}-{1}' -f $TtnIdPrefix, $serial).ToLower()
+    Add-Content -Path $file -Encoding ASCII -Value (@($id, $serial, $devEui, $keys.JoinEui, $keys.AppKey,
+        $TTN_FREQ_PLAN, $TTN_MAC_VERSION, $TTN_PHY_VERSION) -join ';')
+    Log "TTN import: $id DevEUI $devEui added to $file" 'Green'
+}
 
 function Find-FlashHex {
     if ($FlashHex -ne '') { return $FlashHex }
@@ -737,6 +812,21 @@ try {
     elseif ($nLine -match '^serial: ([0-9A-F]{8}) ') { $R.SerialOnTag = $Matches[1] }
     else { $R.SerialOnTag = 'none' }
 
+    # -- 5b. LoRaWAN DevEUI (secondary) --
+    # Read from the tag rather than derived here: the firmware's own answer is
+    # by definition what it will join with. Its absence is a note, not a fail -
+    # firmware before kernel 'l' still provisions.
+    if ($Role -eq 'secondary') {
+        Send-Line 'l'
+        $lLine = Wait-Line '^lorawan: DevEUI=' 5
+        if ($lLine -and $lLine -match '^lorawan: DevEUI=([0-9A-F]{16}) ') {
+            $R.DevEui = $Matches[1]
+            Log "DevEUI   $($R.DevEui)"
+        } else {
+            Add-Note "no DevEUI from the tag (kernel 'l') - firmware too old?"
+        }
+    }
+
     # -- 6. Sleep and final-pass current --
     if ($Role -eq 'secondary') {
         Send-Line 'P'
@@ -763,10 +853,15 @@ try {
             [pscustomobject]@{
                 Timestamp = $R.Timestamp; Serial = $snText; RadioId = $idText; Uid = $uidText
                 OtpSlot = $cur.Slot; Role = $Role; Firmware = $R.Fw; Operator = $Operator
-            } | Export-Csv -Path $Database -Append -NoTypeInformation
+                DevEui = $(if ($R.Contains('DevEui')) { $R.DevEui } else { '' })
+            } | Export-Csv -Path $Database -Append -NoTypeInformation -Force
             Log "Unit recorded in $Database"
         }
     }
+
+    # Only a unit that passed everything goes to TTN: a failed one must not
+    # be able to join the network as if it were in the fleet.
+    if ($script:Fails.Count -eq 0 -and $R.Contains('DevEui')) { Add-TtnImportRow $R.DevEui $snText }
 
     if ($script:Fails.Count -eq 0) { $exitCode = 0 }
 }
@@ -788,13 +883,16 @@ finally {
     if ($R.Result -ne 'DRYRUN') {
         # Fixed column set so rows from different runs line up whatever a run
         # managed to fill in.
-        $cols = 'Timestamp', 'Result', 'Serial', 'SerialOnTag', 'RadioId', 'Uid', 'RunNumber', 'RoleWanted', 'Role',
+        # -Force on append: a log started before a column was added keeps its
+        # own header, and the new column is dropped from its rows rather than
+        # failing the run at its very end.
+        $cols = 'Timestamp', 'Result', 'Serial', 'SerialOnTag', 'RadioId', 'Uid', 'DevEui', 'RunNumber', 'RoleWanted', 'Role',
                 'Fw', 'Bl', 'Flashed', 'PT_flash', 'PT_flashdetail', 'PT_acc', 'PT_gps', 'PT_radio', 'PT_nf',
                 'PT_bat', 'PT_sol', 'Otii', 'SupplyV', 'SleepStart_uA', 'SleepStartMax_uA', 'AllOn_mA',
                 'AllOnMax_mA', 'SleepEnd_uA', 'SleepEndMax_uA', 'Failures', 'Notes', 'Station', 'Operator', 'RunLog'
         $row = [ordered]@{}
         foreach ($c in $cols) { $row[$c] = $(if ($R.Contains($c)) { $R[$c] } else { '' }) }
-        [pscustomobject]$row | Export-Csv -Path $TestLog -Append -NoTypeInformation
+        [pscustomobject]$row | Export-Csv -Path $TestLog -Append -NoTypeInformation -Force
     }
 
     Log ''

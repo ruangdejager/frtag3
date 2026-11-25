@@ -2,14 +2,22 @@
  * lorawan_keys_template.h
  *
  * Template for lorawan_keys.h, which holds the OTAA join credentials and is
- * git-ignored. To set up a build:
+ * git-ignored. To set up a build, either:
  *
- *   1. Copy this file to lorawan_keys.h in the same directory.
- *   2. In the TTN console, open the application the tags are registered in
- *      and copy the AppKey (MSB order) into FRTAG_LORAWAN_APP_KEY below,
- *      one byte per comma-separated pair, no 0x prefix.
- *   3. Leave the JoinEUI at all zeros unless the TTN end devices were
- *      registered with a different one.
+ *   - run build_scripts/new_lorawan_keys.ps1, which writes lorawan_keys.h
+ *     from this template with a fresh random AppKey. Use this for a new
+ *     fleet: the key exists before any tag does, and the production station
+ *     (production/provision_tag.ps1) copies it into the TTN import file for
+ *     every tag it passes; or
+ *   - by hand, for a key that already exists in TTN:
+ *       1. Copy this file to lorawan_keys.h in the same directory.
+ *       2. Copy the AppKey (MSB order) into FRTAG_LORAWAN_APP_KEY below,
+ *          one byte per comma-separated pair, no 0x prefix.
+ *       3. Leave the JoinEUI at all zeros unless the TTN end devices were
+ *          registered with a different one.
+ *
+ * Keep a backup of lorawan_keys.h outside the repo: losing it means
+ * rebuilding and re-registering every tag.
  *
  * Pilot fleet: ONE AppKey shared by every tag (agreed 2026-09-29). Each tag
  * is still registered in TTN separately, by its own DevEUI, all with this
