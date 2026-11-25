@@ -55,7 +55,9 @@
  * -------------------------------------------------------------------------- */
 
 /* ---- CW test (kernel C) ---- */
-#define CW_TEST_DURATION_MS     (60U * 1000U)   /* carrier on for 1 min     */
+/* Carrier duration: RADIOTESTMODE_bEnterCw(u8Minutes), default and ceiling in
+ * RadioTestMode.h (RADIOTESTMODE_CW_DEFAULT_MIN / _MAX_MIN). */
+#define CW_TEST_MS_PER_MIN      (60U * 1000U)
 
 /* The carrier starts on the TX worker no sooner than this after entry, and
  * only once the radio has nothing of ours left to send: FrKernel acks the
@@ -121,6 +123,7 @@ typedef struct {
     bool     bGps;                /* GPS held on ("B gps")                  */
     bool     bCw;                 /* this is the CW test (kernel C)         */
     bool     bCwOn;               /* CW: carrier started                    */
+    uint32_t u32CwMs;             /* CW: how long the carrier stays on      */
 } RtmCtx_t;
 
 /* The gates in MeshNetwork's parser and TX paths read bActive on every packet,
@@ -143,7 +146,7 @@ static uint16_t u16RssiSeq            = 0U;
 static uint8_t  u8RssiFramesSinceBoot = 0U;
 
 static uint8_t  RTM_u8BuildFrame(uint8_t *pu8Buf, uint16_t u16Seq, bool bGps);
-static bool     RTM_bEnter(bool bCw, bool bGps);
+static bool     RTM_bEnter(bool bCw, bool bGps, uint32_t u32CwMs);
 static uint32_t RTM_u32ServiceCw(uint32_t u32Now);
 
 /* --------------------------------------------------------------------------
@@ -156,13 +159,22 @@ const char *RADIOTESTMODE_pcLastEnterError(void) { return pcLastEnterError; }
 /* --------------------------------------------------------------------------
  * RADIOTESTMODE_bEnter
  * -------------------------------------------------------------------------- */
-bool RADIOTESTMODE_bEnter(bool bGps) { return RTM_bEnter(false, bGps); }
-bool RADIOTESTMODE_bEnterCw(void)    { return RTM_bEnter(true, false); }
+bool RADIOTESTMODE_bEnter(bool bGps) { return RTM_bEnter(false, bGps, 0U); }
+bool RADIOTESTMODE_bEnterCw(uint8_t u8Minutes)
+{
+    /* 0 means "the default"; anything over the ceiling is held to it, so a
+     * mistyped "C 50" is a 5-minute carrier, not an hour of one. */
+    if (u8Minutes == 0U)
+        u8Minutes = RADIOTESTMODE_CW_DEFAULT_MIN;
+    if (u8Minutes > RADIOTESTMODE_CW_MAX_MIN)
+        u8Minutes = RADIOTESTMODE_CW_MAX_MIN;
+    return RTM_bEnter(true, false, (uint32_t)u8Minutes * CW_TEST_MS_PER_MIN);
+}
 
 /* Both tests share the whole set-up: the sleep lock, the radio held awake, the
  * mesh stood down and every RADIOTESTMODE_bActive() gate. They differ only in
  * what the TX worker then does with the radio (RADIOTESTMODE_u32ServiceBeacon). */
-static bool RTM_bEnter(bool bCw, bool bGps)
+static bool RTM_bEnter(bool bCw, bool bGps, uint32_t u32CwMs)
 {
     pcLastEnterError = "";
 
@@ -211,6 +223,7 @@ static bool RTM_bEnter(bool bCw, bool bGps)
     memset(pNew, 0, sizeof(RtmCtx_t));
     pNew->bGps              = bGps;
     pNew->bCw               = bCw;
+    pNew->u32CwMs           = u32CwMs;
     pNew->u32EnterTick      = osKernelGetTickCount();
     /* RSSI: due immediately, so the first frame goes out on the TX worker's
      * very next pass rather than 10 s after the operator sees the ack.
@@ -265,7 +278,7 @@ static bool RTM_bEnter(bool bCw, bool bGps)
      * comparison rather than a first data point. */
     if (bCw)
         DBG_LOG("RadioTest: CW test ENTERED (%u s carrier), %u B heap free\r\n",
-                (unsigned)(CW_TEST_DURATION_MS / 1000U), (unsigned)xPortGetFreeHeapSize());
+                (unsigned)(u32CwMs / 1000U), (unsigned)xPortGetFreeHeapSize());
     else
         DBG_LOG("RadioTest: RSSI test ENTERED%s (10 s, 1 h limit), %u B heap free\r\n",
                 bGps ? " with GPS" : "", (unsigned)xPortGetFreeHeapSize());
@@ -489,6 +502,7 @@ static uint32_t RTM_u32ServiceCw(uint32_t u32Now)
 {
     bool     bOn;
     uint32_t u32Enter;
+    uint32_t u32CwMs;
     taskENTER_CRITICAL();
     if (!bActive || pCtx == NULL)
     {
@@ -497,6 +511,7 @@ static uint32_t RTM_u32ServiceCw(uint32_t u32Now)
     }
     bOn      = pCtx->bCwOn;
     u32Enter = pCtx->u32EnterTick;
+    u32CwMs  = pCtx->u32CwMs;
     taskEXIT_CRITICAL();
 
     if (bOn)
@@ -536,13 +551,13 @@ static uint32_t RTM_u32ServiceCw(uint32_t u32Now)
         return osWaitForever;
     }
     pCtx->bCwOn             = true;
-    pCtx->u32NextBeaconTick = u32Now + CW_TEST_DURATION_MS;
+    pCtx->u32NextBeaconTick = u32Now + u32CwMs;
     taskEXIT_CRITICAL();
 
     DBG_LOG("RadioTest: CW carrier ON %lu Hz %d dBm for %u s\r\n",
             (unsigned long)RF_FREQUENCY, (int)TX_OUTPUT_POWER,
-            (unsigned)(CW_TEST_DURATION_MS / 1000U));
-    return CW_TEST_DURATION_MS;
+            (unsigned)(u32CwMs / 1000U));
+    return u32CwMs;
 }
 
 /* --------------------------------------------------------------------------

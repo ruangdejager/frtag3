@@ -65,7 +65,7 @@ static const FrkCmd_t s_atCmds[] = {
     { 'S', 0U,                              "",          "solar sleep - wakes on shake only (secondary)" },
     { 'B', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[gps]",     "RSSI test: beacon every 10 s, 1 h limit,"
                                                          " shake to end" },
-    { 'C', FRK_CMDF_SINGLE,                 "",          "CW test: unmodulated carrier for 1 min, shake to end" },
+    { 'C', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[min]",     "CW test: carrier for min (default 1, max 5), shake to end" },
     { 'Q', 0U,                              "",          "quit the RSSI or CW test (UART only - deaf over LoRa)" },
     { 'N', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "<serial hex> <radio id> [fix]",
                                                          "WRITE the serial number to OTP - permanent;"

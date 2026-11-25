@@ -37,16 +37,17 @@
  *   accelerometer), on kernel 'Q' / 'x' over the UART, or by itself after
  *   RSSI_TEST_TIMEOUT_MS (1 h), after which the tag resumes its schedule.
  *
- * CW test (either role): kernel command C, single-connection only
+ * CW test (either role): kernel command C [min], single-connection only
  *
- *   An unmodulated carrier on RF_FREQUENCY at TX_OUTPUT_POWER for
- *   CW_TEST_DURATION_MS (1 min), for a spectrum analyser or power meter. It
- *   shares everything above - deaf, mesh stood down, LED_AUX lit for the
- *   whole carrier - and ends after the minute, on a shake (secondary), or on
- *   'Q' / 'x' over the UART. The carrier starts once the command's ack and the
- *   session's goodbye have left the radio, so neither is cut off by it.
- *   A full minute of carrier is far beyond the 1 % duty cycle of the 868 MHz
- *   band: a bench / shielded-room test, not one for the field.
+ *   An unmodulated carrier on RF_FREQUENCY at TX_OUTPUT_POWER, for a spectrum
+ *   analyser or power meter: "C" for RADIOTESTMODE_CW_DEFAULT_MIN (1 min),
+ *   "C 3" for 3 min, anything above RADIOTESTMODE_CW_MAX_MIN (5) held to 5.
+ *   It shares everything above - deaf, mesh stood down, LED_AUX lit for the
+ *   whole carrier - and ends when its time is up, on a shake (secondary), or
+ *   on 'Q' / 'x' over the UART. The carrier starts once the command's ack and
+ *   the session's goodbye have left the radio, so neither is cut off by it.
+ *   Even one minute of carrier is far beyond the 1 % duty cycle of the
+ *   868 MHz band: a bench / shielded-room test, not one for the field.
  *
  * The mode is RAM-only and deliberately not persisted: a reboot returns the
  * unit to normal operation. A mode that survived a power cycle would be an
@@ -108,10 +109,17 @@ const char *RADIOTESTMODE_pcLastEnterError(void);
  * already have sent (and let drain) anything it wanted on the air. */
 bool RADIOTESTMODE_bEnter(bool bGps);
 
-/* Enter the CW test (kernel C): same contract and the same failures as
- * RADIOTESTMODE_bEnter, minus the GPS ones. The carrier itself starts a moment
- * later, on the mesh TX worker, once the radio has sent what was queued. */
-bool RADIOTESTMODE_bEnterCw(void);
+/* CW test carrier time, in minutes: what "C" alone gives, and the most any
+ * "C <min>" gets (a larger number is held to it, not refused). */
+#define RADIOTESTMODE_CW_DEFAULT_MIN    1U
+#define RADIOTESTMODE_CW_MAX_MIN        5U
+
+/* Enter the CW test (kernel C) for u8Minutes of carrier: 0 means
+ * RADIOTESTMODE_CW_DEFAULT_MIN, more than RADIOTESTMODE_CW_MAX_MIN is held to
+ * it. Same contract and the same failures as RADIOTESTMODE_bEnter, minus the
+ * GPS ones. The carrier itself starts a moment later, on the mesh TX worker,
+ * once the radio has sent what was queued. */
+bool RADIOTESTMODE_bEnterCw(uint8_t u8Minutes);
 
 /* Leave the test and restore normal operation: stop the beacon, power the GPS
  * down (B gps), release the sleep lock and re-open the mesh gates. Safe when

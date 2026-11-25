@@ -1068,16 +1068,34 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
         break;
 
     case 'C':
-        /* CW test: an unmodulated carrier for 1 min. Entered first so the
-         * reply reflects what happened; the carrier itself only starts once
-         * this ack and the session's BYE have left the radio (RadioTestMode),
-         * so the console hears both. Single-connection only, like B. */
-        if (RADIOTESTMODE_bEnterCw())
+    {
+        /* CW test: an unmodulated carrier for "C" 1 min, "C <n>" n min, held
+         * to RADIOTESTMODE_CW_MAX_MIN. Entered first so the reply reflects
+         * what happened; the carrier itself only starts once this ack and the
+         * session's BYE have left the radio (RadioTestMode), so the console
+         * hears both. Single-connection only, like B. */
+        unsigned long ulMin = RADIOTESTMODE_CW_DEFAULT_MIN;
+        if (*pcArg != '\0')
         {
-            FRKERNEL_vReply(pCtx,
-                (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
-                    ? "cw test: carrier for 60 s - 'Q' on UART ends it sooner\r\n"
-                    : "cw test: carrier for 60 s - shake to end sooner\r\n");
+            char *pcEnd;
+            ulMin = strtoul(pcArg, &pcEnd, 10);
+            if ((pcEnd == pcArg) || (*pcEnd != '\0') || (ulMin == 0UL))
+            {
+                (void)snprintf(resp, sizeof(resp), "usage: C  or  C <minutes 1..%u>\r\n",
+                               (unsigned)RADIOTESTMODE_CW_MAX_MIN);
+                FRKERNEL_vReply(pCtx, resp);
+                break;
+            }
+            if (ulMin > RADIOTESTMODE_CW_MAX_MIN)
+                ulMin = RADIOTESTMODE_CW_MAX_MIN;
+        }
+
+        if (RADIOTESTMODE_bEnterCw((uint8_t)ulMin))
+        {
+            (void)snprintf(resp, sizeof(resp), "cw test: carrier for %lu min - %s\r\n", ulMin,
+                           (DEVICE_DISCOVERY_eGetDeviceRole() == DEVICE_ROLE_PRIMARY)
+                               ? "'Q' on UART ends it sooner" : "shake to end sooner");
+            FRKERNEL_vReply(pCtx, resp);
             FRKERNEL_vTerminal("cw test");
         }
         else
@@ -1087,6 +1105,7 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
             FRKERNEL_vReply(pCtx, resp);
         }
         break;
+    }
 
     case 'Q':
         /* Reaches a tag in a test only over the UART: over LoRa it is deaf. */
