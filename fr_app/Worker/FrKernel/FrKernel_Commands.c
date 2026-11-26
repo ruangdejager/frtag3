@@ -35,6 +35,7 @@ static const FrkCmd_t s_atCmds[] = {
     { 'k', FRK_CMDF_SINGLE,                 "",          "ext-flash read-verify counters (reading clears them)" },
     { 'n', FRK_CMDF_SINGLE,                 "",          "serial number, radio id and where the serial is stored" },
     { 'u', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[hold s]",  "production test: live checks, then all-on for hold s (default 10)" },
+    { 'g', FRK_CMDF_SINGLE | FRK_CMDF_ARG,  "[min|off]", "stream movement filter output, 25 lines/s (UART only, secondary)" },
 
     /* ---- log streaming ---- */
     { 'a', FRK_CMDF_SINGLE,                 "",          "stream the whole ext-flash log" },

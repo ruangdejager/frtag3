@@ -123,6 +123,16 @@
 #define MOVE_STILL_TIMEOUT_S        900U   /* 15 min of envelope ≤ threshold → STILL */
 #define MOVE_STILL_ENV_THRESHOLD      3U   /* envelope ≤ this counts as no motion    */
 
+/* Filtered-output stream (kernel 'g', see MOVE_vStartStream).
+ *
+ * A running stream counts as kernel activity, so it keeps the UART session -
+ * and with it the whole device - out of its schedule for as long as it runs.
+ * The limit is what stops a stream left running on the bench from holding a
+ * tag off its campaigns indefinitely; an hour covers any tuning run, and a
+ * longer one is just "g" again. */
+#define MOVE_STREAM_DEFAULT_MIN      10U
+#define MOVE_STREAM_MAX_MIN          60U
+
 /* Gravity sequence detector */
 #define MOVE_SEQ_GRAV_TH              50    /* |dcLevel| > this → axis carries gravity  */
 #define MOVE_SEQ_GRAV_NULL            10    /* |dcLevel| < this → axis is free          */

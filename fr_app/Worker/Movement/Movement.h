@@ -43,6 +43,40 @@ uint16_t    MOVE_u16GetDailyTriggerCount(void);
 /* Current value of a movementAlarm setting for the day-time zone in force now. */
 uint8_t     MOVE_u8GetAlarmSettingNow(MoveAlarmSetting_e eSetting);
 
+/* Filtered-output stream (kernel "g [min|off]", UART only).
+ *
+ * Prints the algorithm's internal signals for every accelerometer sample, as
+ * plain CSV on the debug UART, so the trigger thresholds can be tuned against
+ * real animal movement. One line per sample, 25 lines/s:
+ *
+ *   MV,<n>,<dx>,<dy>,<dz>,<hp>,<env>,<win>
+ *
+ *   n           sample number since the stream started
+ *   dx,dy,dz    DC level per axis: the 32-sample moving average, i.e. the
+ *               gravity/orientation estimate (the shake-sequence detector
+ *               reads these), in raw counts / MOVE_ACC_RAW_SCALE_VALUE
+ *   hp          this sample's high-passed magnitude, |x-dx|+|y-dy|+|z-dz|
+ *   env         envelope level: the 8-sample moving average of hp. This is
+ *               the value compared with maxLevel.
+ *   win         the max-level window counter after this sample: up one per
+ *               sample at/above maxLevel (in an active zone), down one below.
+ *               A trigger fires when it reaches maxWindow * 25, and it
+ *               restarts at 0.
+ *
+ * Lines starting with '#' carry context: the column list when the stream
+ * starts, and maxLevel / maxWindow / zone-active / in-service whenever they
+ * change (the day-time zone can roll over mid-stream). Trigger and episode
+ * log lines appear in place, between the samples that caused them. Other
+ * debug output is not muted, so a parser should keep only "MV," lines.
+ *
+ * Start (or restart) for u16Minutes, held to MOVE_STREAM_MAX_MIN; 0 means
+ * MOVE_STREAM_DEFAULT_MIN. Stop ends it at once. Both may be called from any
+ * task; the Movement task does all the printing. A no-op on a primary, where
+ * the Movement task does not run - the caller refuses it there. */
+void        MOVE_vStartStream(uint16_t u16Minutes);
+void        MOVE_vStopStream(void);
+bool        MOVE_bStreamActive(void);
+
 #ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
 int8_t MOVE_i8SensorDataX(void);
 int8_t MOVE_i8SensorDataY(void);

@@ -97,6 +97,7 @@ void FRKERNEL_vEndSession(const char *pcReason) { (void)pcReason; }
 #include "Flash_SelfTest.h"    /* flash self-test + stress harness          */
 #include "Identity.h"          /* serial number: 'n', 'N', status line      */
 #include "LoRaWan.h"           /* DevEUI and join state: 'l'                */
+#include "Movement.h"          /* filtered-output stream: 'g'               */
 #include "SelfTest.h"          /* production test: 'u'                      */
 
 #ifdef FRKERNEL_INTERFACE_UART
@@ -378,6 +379,7 @@ static void FRKERNEL_vCloseSession(const char *pcReason, bool bNotify)
         return;
 
     DBGLOG_vCancelDump();
+    MOVE_vStopStream();
 
     /* An explicit "w" arm belongs to this session. v1 left it set after
      * release/timeout, so a later unrelated session (a log download) could
@@ -782,6 +784,64 @@ static void FRKERNEL_vDispatch(const FrkCtx_t *pCtx, char cLetter, const char *p
             }
         }
         (void)SELFTEST_bRunProductionTest(u32Hold, FRKERNEL_vSelfTestReply, (void *)pCtx);
+        break;
+    }
+
+    case 'g':
+    {
+        /* g            stream for MOVE_STREAM_DEFAULT_MIN
+         * g <min>      stream for min, held to MOVE_STREAM_MAX_MIN
+         * g off        stop
+         *
+         * The Movement task prints the samples (format in Movement.h); this
+         * only starts and stops it. A running stream keeps the session open
+         * (FRKERNEL_bBusy) until its time limit, "g off", "x" or anything else
+         * that closes the session, which also stops it.
+         *
+         * UART only: 25 lines/s is ~1 KB/s, several times what a LoRa link
+         * moves, and the lines are written to the debug UART regardless of
+         * where the command came from. Secondary only: a primary has no
+         * accelerometer and does not run the Movement task. */
+        if (pCtx->eXport != FRKERNEL_XPORT_UART)
+        {
+            FRKERNEL_vReply(pCtx, "g: UART only - 25 lines/s does not fit over LoRa\r\n");
+            break;
+        }
+        if (strcmp(pcArg, "off") == 0)
+        {
+            const bool bWasOn = MOVE_bStreamActive();
+            MOVE_vStopStream();
+            FRKERNEL_vReply(pCtx, bWasOn ? "movement stream stopped\r\n"
+                                         : "no movement stream running\r\n");
+            break;
+        }
+        if (DEVICE_DISCOVERY_eGetDeviceRole() != DEVICE_ROLE_SECONDARY)
+        {
+            FRKERNEL_vReply(pCtx, "g: secondary only (no accelerometer on a primary)\r\n");
+            break;
+        }
+
+        unsigned long ulMin = MOVE_STREAM_DEFAULT_MIN;
+        if (*pcArg != '\0')
+        {
+            char *pcEnd;
+            ulMin = strtoul(pcArg, &pcEnd, 10);
+            if ((pcEnd == pcArg) || (*pcEnd != '\0') || (ulMin == 0UL))
+            {
+                (void)snprintf(resp, sizeof(resp), "usage: g  or  g <minutes 1..%u>  or  g off\r\n",
+                               (unsigned)MOVE_STREAM_MAX_MIN);
+                FRKERNEL_vReply(pCtx, resp);
+                break;
+            }
+            if (ulMin > MOVE_STREAM_MAX_MIN)
+                ulMin = MOVE_STREAM_MAX_MIN;
+        }
+
+        /* Ack first, so it lands ahead of the stream's header. */
+        (void)snprintf(resp, sizeof(resp),
+                       "movement stream: 25 lines/s for %lu min - 'g off' stops it\r\n", ulMin);
+        FRKERNEL_vReply(pCtx, resp);
+        MOVE_vStartStream((uint16_t)ulMin);
         break;
     }
 
@@ -1494,11 +1554,13 @@ static void FRKERNEL_vServiceUart(void)
 /* -------------------------------------------------------------------------- */
 
 /* Work in progress that the operator is waiting on keeps the session alive
- * even though no command arrives: a log stream, a FOTA receive/distribute.
- * (The RSSI test is not one: entering it ends the session.) */
+ * even though no command arrives: a log stream, a movement stream, a FOTA
+ * receive/distribute. (The RSSI test is not one: entering it ends the
+ * session.) The movement stream carries its own time limit, so it cannot hold
+ * a session open for ever. */
 static bool FRKERNEL_bBusy(void)
 {
-    return DBGLOG_bDumpBusy() || FOTA_bSessionActive();
+    return DBGLOG_bDumpBusy() || MOVE_bStreamActive() || FOTA_bSessionActive();
 }
 
 /* -------------------------------------------------------------------------- */

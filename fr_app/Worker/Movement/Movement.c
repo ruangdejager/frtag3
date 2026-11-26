@@ -66,6 +66,14 @@
  * cold boot, when the RTC still holds an invalid epoch — clears it as well;
  * counts gathered against an unknown date cannot be attributed to a day
  * anyway. It is RAM only: a reset loses the day's count.
+ *
+ * Filtered-output stream
+ * ----------------------
+ * Kernel "g" prints the per-sample filter signals (DC levels, high-passed
+ * magnitude, envelope, max-level window counter) as CSV on the debug UART,
+ * for tuning maxLevel / maxWindow against real movement on the bench or on an
+ * animal with a cable. It only observes: the algorithm runs identically with
+ * the stream on or off. Format in Movement.h (MOVE_vStartStream).
  */
 
 #include <stdbool.h>
@@ -142,6 +150,23 @@ static uint16_t          u16MaxLevelWindowTmr = 0U; /* samples, see header */
 static volatile uint16_t u16DailyTriggerCnt   = 0U; /* read by the MeshTx task */
 static uint8_t           u8CountDate          = 0xFFU; /* local date the count belongs to */
 
+/* Filtered-output stream (kernel 'g'). The kernel task starts and stops it;
+ * this task does all the printing. Start writes the end tick and raises
+ * bStreamRestart before bStreamOn, so this task never sees a stream that is
+ * on without its end tick. */
+typedef struct {
+    uint8_t u8MaxLevel;
+    uint8_t u8MaxWindowS;
+    bool    bActive;
+    bool    bInService;
+} move_stream_ctx_t;
+
+static volatile bool     bStreamOn        = false;
+static volatile bool     bStreamRestart   = false;
+static volatile uint32_t u32StreamEndTick = 0U;
+static uint32_t          u32StreamSamples = 0U;
+static move_stream_ctx_t StreamCtx;
+
 /* Gravity sequence detector */
 static uint8_t u8SeqStep         = 0U;
 static uint8_t u8HoldCounter     = 0U;
@@ -159,6 +184,8 @@ static bool MOVE_bIsAlarmActiveNow(void);
 static void MOVE_vUpdateState(void);
 static bool MOVE_bCheckPosition(uint8_t step);
 static void MOVE_vSequenceTick(void);
+static void MOVE_vStreamTick(void);
+static void MOVE_vStreamSample(void);
 static void MOVE_vTask(void *arg);
 
 /* --------------------------------------------------------------------------
@@ -219,6 +246,10 @@ static void MOVE_vTask(void *arg)
         /* Midnight first, so a trigger landing in this tick's samples is
          * counted against the new day rather than cleared with the old. */
         MOVE_vDailyRollover();
+
+        /* Stream bookkeeping before this tick's samples, so its header and
+         * any settings change print ahead of the samples they apply to. */
+        MOVE_vStreamTick();
 
         MOVE_vEvalMovementLevel();
         MOVE_vWindowATick();
@@ -659,7 +690,98 @@ static void MOVE_vEvalMovementLevel(void)
     {
         if (bInService)
             MOVE_vEvalTrigger(u8Level);
+        if (bStreamOn)
+            MOVE_vStreamSample();
     }
+}
+
+/* --------------------------------------------------------------------------
+ * Filtered-output stream (kernel 'g'). Format and columns: Movement.h.
+ *
+ * Output goes through _DBG_ (debug UART only, never the flash log - 25 lines
+ * a second would fill it in hours). The DbgLog consumer runs above this task
+ * and is woken by every line, so each line leaves the 1 KB ring as soon as it
+ * is written and a 25-line burst never backs it up; at 115200 baud the
+ * stream uses under a tenth of the UART.
+ * -------------------------------------------------------------------------- */
+void MOVE_vStartStream(uint16_t u16Minutes)
+{
+    if (u16Minutes == 0U)                 u16Minutes = MOVE_STREAM_DEFAULT_MIN;
+    if (u16Minutes > MOVE_STREAM_MAX_MIN) u16Minutes = MOVE_STREAM_MAX_MIN;
+
+    u32StreamEndTick = osKernelGetTickCount() + (uint32_t)u16Minutes * 60U * 1000U;
+    bStreamRestart   = true;
+    bStreamOn        = true;
+}
+
+void MOVE_vStopStream(void)
+{
+    bStreamOn      = false;
+    bStreamRestart = false;
+}
+
+bool MOVE_bStreamActive(void) { return bStreamOn; }
+
+/* Once per heartbeat tick, before the samples: header on (re)start, the time
+ * limit, and a context line whenever a setting the 'win' column depends on
+ * changes. */
+static void MOVE_vStreamTick(void)
+{
+    if (!bStreamOn)
+        return;
+
+    if (bStreamRestart)
+    {
+        bStreamRestart   = false;
+        u32StreamSamples = 0U;
+        memset(&StreamCtx, 0xFF, sizeof(StreamCtx));   /* forces the context line */
+        _DBG_("# movement stream: %u Hz, axes=0x%02X, columns MV,n,dx,dy,dz,hp,env,win\r\n",
+              (unsigned)MOVE_ACC_SAMPLE_RATE_HZ,
+              (unsigned)SETTINGS_u8GetByte(movementAlarm.accelerometerAxes));
+    }
+
+    if ((int32_t)(osKernelGetTickCount() - u32StreamEndTick) >= 0)
+    {
+        bStreamOn = false;
+        _DBG_("# movement stream end: time limit, %lu samples\r\n",
+              (unsigned long)u32StreamSamples);
+        return;
+    }
+
+    move_stream_ctx_t tNow;
+    memset(&tNow, 0, sizeof(tNow));   /* padding too, so memcmp is meaningful */
+    tNow.u8MaxLevel   = MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_LEVEL);
+    tNow.u8MaxWindowS = MOVE_u8GetAlarmSettingNow(MOVE_ALARM_SETTING_MAX_WINDOW);
+    tNow.bActive      = MOVE_bIsAlarmActiveNow();
+    tNow.bInService   = SETTINGS_bGetBool(inService);
+
+    if (memcmp(&tNow, &StreamCtx, sizeof(tNow)) != 0)
+    {
+        StreamCtx = tNow;
+        /* win only moves while both flags are 1: not in service, triggers are
+         * not evaluated at all; outside an active zone, an above-maxLevel
+         * sample leaves it where it is. */
+        _DBG_("# maxLevel=%u maxWindow=%us (%u samples) zoneActive=%u inService=%u\r\n",
+              (unsigned)tNow.u8MaxLevel, (unsigned)tNow.u8MaxWindowS,
+              (unsigned)(MOVE_ACC_SAMPLE_RATE_HZ * tNow.u8MaxWindowS),
+              (unsigned)tNow.bActive, (unsigned)tNow.bInService);
+    }
+}
+
+/* One line for the sample MOVE_bUpdateMovementLevel has just filtered (and
+ * MOVE_vEvalTrigger has just judged). hp is the envelope-buffer slot that
+ * sample wrote, one behind the advanced index. */
+static void MOVE_vStreamSample(void)
+{
+    uint8_t u8Hp = MoveAlg.au8EnvBuf[(MoveAlg.u8EnvBufIdx + MOVE_ALG_ENV_BUF_SIZE - 1U) %
+                                     MOVE_ALG_ENV_BUF_SIZE];
+
+    _DBG_("MV,%lu,%d,%d,%d,%u,%u,%u\r\n",
+          (unsigned long)u32StreamSamples,
+          (int)MoveAlg.X.i8DcLevel, (int)MoveAlg.Y.i8DcLevel, (int)MoveAlg.Z.i8DcLevel,
+          (unsigned)u8Hp, (unsigned)MoveAlg.u8EnvLevel,
+          (unsigned)u16MaxLevelWindowTmr);
+    u32StreamSamples++;
 }
 
 #ifdef ENABLE_MOVEMENT_SENSOR_DATA_API
